@@ -1,0 +1,15 @@
+{
+    "watchlist": ["600519"],
+    "600519": {
+        "name": "贵州茅台",
+        "industry": "白酒",
+        "params": {
+            "s": 5,
+            "m": 13,
+            "l": 34
+        },
+        "style": "默认",
+        "last_optimized": "2026-01-01",
+        "strategy_type": "Trend_MA"
+    }
+}
