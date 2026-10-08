@@ -1,0 +1,22 @@
+# Python
+*.pyc
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 环境与依赖
+.env
+.venv/
+venv/
+
+# 个人配置与本地数据缓存（勿提交）
+source/stock_analysis/stock_config.json
+source/fund_analysis/fund_config.json
+source/stock_analysis/data/
+source/fund_analysis/data/
+
+# IDE
+.vscode/
+.idea/
+.claude/
