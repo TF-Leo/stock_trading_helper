@@ -18,6 +18,21 @@ class Status(Enum):
     UNTRADEABLE = "untradeable"
 
 
+# C5 契约：status -> 退出码。五个码互不相同，必须由 CLI 显式 sys.exit。
+EXIT_CODES = {
+    "ok": 0,
+    "no_edge": 10,
+    "insufficient_data": 20,
+    "data_source_error": 30,
+    "untradeable": 40,
+}
+
+
+def exit_code_for(status: str) -> int:
+    """status 字符串 -> 进程退出码（未知状态按数据源错误处理，绝不静默返回 0）。"""
+    return EXIT_CODES.get(str(status), 30)
+
+
 class Action(Enum):
     """交易动作枚举"""
     BUY = "buy"
@@ -41,6 +56,7 @@ class Request:
     """请求参数"""
     code: str
     type: str
+    type_hint: str = "auto"
     start: Optional[str] = None
     opt: str = "grid"
     jobs: int = 1
@@ -93,6 +109,7 @@ class Recommendation:
     distance_to_trigger: Dict[str, Optional[float]]
     invalidation: str
     no_edge: bool
+    stop_method: str = "atr"
 
 
 @dataclass

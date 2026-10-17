@@ -3,31 +3,63 @@
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 
-# Score weights (B1)
+# Score weights (B1) —— 权重只允许在此处定义，analyzer 不得另写一套
 SCORE_WEIGHTS = {
     'risk_adjusted': 0.6,  # Calmar/Sharpe primary
     'win_rate': 0.2,       # Win rate secondary
     'stability': 0.2,      # Stability
 }
+# Calmar 上限，避免极端小回撤导致评分发散
+CALMAR_CAP = 10.0
+# 交易数达到该值即认为"稳定性"满格（B1 的 stability 项）
+STABILITY_TRADE_FULL = 60.0
+
+
+def _annualize(total_return: float, n_bars: int, periods_per_year: int = 252) -> float:
+    """把区间总收益年化。n_bars<=0 时视为已年化，原样返回。
+
+    历史缺陷：旧实现写成 `(1+total_return)**(252/max(1,252))-1`，指数恒为 1，
+    等于没有年化（B1 明确点名的 bug）。
+    """
+    if not n_bars or int(n_bars) <= 0:
+        return float(total_return)
+    if total_return <= -1.0:
+        return -1.0
+    return float((1.0 + total_return) ** (periods_per_year / max(int(n_bars), 1)) - 1.0)
+
+
+def score_components(total_return: float, max_drawdown: float,
+                     win_rate: float, trade_count: int,
+                     n_bars: int = None, periods_per_year: int = 252) -> Dict[str, float]:
+    """B1: 拆出三项分量，供"胜率项贡献占比 ≤ 40%"的验证与门禁使用。"""
+    mdd = abs(float(max_drawdown))
+    if mdd == 0:
+        calmar = CALMAR_CAP if total_return > 0 else 0.0
+    else:
+        calmar = _annualize(total_return, n_bars, periods_per_year) / mdd
+    adj_win_rate = wilson_lower_bound(win_rate, trade_count) if trade_count > 0 else 0.0
+    stability = min(float(trade_count) / STABILITY_TRADE_FULL, 1.0)
+    return {
+        'calmar': float(calmar),
+        'calmar_term': SCORE_WEIGHTS['risk_adjusted'] * min(calmar, CALMAR_CAP),
+        'win_rate_term': SCORE_WEIGHTS['win_rate'] * adj_win_rate,
+        'stability_term': SCORE_WEIGHTS['stability'] * stability,
+        'adj_win_rate': float(adj_win_rate),
+        'annual_return': _annualize(total_return, n_bars, periods_per_year),
+    }
 
 
 def risk_adjusted_score(total_return: float, max_drawdown: float,
-                       win_rate: float, trade_count: int) -> float:
-    """B1: Risk-adjusted score with Calmar as primary term"""
-    if max_drawdown == 0:
-        calmar = float('inf') if total_return > 0 else 0
-    else:
-        annual_return = (1 + total_return) ** (252 / max(1, 252)) - 1
-        calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
-    
-    # Wilson lower bound adjustment for win rate
-    adj_win_rate = wilson_lower_bound(win_rate, trade_count) if trade_count > 0 else 0
-    
-    score = (SCORE_WEIGHTS['risk_adjusted'] * min(calmar, 10) +  # Cap at 10 to avoid overflow
-             SCORE_WEIGHTS['win_rate'] * adj_win_rate +
-             SCORE_WEIGHTS['stability'] * min(trade_count / 60, 1.0))
-    
-    return score
+                        win_rate: float, trade_count: int,
+                        n_bars: int = None, periods_per_year: int = 252) -> float:
+    """B1: 以风险调整收益（Calmar）为主项的评分。
+
+    total_return 为**区间总收益**；传 n_bars 时按该 bar 数年化后再算 Calmar，
+    不传则视为调用方已给出年化收益（保持对旧调用点/测试的兼容）。
+    """
+    c = score_components(total_return, max_drawdown, win_rate, trade_count,
+                         n_bars=n_bars, periods_per_year=periods_per_year)
+    return c['calmar_term'] + c['win_rate_term'] + c['stability_term']
 
 
 def wilson_lower_bound(p: float, n: int, z: float = 1.96) -> float:
@@ -64,6 +96,91 @@ def point_stat(values: List[float], stat_fn) -> float:
     if not values:
         return 0.0
     return float(stat_fn(np.asarray(values, dtype=float)))
+
+
+# ---------------------------------------------------------------------------
+# B7: 逐期收益 / 逐笔盈亏序列上的常用统计量（供 metrics.ci_95 使用）
+# 全部用 numpy 自实现，不引入 scipy。
+# ---------------------------------------------------------------------------
+def stat_total_return(vals) -> float:
+    arr = np.asarray(vals, dtype=float)
+    if arr.size == 0:
+        return 0.0
+    return float(np.prod(1.0 + arr) - 1.0)
+
+
+def stat_annual_return(vals, periods_per_year: int = 252) -> float:
+    arr = np.asarray(vals, dtype=float)
+    n = int(arr.size)
+    if n == 0:
+        return 0.0
+    tr = float(np.prod(1.0 + arr) - 1.0)
+    if tr <= -1.0:
+        return -1.0
+    return float((1.0 + tr) ** (periods_per_year / n) - 1.0)
+
+
+def stat_sharpe(vals, periods_per_year: int = 252) -> float:
+    arr = np.asarray(vals, dtype=float)
+    if arr.size < 2:
+        return 0.0
+    sd = float(np.std(arr, ddof=1))
+    if sd <= 0:
+        return 0.0
+    return float(np.mean(arr) / sd * np.sqrt(periods_per_year))
+
+
+def stat_max_drawdown(vals) -> float:
+    """由逐期收益序列重建权益曲线，返回最大回撤（正数，与 BacktestResult 口径一致）。"""
+    arr = np.asarray(vals, dtype=float)
+    if arr.size == 0:
+        return 0.0
+    eq = np.cumprod(1.0 + arr)
+    peak = np.maximum.accumulate(eq)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dd = np.where(peak > 0, 1.0 - eq / peak, 0.0)
+    return float(np.max(dd)) if dd.size else 0.0
+
+
+def stat_calmar(vals, periods_per_year: int = 252) -> float:
+    mdd = stat_max_drawdown(vals)
+    if mdd <= 0:
+        return 0.0
+    return float(stat_annual_return(vals, periods_per_year) / mdd)
+
+
+def stat_win_rate(vals) -> float:
+    arr = np.asarray(vals, dtype=float)
+    if arr.size == 0:
+        return 0.0
+    return float((arr > 0).mean())
+
+
+def stat_profit_factor(vals) -> float:
+    arr = np.asarray(vals, dtype=float)
+    if arr.size == 0:
+        return 0.0
+    win = float(arr[arr > 0].sum())
+    loss = float(-arr[arr < 0].sum())
+    if loss <= 0:
+        return float(win) if win > 0 else 0.0
+    return float(win / loss)
+
+
+def metric_with_ci(values, stat_fn, n_boot: int = 2000, seed: int = 7) -> Dict:
+    """B7: 返回 {'point', 'ci_95'}；样本不足 2 时 ci_95 为 None（不硬造区间）。
+
+    ci_95 会外扩到包含点估计 —— 百分位法在偏态分布下可能不含点估计，
+    而对外报"点估计不在自己的 95% 区间内"属于自相矛盾（C4）。
+    """
+    vals = [float(v) for v in (values or [])]
+    if len(vals) < 2:
+        return {'point': float(vals[0]) if vals else 0.0, 'ci_95': None}
+    point = float(stat_fn(np.asarray(vals, dtype=float)))
+    lo, hi = bootstrap_ci(vals, stat_fn, n_boot=n_boot, seed=seed)
+    lo = float(min(lo, point))
+    hi = float(max(hi, point))
+    return {'point': round(point, 6), 'ci_95': [round(lo, 6), round(hi, 6)]}
 
 
 def _norm_cdf(x: float) -> float:

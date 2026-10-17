@@ -24,8 +24,8 @@ def evaluate_triggers(df: pd.DataFrame, strategy_signals: Dict[str, pd.Series]) 
     lookback = max(1, min(10, n))
 
     for name, sig in strategy_signals.items():
-        buy = sig['buy']
-        sell = sig['sell']
+        buy = sig['buy'].astype(bool)
+        sell = sig['sell'].astype(bool)
         buy_now = bool(buy.iloc[-1])
         sell_now = bool(sell.iloc[-1])
         buy_recent = int(buy.iloc[-lookback:].sum())
@@ -42,14 +42,30 @@ def evaluate_triggers(df: pd.DataFrame, strategy_signals: Dict[str, pd.Series]) 
         else:
             state = 'neutral'
 
+        # F06b: buy_price/sell_price 必须是**真实历史价位**（最近一次该向信号所在 bar 的收盘价），
+        # 此前恒等于 last_close → distance_to_trigger 恒 0（占位常量）。
+        buy_price = None
+        sell_price = None
+        try:
+            bidx = buy[buy].index
+            sidx = sell[sell].index
+            if len(bidx):
+                buy_price = float(df.loc[bidx[-1], 'close'])
+            if len(sidx):
+                sell_price = float(df.loc[sidx[-1], 'close'])
+        except Exception:
+            buy_price = sell_price = None
+
         triggers.append({
             'indicator': name,
             'current': last_close,
-            'buy_trigger': '最新 bar 触发买入信号',
-            'sell_trigger': '最新 bar 触发卖出信号',
+            'buy_trigger': (f"买入信号触发价 {buy_price:.2f}（最近一次买入信号收盘价）"
+                            if buy_price is not None else "当前无买入信号"),
+            'sell_trigger': (f"卖出信号触发价 {sell_price:.2f}（最近一次卖出信号收盘价）"
+                             if sell_price is not None else "当前无卖出信号"),
             'state': state,
-            'buy_price': last_close if (buy_now or buy_recent) else None,
-            'sell_price': last_close if (sell_now or sell_recent) else None
+            'buy_price': buy_price,
+            'sell_price': sell_price
         })
 
     return triggers
