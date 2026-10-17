@@ -19,7 +19,10 @@ source/fund_analysis/data/
 
 # 门禁生成物（每次运行重写，不入库）
 gates-report.json
+gates_run.log
 # IDE
 .vscode/
 .idea/
 .claude/
+# Agent 工作区（记忆/日志，本地产物）
+.workbuddy-ai/
