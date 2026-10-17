@@ -13,6 +13,7 @@ from stock_analysis.data_loader.bars import (
 )
 from stock_analysis.data_loader.meta import (
     get_stock_daily,
+    get_fund_daily,
     get_market_index_daily,
     resample_stock_data,
 )

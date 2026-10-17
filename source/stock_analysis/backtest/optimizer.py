@@ -103,13 +103,14 @@ def bayes_search(
         evaluated = is_scores
     else:
         best_name = max(evaluated, key=evaluated.get)
-    best_result = eng_is.run_backtest(df, grid[best_name], market_regimes)
+    best_result = eng_oos.run_backtest(df, grid[best_name], market_regimes)
     rows = [{"策略": n, "评分OOS": s, "交易数_OOS": int(eval_trades.get(n, 0))}
             for n, s in sorted(evaluated.items(), key=lambda kv: kv[1], reverse=True)]
     comp = pd.DataFrame(rows).set_index("策略")
     base = calc_buy_hold_baseline(df, config)
+    # 同上：不给 best_name 加中文后缀，避免调用方回查 grid[name] 时静默降级
     if evaluated[best_name] <= -100 or (best_result.annual_return <= 0 and best_result.annual_return <= base["annual_return"]):
-        best_name = best_name + "（无优势，建议观望）"
+        best_result.no_edge = True
     return best_name, best_result, comp
 
 

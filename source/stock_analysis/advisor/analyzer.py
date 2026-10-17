@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from stock_analysis.indicators import calc_rsi, calc_cyc_cost, calc_winner_pct
+from stock_analysis.data_loader import get_market_index_daily
 
 
 def analyze_trend_strength(df):
@@ -146,3 +147,24 @@ def analyze_volume_chip_structure(df):
     else:
         desc = "量价筹码偏弱"
     return {"score": score, "desc": desc, "details": details}
+
+
+# A8: 统一的 regime 定义（合并 strategy_master/config.py）
+def get_market_regime_series(start_date='20200101'):
+    df = get_market_index_daily("000985", start_date=start_date, source='sina')
+    if df is None or df.empty:
+        df = get_market_index_daily("sh000001", start_date=start_date, source='sina')
+    if df is None or df.empty:
+        return None
+    df['MA60'] = df['close'].rolling(60).mean()
+    df['MA120'] = df['close'].rolling(120).mean()
+
+    def label_regime(row):
+        if row['close'] > row['MA60'] and row['MA60'] > row['MA120']:
+            return 'Bull'
+        elif row['close'] < row['MA60'] and row['MA60'] < row['MA120']:
+            return 'Bear'
+        else:
+            return 'Shock'
+
+    return df.apply(label_regime, axis=1)

@@ -18,8 +18,10 @@ def backtest_strategy(df, params, strategy_type='swing'):
     initial_capital = 100000.0
     cash = initial_capital
     position = 0.0
-    start_date = df.index[-1] - pd.DateOffset(years=3)
-    test_df = df[df.index >= start_date].copy()
+        # A7: 尊重调用窗口，不再硬编码截断
+    # start_date = df.index[-1] - pd.DateOffset(years=3)
+    # test_df = df[df.index >= start_date].copy()
+    test_df = df.copy()
     if test_df.empty:
         return 0, 0
     if 'RSI' in test_df:

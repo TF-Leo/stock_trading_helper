@@ -21,8 +21,9 @@ def _fund_backtest_with_stats(
     initial = 100000.0
     cash = initial
     position = 0.0
-    start = test.index[-1] - pd.DateOffset(years=3)
-    test = test[test.index >= start].copy()
+    # A7: 尊重调用窗口，不再硬编码截断
+    # start = test.index[-1] - pd.DateOffset(years=3)
+    # test = test[test.index >= start].copy()
     if test.empty:
         return None
     test["RSI_S"] = test["RSI"].shift(1) if "RSI" in test else 50
@@ -31,6 +32,7 @@ def _fund_backtest_with_stats(
     trades: list[float] = []
     values: list[float] = []
     buy_price = 0.0
+    buy_cost = 0.0
     holding = False
     for i in range(len(test)):
         price = float(test["close"].iloc[i])
@@ -57,14 +59,14 @@ def _fund_backtest_with_stats(
             holding = True
         elif sell_signal and holding:
             cash = position * price * (1 - FUND_FEE_RATE)
-            trades.append((cash - buy_cost) / buy_cost if 'buy_cost' in locals() and buy_cost else (price - buy_price) / buy_price)
+            trades.append((cash - buy_cost) / buy_cost if buy_cost else (price - buy_price) / buy_price)
             position = 0.0
             holding = False
         values.append(cash + position * price)
     if holding and values:
         last_price = float(test["close"].iloc[-1])
         _net = position * last_price * (1 - FUND_FEE_RATE)
-        trades.append((_net - buy_cost) / buy_cost if 'buy_cost' in locals() and buy_cost else (last_price - buy_price) / buy_price)
+        trades.append((_net - buy_cost) / buy_cost if buy_cost else (last_price - buy_price) / buy_price)
     if not values:
         return None
     total_ret = (values[-1] - initial) / initial
@@ -85,21 +87,24 @@ def _fund_backtest_signals(df: pd.DataFrame, signals: pd.DataFrame) -> dict | No
 
     适配 P2 基金策略（双均线/MACD/波动率目标）的信号输出。
     P0: 已补双边申赎费用FUND_FEE_RATE。
+    A5: 信号 T+1 执行——当日收盘产生的信号只能在下一交易日成交（单一 shift(1)）。
     """
     test = df.copy()
     initial = 100000.0
     cash = initial
     position = 0.0
-    start = test.index[-1] - pd.DateOffset(years=3)
-    test = test[test.index >= start].copy()
+    # A7: 尊重调用窗口，不再硬编码截断
+    # start = test.index[-1] - pd.DateOffset(years=3)
+    # test = test[test.index >= start].copy()
     if test.empty:
         return None
-    buy_sig = signals['buy'].reindex(test.index).fillna(False)
-    sell_sig = signals['sell'].reindex(test.index).fillna(False)
+    buy_sig = signals['buy'].reindex(test.index).fillna(False).astype(bool).shift(1, fill_value=False)
+    sell_sig = signals['sell'].reindex(test.index).fillna(False).astype(bool).shift(1, fill_value=False)
 
     trades: list[float] = []
     values: list[float] = []
     buy_price = 0.0
+    buy_cost = 0.0
     holding = False
     for i in range(len(test)):
         price = float(test['close'].iloc[i])
@@ -111,14 +116,14 @@ def _fund_backtest_signals(df: pd.DataFrame, signals: pd.DataFrame) -> dict | No
             holding = True
         elif sell_sig.iloc[i] and holding:
             cash = position * price * (1 - FUND_FEE_RATE)
-            trades.append((cash - buy_cost) / buy_cost if 'buy_cost' in locals() and buy_cost else (price - buy_price) / buy_price)
+            trades.append((cash - buy_cost) / buy_cost if buy_cost else (price - buy_price) / buy_price)
             position = 0.0
             holding = False
         values.append(cash + position * price)
     if holding and values:
         last_price = float(test['close'].iloc[-1])
         _net = position * last_price * (1 - FUND_FEE_RATE)
-        trades.append((_net - buy_cost) / buy_cost if 'buy_cost' in locals() and buy_cost else (last_price - buy_price) / buy_price)
+        trades.append((_net - buy_cost) / buy_cost if buy_cost else (last_price - buy_price) / buy_price)
     if not values:
         return None
     total_ret = (values[-1] - initial) / initial

@@ -271,6 +271,9 @@ def run_strategy_tournament(
     - 保持返回 (best_name, best_result全量回测, comparison含IS/OOS列) 向后兼容。
     """
     strategies = _build_strategy_grid()
+    oos_cfg = adaptive_oos_config(df, config)
+    engine_is = BacktestEngine(config)
+    engine_oos = BacktestEngine(oos_cfg)
     engine = BacktestEngine(config)
 
     comparison = compare_strategies(df, strategies, market_regimes, config, jobs=jobs)
@@ -355,10 +358,11 @@ def run_strategy_tournament(
             else:
                 final_scores[n] = (1 - oos_weight) * s_is + oos_weight * s_oos
     comparison['评分'] = [final_scores.get(n, -100) for n in comparison.index]
-    comparison['评分Final'] = comparison['评分']
+    comparison['评分Final'] = comparison['评分']  # 契约列名：tests/test_p1_oos.py 断言无空格
 
+    # A1/A12: 先确定 best_name，再运行全样本回测
     best_name = max(final_scores, key=final_scores.get)
-    best_result = engine.run_backtest(df, strategies[best_name], market_regimes)
+    best_result = engine_oos.run_backtest(df, strategies[best_name], market_regimes)
 
     # P0: 评分地板 — 与买入持有/空仓基线对比，低于基线则提示无优势
     # 买入持有：首收盘买入、尾收盘卖出（含一次双边费用近似）
@@ -382,14 +386,13 @@ def run_strategy_tournament(
         no_edge = True
     elif best_result.total_return < bh_total and best_result.total_return <= 0:
         no_edge = True
+    # 不要给 best_name 追加中文后缀：调用方需用该名字回查 strategies[name]，
+    # 追加后缀会导致 KeyError 并被静默降级为"全 False 信号"→ triggers 恒为空（自相矛盾）。
     if no_edge:
-        best_name = best_name + "（无优势，建议观望）"
+        best_result.no_edge = True
     # 把基线写入对比表尾部便于核查（不参与评分排序）
-    try:
-        comparison.loc["__买入持有基线__", "年化收益"] = f"{bh_annual:.2%}"
-        comparison.loc["__买入持有基线__", "总收益率"] = f"{bh_total:.2%}"
-    except Exception:
-        pass
+    # A9: 基线不再注入对比表，由 calc_buy_hold_baseline 独立返回
+    # comparison.loc["__买入持有基线__", ...] 已移除
 
     return best_name, best_result, comparison
 

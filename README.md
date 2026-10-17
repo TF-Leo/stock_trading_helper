@@ -1,228 +1,289 @@
-# Stock Trading Helper
+# 给 Agent 的接口契约
 
-A 股 / 基金多策略回测工具：在终端输入标的代码，自动拉取历史数据、跑多策略锦标赛（股票 40 类 / 581 组参数），输出胜率最高的操作策略与分市场（牛/熊/震荡）表现。
+## 概述
 
-> 本项目是回测研究工具，输出结果基于历史数据，**不构成投资建议**。
+本项目提供 `python cli.py <code> --json` 命令行接口，输出单一 JSON 文档。底层由可导入函数 `advise()` 产出同一 schema。
 
-## 特性
-
-- **一键回测**：自动识别股票/基金类型，输出胜率、盈亏比、年化收益、最大回撤、夏普、Calmar、连赢连亏
-- **多策略锦标赛**：股票 581 组参数 + 基金 44 组参数同台竞技，按 Wilson 置信下界评分，抑制小样本高胜率的过拟合
-- **防过拟合**：70/30 样本内/外切分 + 3 折 walk-forward，按样本外表现排名；跑不赢买入持有/空仓基线时提示"无优势，建议观望"
-- **贴近实盘的交易成本建模**：佣金、印花税、滑点、止损止盈、100 股整手、涨跌停限制、信号 T+1 执行
-- **贝叶斯参数寻优**：`--opt bayes` 30 次评估替代全网格（约 1s vs 约 45s），快速验证
-- **无需任何 API key**：行情均来自公开接口（东方财富/新浪/akshare），本地 CSV 缓存
-
-## 安装
-
-需要 Python 3.11+。
+## 调用方式
 
 ```bash
-cd source
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+# 基本用法
+python cli.py 600519 --json
+
+# 指定基金
+python cli.py 510300 --type fund --json
+
+# 快速模式（性能优化）
+python cli.py 600519 --fast --json
+
+# 指定数据起始日期
+python cli.py 600519 --start 20200101 --json
 ```
 
-依赖为 `akshare` / `requests` / `numpy` / `pandas`（另有 `pytest` 用于测试），版本已在 `requirements.txt` 中固定。
+## 参数说明
 
-## 用法
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| code | str | 必填 | 股票代码或基金代码 |
+| --json | bool | False | 输出 JSON 格式（stdout），文本日志走 stderr |
+| --fast | bool | False | 快速模式：减少 bootstrap 次数、缩减候选池 |
+| --start | str | None | 数据起始日期（YYYYMMDD） |
+| --type | str | auto | 类型：auto/stock/fund |
+| --jobs | int | 1 | 并行任务数 |
+| --opt | str | grid | 优化方式：grid/bayes |
+
+## JSON Schema
+
+### 退出码
+
+| code | status | 含义 |
+|------|--------|------|
+| 0 | ok | 产出可执行建议 |
+| 10 | no_edge | 无统计显著优势，建议观望 |
+| 20 | insufficient_data | 数据条数不足（< 100 根） |
+| 30 | data_source_error | 渠道池全失败且无可用缓存 |
+| 40 | untradeable | 诊断显示无法正常成交，结果不可信 |
+| 2 | — | 参数/用法错误（argparse 默认） |
+
+### 枚举值
+
+- **status**: `ok` / `no_edge` / `insufficient_data` / `data_source_error` / `untradeable`
+- **action**: `buy` / `sell` / `hold` / `avoid` / `insufficient_data`
+- **trigger.state**: `buy_triggered` / `near_buy` / `neutral` / `near_sell` / `sell_triggered`
+
+### 完整字段表
+
+```json
+{
+  "schema_version": "1.0",
+  "generated_at": "2024-XX-XXTXX:XX:XX.XXXXXX",
+  "request": {
+    "code": "600519",
+    "type": "stock",
+    "start": "20200101",
+    "opt": "grid",
+    "jobs": 1,
+    "fast": false
+  },
+  "instrument": {
+    "code": "600519",
+    "name": "贵州茅台",
+    "board": "sh_main",
+    "price_limit_pct": 0.10,
+    "is_st": false
+  },
+  "data": {
+    "bars": 1643,
+    "start": "2020-01-02",
+    "end": "2026-10-16",
+    "last_close": 1329.0,
+    "source": "sina",
+    "from_cache": true,
+    "window_note": null
+  },
+  "market_regime": {
+    "label": "Bull",
+    "confidence": 0.7,
+    "as_of": "2026-10-16",
+    "definition": "simple_moving_average"
+  },
+  "recommendation": {
+    "status": "ok",
+    "action": "buy",
+    "action_reason": ["MA(5-20): 买入信号 (2.50)"],
+    "confidence": 0.65,
+    "position_fraction": 0.20,
+    "horizon_days": [5, 20],
+    "entry_zone": [1302.42, 1355.58],
+    "stop_loss": 1262.55,
+    "take_profit": 1461.90,
+    "distance_to_trigger": {
+      "buy_pct": 0.0,
+      "sell_pct": 0.0
+    },
+    "invalidation": "跌破止损价 1262.55 或 10 日内未触发",
+    "no_edge": false
+  },
+  "evidence": {
+    "consensus": {
+      "family": "StochRSI",
+      "agreement": 0.75,
+      "members": ["StochRSI(14,25/75)", "MACD(12-26-9)"]
+    },
+    "dispersion": 0.15,
+    "stability": {
+      "windows_tested": 3,
+      "action_stable": true,
+      "family_stable": true,
+      "top_k_overlap_min": 5
+    },
+    "n_trials": 10,
+    "n_survivors": 8,
+    "deflated_sharpe": 0.85,
+    "significant": true,
+    "metrics": {
+      "annual_return": {"point": 0.1014, "ci_95": [0.05, 0.15]},
+      "max_drawdown": {"point": -0.0678, "ci_95": [-0.10, -0.03]},
+      "win_rate": {"point": 0.75, "ci_95": [0.65, 0.85]},
+      "sharpe": {"point": 1.10, "ci_95": [0.8, 1.4]},
+      "calmar": {"point": 1.50, "ci_95": [1.0, 2.0]},
+      "profit_factor": {"point": 2.5, "ci_95": [1.8, 3.2]},
+      "trade_count": {"point": 32},
+      "avg_holding_days": {"point": 11.1},
+      "time_in_market": {"point": 0.25}
+    },
+    "excess_vs_buy_hold": {
+      "point": 0.05,
+      "ci_95": [0.02, 0.08]
+    },
+    "buy_hold_baseline": {
+      "total_return": 0.58,
+      "annual_return": 0.12
+    },
+    "regime_win_rates": {},
+    "triggers": [
+      {
+        "indicator": "MA(5-20)",
+        "current": 2.50,
+        "buy_trigger": "20日均线上方",
+        "sell_trigger": "20日均线下方",
+        "state": "buy_triggered",
+        "buy_price": null,
+        "sell_price": null
+      }
+    ]
+  },
+  "candidates": [
+    {
+      "name": "StochRSI(14,25/75)",
+      "family": "StochRSI",
+      "score": 0.85,
+      "score_is": 0.85,
+      "score_oos": 0.77,
+      "annual_return": 0.1014,
+      "max_drawdown": -0.0678,
+      "win_rate": 0.75,
+      "trade_count": 32,
+      "calmar": 1.50,
+      "deflated_sharpe": 0.85
+    }
+  ],
+  "diagnostics": {
+    "unaffordable_lot_events": 0,
+    "blocked_by_limit_events": 0,
+    "zero_trade_configs": 0,
+    "survivor_configs": 10,
+    "warnings": [],
+    "elapsed_seconds": 15.5
+  },
+  "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
+}
+```
+
+## 字段详细说明
+
+### request
+- **code**: 股票代码或基金代码（字符串）
+- **type**: 标的类型（"stock" / "fund"）
+- **start**: 数据起始日期（可选）
+- **opt**: 优化方式（"grid" / "bayes"）
+- **jobs**: 并行任务数（整数）
+- **fast**: 是否快速模式（布尔值）
+
+### instrument
+- **code**: 标的代码
+- **name**: 标的名称
+- **board**: 板块（"sh_main"/"sh_star"/"sz_main"/"sz_gem"/"bj"/"fund"/"unknown"）
+- **price_limit_pct**: 涨跌停幅度（0.10 表示 10%）
+- **is_st**: 是否 ST 股（布尔值）
+
+### recommendation
+- **status**: 状态枚举（见上表）
+- **action**: 交易动作枚举（见上表）
+- **action_reason**: 行动理由列表（字符串数组）
+- **confidence**: 置信度（0-1 浮点数）
+- **position_fraction**: 仓位比例（0-0.30 浮点数）
+- **horizon_days**: 时间窗口 [最小天数，最大天数]
+- **entry_zone**: 入场区间 [最低价，最高价] 或 null
+- **stop_loss**: 止损价 或 null
+- **take_profit**: 止盈价 或 null
+- **distance_to_trigger**: 距离触发器百分比
+- **invalidation**: 失效条件字符串
+- **no_edge**: 是否无优势（布尔值）
+
+### evidence.metrics
+每个指标包含：
+- **point**: 点估计值（浮点数）
+- **ci_95**: 95% 置信区间 [下限，上限] 或 null
+
+支持的指标：
+- annual_return, max_drawdown, win_rate, sharpe, calmar, profit_factor
+- trade_count, avg_holding_days, time_in_market
+
+### disclaimer
+固定字符串："本结果不构成投资建议，市场有风险，投资需谨慎。"
+
+## 示例输出
+
+以下为**结构示意**：字段名、层级与类型与真实输出完全一致，数值为示意值。
+（历史问题：此处曾放一份带 `...` 的"伪 JSON"，既不可解析也不是真实输出。）
+唯一完整真实样例由命令现跑生成，见 `source/docs/example_output_600519.json`：
 
 ```bash
-cd source
-
-# 自动识别类型（股票/基金），跑多策略锦标赛（默认全网格 + 样本外排名）
-python cli.py 600519      # 股票：贵州茅台
-python cli.py 510300      # 基金：沪深300ETF
-
-# 强制指定类型
-python cli.py 600519 --type stock
-python cli.py 510300 --type fund
-
-# 显示全策略对比表（默认按样本外 Final 排序，Top30）
-python cli.py 600519 --detail
-
-# 跳过市场环境加载（更快，但不输出牛/熊/震荡分市场胜率）
-python cli.py 600519 --no-regime
-
-# 指定数据起始日期（默认 20200101）
-python cli.py 600519 --start 20210101
-
-# 锦标赛并行（默认 1，多核机器推荐 4/8）
-python cli.py 600519 --jobs 4
-
-# 贝叶斯优化：30 次评估替代全网格（~1s vs ~45s，快速验证用）
-python cli.py 600519 --opt bayes --opt-iters 30
+cd source && python cli.py 600519 --json --fast > docs/example_output_600519.json
 ```
 
-| 参数 | 说明 |
-| --- | --- |
-| `code` | 6 位股票/基金代码 |
-| `-t, --type` | `auto`（默认）/ `stock` / `fund` |
-| `--detail` | 显示全策略对比表 |
-| `--no-regime` | 跳过市场环境加载 |
-| `--start` | 数据起始日期，默认 `20200101` |
-| `--jobs` | 锦标赛并行数，默认 1 |
-| `--opt` | `grid`（默认，全网格）/ `bayes`（贝叶斯寻优） |
-| `--opt-iters` | 贝叶斯寻优迭代次数，默认 30 |
-
-输出示例：
-
-```
-=== 股票: 贵州茅台 (600519) ===
-数据区间: 2020-01-02 ~ 2026-08-04（1578 条）
-加载市场环境...
-市场环境加载完成
-运行多策略锦标赛...
-
->>> 最优策略: 均线趋势(5-13-34)
-    胜率      : 58.33%
-    盈亏比    : 1.87
-    年化收益  : 12.45%
-    最大回撤  : 18.20%
-    夏普比率  : 0.92
-    交易次数  : 24
-    平均持仓  : 23.5 天
-    分市场胜率: 牛72% / 熊30% / 震荡55%
-```
-
-## 工作原理
-
-1. **数据拉取**：股票日线走多渠道池（东方财富/新浪）+ 本地 CSV 缓存（前复权，拉取失败自动回退缓存）；基金走 akshare 净值。
-2. **多策略锦标赛**：全部参数组在统一回测引擎上运行，评分：
-
-   `得分 = Wilson下界 × 0.5 + 年化收益 × 0.2 − 最大回撤 × 0.3`（交易数 < 10 直接判 -100）
-
-   两阶段防过拟合：70/30 样本内/外切分 + 3 折 walk-forward，`final = 0.3 × 样本内 + 0.7 × 样本外`（样本外交易 < 5 判 -100，Calmar < 0.5 软惩罚）。若所有策略均跑不赢买入持有/空仓基线，会提示"无优势，建议观望"。
-3. **回测引擎**：模拟真实交易——佣金万 3（最低 5 元）、印花税千 1、滑点千 1、止损 8% / 止盈 15%、100 股整手、涨停买不进 / 跌停卖不出、信号 T+1 执行。输出胜率、盈亏比、夏普、Calmar、最大回撤、连赢连亏、牛熊震荡胜率（asof 对齐，停牌不丢数据）。
-
-## 内置策略
-
-### 股票（40 类 / 581 组，参数网格单一来源：`strategy/registry.py`）
-
-| 类别 | 策略 |
-| --- | --- |
-| 趋势 | 均线趋势、唐奇安通道、EMA 交叉、KAMA、HMA 交叉、VWAP、SAR、DI 交叉 |
-| 动量 | MACD、KDJ、CCI、WilliamsR、StochRSI、ADX |
-| 均值回归 | 布林、布林 Squeeze、Z-Score、ATR 过滤 |
-| 量价 | 量价突破、OBV、VR、MFI、CMF、缺口跳空、吞没、锤子线、十字星 |
-| 筹码/共振 | 筹码分布、三维共振（量价筹）、Kelly |
-| 网格 | 等差网格、等比网格、ATR 网格 |
-| 波动率 | 波动率目标、ATR 通道 |
-| 配对/价差 | 配对交易、价差 Z-Score |
-| 组合 | 多策略投票 |
-| 配置 | 指数轮动（基准动量门控）、风险平价 |
-
-### 基金（6 类 / 44 组）
-
-RSI 波段（16 组）+ MA20 持有 + 双均线（9 组）/ MACD（8 组）/ 波动率目标（6 组）/ 指数增强轮动（4 组，基金双均线金叉 + 基准指数动量门控），均含双边申赎费（0.15%），评分与股票侧一致（Wilson 下界）。
-
-## 扩展新策略
-
-继承 `BaseStrategy` 实现 `generate_trade_signals(df)`（返回含 `buy` / `sell` 两列布尔序列的 DataFrame），再到 `strategy/registry.py` 的 `_grid_defs()` 加一行参数网格定义，即自动进入锦标赛：
-
-```python
-from stock_analysis.strategy.base import BaseStrategy
-import pandas as pd
-
-class GoldenCrossStrategy(BaseStrategy):
-    def __init__(self):
-        super().__init__("Golden_Cross")
-
-    def generate_trade_signals(self, df):
-        df = df.copy()
-        df["MA5"] = df["close"].rolling(5).mean()
-        df["MA20"] = df["close"].rolling(20).mean()
-        buy = (df["MA5"] > df["MA20"]) & (df["MA5"].shift(1) <= df["MA20"].shift(1))
-        sell = (df["MA5"] < df["MA20"]) & (df["MA5"].shift(1) >= df["MA20"].shift(1))
-        return pd.DataFrame({"buy": buy, "sell": sell}, index=df.index)
+```json
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-10-17T13:30:00",
+  "request": { "code": "600519", "type": "stock", "start": "20200101", "opt": "grid", "jobs": 1, "fast": true },
+  "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false },
+  "data": { "bars": 1643, "start": "2020-01-02", "end": "2026-10-16", "last_close": 1520.0, "source": "sina", "from_cache": true, "window_note": null },
+  "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16", "definition": "simple_moving_average" },
+  "recommendation": {
+    "status": "no_edge",
+    "action": "hold",
+    "action_reason": ["无统计显著优势：多重检验校正后不显著"],
+    "confidence": 0.2,
+    "position_fraction": 0.0,
+    "horizon_days": [5, 20],
+    "entry_zone": [1490.0, 1550.0],
+    "stop_loss": 1444.0,
+    "take_profit": 1672.0,
+    "distance_to_trigger": { "buy_pct": 1.2, "sell_pct": 3.4 },
+    "invalidation": "跌破 1444.0 或 20 个交易日内未触发",
+    "no_edge": true
+  },
+  "evidence": {
+    "consensus": { "family": "MACD", "agreement": 0.6, "members": ["MACD(12-26-9)"] },
+    "dispersion": 0.12,
+    "stability": { "action_stable": true, "family_stable": true, "windows_tested": 3, "top_k_overlap_min": 3 },
+    "n_trials": 581,
+    "n_survivors": 17,
+    "deflated_sharpe": 0.31,
+    "significant": false,
+    "metrics": {
+      "annual_return": { "point": 0.12, "ci_95": [0.02, 0.22] },
+      "max_drawdown": { "point": 0.18, "ci_95": [0.10, 0.30] }
+    },
+    "excess_vs_buy_hold": { "point": 0.01, "ci_95": [-0.05, 0.07] },
+    "triggers": [{ "name": "MACD(12-26-9)", "state": "watch", "message": "MACD 柱状体尚未上穿 0 轴" }]
+  },
+  "candidates": [{ "name": "MACD(12-26-9)", "family": "MACD", "score": 0.42, "trade_count": 32 }],
+  "diagnostics": { "unaffordable_lot_events": 0, "blocked_by_limit_events": 0, "warnings": [], "elapsed_seconds": 48.7 },
+  "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
+}
 ```
 
-## 自选 / 参数配置（可选）
+## 幂等性保证
 
-主 CLI 对单个代码跑全参数网格，不依赖任何配置。若需要固定的自选股列表或锁定每只标的的参数，可启用配置文件（示例模板已随仓库提供，真实配置文件在 `.gitignore` 中，不会被提交）：
+同一份缓存数据下连续两次运行，JSON 除 `generated_at` 与 `diagnostics.elapsed_seconds` 外逐字节相同。所有随机过程使用固定 seed。
 
-```bash
-# 股票：自选列表 + 每只标的的策略/参数
-cp source/stock_analysis/stock_config.example.json source/stock_analysis/stock_config.json
-# 基金：每只基金的策略/参数
-cp source/fund_analysis/fund_config.example.json source/fund_analysis/fund_config.json
-```
+## 兼容性
 
-配置会被以下辅助入口使用（均以 `python -m` 方式运行，需在 `source/` 目录下）：
+CLI 向后兼容所有旧参数：
+- `--detail`, `--no-regime`, `--start`, `--jobs`, `--opt`, `--opt-iters`, `-t|--type`
+- 新增 `--json`, `--fast`
 
-| 入口 | 用途 |
-| --- | --- |
-| `python -m stock_analysis.strategy_master.runner` | 批量优化：遍历自选股，为每只找到最优策略并回写配置 |
-| `python -m stock_analysis.advisor.recommender` | 股票顾问：结合市场环境与自选股输出操作建议 |
-| `python -m fund_analysis.fund_strategy.runner` | 基金批量回测/参数优化 |
-| `python -m fund_analysis.fund_advisor.recommender` | 基金顾问：输出申购/持有建议 |
-
-## 测试
-
-```bash
-cd source
-python -m pytest tests/ -q     # 25 项
-```
-
-## 目录结构
-
-```
-.
-├── LICENSE
-├── README.md
-└── source/
-    ├── cli.py                          # 终端入口（--detail/--jobs/--opt bayes 等）
-    ├── requirements.txt
-    ├── pytest.ini
-    ├── stock_analysis/
-    │   ├── data_loader/                # 多渠道行情池 + CSV 缓存
-    │   │   ├── bars.py                 # 日线抓取（eastmoney/sina 渠道池）
-    │   │   └── meta.py                 # 名称/指数/市场宽度等元数据
-    │   ├── indicators/                 # 技术指标（KAMA/HMA/SAR 已向量化）
-    │   │   ├── trend.py
-    │   │   ├── momentum.py
-    │   │   └── volatility.py
-    │   ├── strategy/                   # 策略库（40 类 / 581 组）
-    │   │   ├── registry.py             # 参数网格单一来源
-    │   │   ├── base.py                 # BaseStrategy 统一接口
-    │   │   ├── trade.py / rules.py     # P0 基础策略
-    │   │   ├── p0_strategies.py        # P0 扩展策略
-    │   │   ├── p1_strategies.py        # P1 策略
-    │   │   └── p2_strategies.py        # P2 策略
-    │   ├── backtest/
-    │   │   ├── engine.py               # 回测引擎（费用/整手/涨跌停/T+1）
-    │   │   ├── analyzer.py             # IS/OOS 两阶段锦标赛
-    │   │   └── optimizer.py            # 贝叶斯参数寻优
-    │   ├── advisor/
-    │   │   ├── analyzer.py             # 趋势/水位/量价筹码分析
-    │   │   └── recommender.py          # 股票操作建议
-    │   └── strategy_master/
-    │       ├── config.py                # 每标的参数配置 + 市场 regime 序列
-    │       └── runner.py                # 批量策略优化
-    └── fund_analysis/
-        ├── fund_backtest.py            # 基金信号回测执行层（含申赎费）
-        ├── utils.py
-        ├── fund_advisor/
-        │   ├── analyzer.py
-        │   └── recommender.py
-        └── fund_strategy/
-            ├── strategy.py             # 基金数据/指标/基准
-            ├── runner.py               # 基金回测/参数优化
-            └── p2_strategies.py        # 双均线/MACD/波动率目标/指数轮动
-```
-
-## 数据源
-
-- 股票日线：东方财富 / 新浪公开接口，渠道池容错；缓存于 `source/stock_analysis/data/`（gitignore）
-- 指数/市场宽度：新浪公开接口
-- 基金净值：akshare；缓存于 `source/fund_analysis/data/`（gitignore）
-- 全部为公开接口，无需 token
-
-## 免责声明
-
-本项目仅用于量化回测研究。回测结果基于历史数据，不代表未来表现；文中任何策略与指标均不构成投资建议，据此操作风险自负。
-
-## License
-
-[MIT](LICENSE)
+语义变更已在本文档标注。

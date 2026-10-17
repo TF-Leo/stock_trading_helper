@@ -1,0 +1,262 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-10-17T13:21:55.205513",
+  "request": {
+    "code": "600519",
+    "type": "stock",
+    "start": "20200101",
+    "opt": "grid",
+    "jobs": 1,
+    "fast": true
+  },
+  "instrument": {
+    "code": "600519",
+    "name": "����ę́",
+    "board": "sh_main",
+    "price_limit_pct": 0.1,
+    "is_st": false
+  },
+  "data": {
+    "bars": 1643,
+    "start": "2020-01-02 00:00:00",
+    "end": "2026-10-16 00:00:00",
+    "last_close": 1329.0,
+    "source": "sina",
+    "from_cache": true,
+    "window_note": null
+  },
+  "market_regime": {
+    "label": "Bull",
+    "confidence": 0.7,
+    "as_of": "2026-10-16 00:00:00",
+    "definition": "simple_moving_average"
+  },
+  "recommendation": {
+    "status": "ok",
+    "action": "buy",
+    "action_reason": [
+      "������ȷ�����źţ��������"
+    ],
+    "confidence": 0.694,
+    "position_fraction": 0.139,
+    "horizon_days": [
+      5,
+      20
+    ],
+    "entry_zone": [
+      1302.42,
+      1355.58
+    ],
+    "stop_loss": 1262.55,
+    "take_profit": 1461.9,
+    "distance_to_trigger": {
+      "buy_pct": 0.0,
+      "sell_pct": 0.0
+    },
+    "invalidation": "����ֹ��� 1262.55 �� 10 ����δ����",
+    "no_edge": false
+  },
+  "evidence": {
+    "consensus": {
+      "family": "��������",
+      "agreement": 1.0,
+      "members": [
+        "��������(3-5-8)"
+      ]
+    },
+    "dispersion": 0.0,
+    "stability": {
+      "action_stable": true,
+      "family_stable": true,
+      "windows_tested": 3,
+      "top_k_overlap_min": 5
+    },
+    "n_trials": 10,
+    "n_survivors": 0,
+    "deflated_sharpe": 0.335,
+    "significant": true,
+    "metrics": {
+      "annual_return": {
+        "point": 0.06646194510712489
+      },
+      "max_drawdown": {
+        "point": 0.448975429248485
+      },
+      "win_rate": {
+        "point": 0.5569620253164557
+      },
+      "sharpe": {
+        "point": 0.5499627663096431
+      },
+      "calmar": {
+        "point": 0.14803025015950616
+      },
+      "profit_factor": {
+        "point": 1.4081221222401632
+      },
+      "trade_count": {
+        "point": 79
+      },
+      "avg_holding_days": {
+        "point": 11.860759493670885
+      },
+      "time_in_market": {
+        "point": 0
+      }
+    },
+    "excess_vs_buy_hold": {
+      "point": 0.05,
+      "ci_95": [
+        0.02,
+        0.08
+      ]
+    },
+    "buy_hold_baseline": {
+      "total_return": 0.38599757211566177,
+      "annual_return": 0.05134012393751841
+    },
+    "regime_win_rates": {},
+    "triggers": []
+  },
+  "candidates": [
+    {
+      "name": "��������(3-5-8)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": -0.01,
+      "max_drawdown": 0.0633,
+      "win_rate": 0.0,
+      "trade_count": 3,
+      "calmar": -0.1579778830963665,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-5-10)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": -0.0128,
+      "max_drawdown": 0.08070000000000001,
+      "win_rate": 0.0,
+      "trade_count": 4,
+      "calmar": -0.15861214374225527,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-5-13)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": -0.0203,
+      "max_drawdown": 0.1284,
+      "win_rate": 0.0,
+      "trade_count": 3,
+      "calmar": -0.15809968847352027,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-5-20)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": -0.0144,
+      "max_drawdown": 0.0935,
+      "win_rate": 0.25,
+      "trade_count": 4,
+      "calmar": -0.15401069518716576,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-5-30)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": -0.0073,
+      "max_drawdown": 0.0867,
+      "win_rate": 0.3333,
+      "trade_count": 3,
+      "calmar": -0.08419838523644751,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-5-60)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": 0.0189,
+      "max_drawdown": 0.0277,
+      "win_rate": 0.5,
+      "trade_count": 2,
+      "calmar": 0.6823104693140795,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-5-120)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": 0.0,
+      "max_drawdown": 0.0,
+      "win_rate": 0.0,
+      "trade_count": 0,
+      "calmar": 0,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-8-10)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": -0.0147,
+      "max_drawdown": 0.09230000000000001,
+      "win_rate": 0.0,
+      "trade_count": 3,
+      "calmar": -0.15926327193932827,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-8-13)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": -0.0097,
+      "max_drawdown": 0.0795,
+      "win_rate": 0.0,
+      "trade_count": 2,
+      "calmar": -0.1220125786163522,
+      "deflated_sharpe": 0.5
+    },
+    {
+      "name": "��������(3-8-20)",
+      "family": "��������",
+      "score": -100.0,
+      "score_is": -100.0,
+      "score_oos": -90.0,
+      "annual_return": -0.0148,
+      "max_drawdown": 0.11710000000000001,
+      "win_rate": 0.0,
+      "trade_count": 2,
+      "calmar": -0.1263877028181042,
+      "deflated_sharpe": 0.5
+    }
+  ],
+  "diagnostics": {
+    "unaffordable_lot_events": 0,
+    "blocked_by_limit_events": 0,
+    "zero_trade_configs": 0,
+    "survivor_configs": 10,
+    "warnings": [],
+    "elapsed_seconds": 48.73
+  },
+  "disclaimer": "�����������Ͷ�ʽ��飬�г��з��գ�Ͷ���������"
+}

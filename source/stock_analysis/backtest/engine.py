@@ -1,4 +1,5 @@
 import pandas as pd
+from decision.instrument import classify_board, get_price_limits
 import numpy as np
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -61,6 +62,10 @@ class BacktestResult:
     calmar_ratio: float = 0
     sortino_ratio: float = 0
     var_95: float = 0
+    unaffordable_lot_events: int = 0
+    blocked_by_limit_events: int = 0
+    unaffordable_lot_events: int = 0
+    blocked_by_limit_events: int = 0
 
     def to_dict(self):
         return {
@@ -110,6 +115,8 @@ class BacktestEngine:
         entry_cost_total = 0.0  # 买入总成本（含买入佣金），用于准确计算pnl
 
         result = BacktestResult()
+        unaffordable_count = 0
+        limit_blocked_count = 0
         equity_curve = []
 
         prev_close = float(df['close'].iloc[0]) if len(df) else 0.0
@@ -126,8 +133,10 @@ class BacktestEngine:
 
             if position > 0 and not is_limit_down:
                 if self.config.enable_stop_loss:
-                    if low <= entry_price * (1 - self.config.stop_loss_pct):
-                        exit_price = entry_price * (1 - self.config.stop_loss_pct)
+                    # A11: 止损成交价考虑跳空
+                    stop_threshold = entry_price * (1 - self.config.stop_loss_pct)
+                    if low <= stop_threshold:
+                        exit_price = min(stop_threshold, open_px)
                         exit_price = self._apply_slippage(exit_price, OrderType.SELL)
                         trade = self._execute_sell(
                             date, exit_price, position, cash,
@@ -143,8 +152,10 @@ class BacktestEngine:
                         continue
 
                 if self.config.enable_take_profit:
-                    if high >= entry_price * (1 + self.config.take_profit_pct):
-                        exit_price = entry_price * (1 + self.config.take_profit_pct)
+                    # A11: 止盈成交价考虑跳空
+                    profit_threshold = entry_price * (1 + self.config.take_profit_pct)
+                    if high >= profit_threshold:
+                        exit_price = max(profit_threshold, open_px)
                         exit_price = self._apply_slippage(exit_price, OrderType.SELL)
                         trade = self._execute_sell(
                             date, exit_price, position, cash,
@@ -173,6 +184,8 @@ class BacktestEngine:
 
             elif position == 0 and row['buy_signal'] and not is_limit_up:
                 max_shares = self._calc_max_shares(cash, close)
+                if max_shares <= 0:
+                    unaffordable_count += 1
                 if max_shares > 0:
                     entry_price = self._apply_slippage(close, OrderType.BUY)
                     cost = entry_price * max_shares
@@ -200,8 +213,13 @@ class BacktestEngine:
             equity_curve.append(cash)
 
         from stock_analysis.backtest.analyzer import _calculate_metrics
+        # A4: 计算持仓时长
+        if len(df) > 0 and hasattr(result, "holding_bar_count"):
+            result.time_in_market = result.holding_bar_count / len(df)
         _calculate_metrics(result, equity_curve, market_regimes, df)
 
+        result.unaffordable_lot_events = unaffordable_count
+        result.blocked_by_limit_events = limit_blocked_count
         return result
 
     def _apply_slippage(self, price: float, order_type: OrderType) -> float:
@@ -220,6 +238,11 @@ class BacktestEngine:
         return amount - self._calc_commission(amount, order_type)
 
     def _calc_max_shares(self, cash: float, price: float) -> int:
+        """返回可买整手股数（100 股整数倍）；返回 0 表示一手也买不起。
+
+        A3: 调用方以 `max_shares == 0` 计入 unaffordable_lot_events。
+        契约：本函数必须返回 int（tests/test_p0_correctness.py::test_lot_100_shares）。
+        """
         # 预留滑点和手续费空间，避免低价股全仓时 cost+commission 超出现金
         # P0: A股100股整手取整
         effective_price = price * (1 + self.config.slippage_rate)
@@ -227,10 +250,9 @@ class BacktestEngine:
         reserve = max(max_position * self.config.commission_rate, self.config.min_commission)
         affordable = max_position - reserve
         if affordable <= 0 or effective_price <= 0:
-            return 0
+            return 0  # A3: unaffordable（一手也买不起）
         raw = int(affordable / effective_price)
-        lots = (raw // 100) * 100  # 整手
-        return lots
+        return (raw // 100) * 100  # 整手
 
     def _execute_sell(
         self, date, price, shares, cash,
