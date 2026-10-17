@@ -1,6 +1,27 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
-- **最后更新**：2026-10-17 20:0x（台账 T3–T7 全部完成并提交 `d51ea5c`；门禁 14/14 全绿含 `-Full`）
+- **最后更新**：2026-10-17 23:3x（独立复核 + 出具修复清单）
+- **➡️ 下一步照 `GOAL_FIXLIST.md` 逐条执行（F01–F21，每条自带精确行号、改法、验收命令、应加的门禁项）。**
+- **本轮复核结论**：门禁 `-Full` 14/14 全绿退出码 0（22:56:28，主回合亲自跑），`pytest` 28 passed，
+  但**门禁绿 ≠ 契约全清**：实测出 §3.5 的 X1–X15 + 下列新发现，全部已整理进 `GOAL_FIXLIST.md`。
+  **X1 与 X4 属误判，已在下表更正/撤销**；T4 实际已完成（此前台账漂移，已更正）。
+- **本轮新查出（比 X1–X15 更严重）**：
+  **F01 基金侧实际在跑股票 581 组网格** —— `run_strategy_tournament()` 无 `strategies` 形参、内部自建股票网格，
+  `cli.py:193` 算出的 `build_fund_strategy_signals()` 被丢弃；实测 510300 的 10 个候选 **0 个**在基金网格、**10 个**在股票网格
+  （`candidates[0]=配对交易(10,-2.0,0.0)`，用在单一 ETF 上无金融意义）；连锁导致 `cli.py:250` 回查失败 → 信号降级全 False →
+  **基金 action 永远只能是 hold**，且 triggers 同时显示买/卖触发而 state=neutral（违反 C4，G03 查不到）。
+  **F07 B1 评分公式根本没换**（`analyzer.py:218-223/226-230` 仍是 `adj*0.5+年化*0.2-回撤*0.3`；`scoring.risk_adjusted_score` 是死码，
+  `cli.py:18` 以 `noqa:F401` 导入未用；基线"Wilson 占 72.8%"缺陷仍在）。
+  **F08 B2 ATR 自适应止损完全未实现**（`Select-String 'atr|stop_mode' stock_analysis\backtest\*.py` → **0 处匹配**）。
+  **F09 B3 walk-forward 未逐折重新寻优**（`analyzer.py:201` 名称语义均未改，`316/328-333` 仍对固定候选重跑子窗口）。
+  **F02 `--type` 参数空转**（`advise_internal` 收了 `type_hint` 却从不使用，靠 `code.startswith('5')` 判类型）。
+  **F15 基金 `grid_size()` 是硬编码算式且三方矛盾**（返回 43、实际 signals 40、契约要求 44；注释还写着 `# = 43 (≈44 as per contract)`；
+  VolTarget 算式按 3×2=6 实际只生成 3；族数实测 5 而契约要 6；registry 无 `_grid_defs()`）。
+  **F19 `BacktestResult` 的 `unaffordable_lot_events`/`blocked_by_limit_events` 被重复声明两次**（`engine.py:66-69`）。
+  **F12 补充**：对外报 `stop_loss=last_close×0.95`/`take_profit=×1.10`，而回测实际用 `BacktestConfig.stop_loss_pct=0.08`/`take_profit_pct=0.15`
+  → **Hermes 拿到的止损价与本项目回测结论不是同一个东西**。
+- **git 状态**：工作树 clean（`GOAL_FIXLIST.md` 为新增未提交），`main` **领先 origin/main 3 个提交**（`9b34797`/`d51ea5c`/`d915496`，Hermes 化工作尚未推送）。
+- **交付判定**：**暂不建议推送给 Hermes**。最小可推送集 = F01 + F03 + F05 + F06 + F17（详见 `GOAL_FIXLIST.md` §0.2）。
 - **最近完整门禁**：`pwsh -File tools/check_gates.ps1`
   → **PASS 14 | FAIL 0 | BLOCKED 0 | SKIP 0，退出码 0**（全绿，2026-10-17 18:46 `-Full`；G03 语义自洽 + G06 三窗口 均已修复）
 - 报告文件：`gates-report.json`
@@ -89,13 +110,50 @@
   `ma20_ma60_return_volatility`（600519 当前确为 Bull，标签相同但来源已换）。
 - [x] **T7 —— 脚手架清理 ✅ 已完成**：`source/phase_a_final_fix.py`、`refactor_cli.py`、`verify_a1.py`
   经引用检查（各 0 处引用）后删除；`source/*.py` 现仅剩 `cli.py`。
-- [ ] T4 —— B5 consensus：先过滤 `score <= -100` 的候选，再求族共识与分歧度（**唯一剩余项**）
+- [x] **T4 —— B5 consensus 过滤 ✅ 复核确认已实现并接线（2026-10-17 23:1x）**：`decision/consensus.py:44` 已按 `score > -100` 过滤并返回 `valid_count`/`all_invalid`；`cli.py:247` 调用、`cli.py:269` 用 `all_invalid` 参与 `top_valid` 判定。**本台账此前记为"唯一剩余项"属漂移**。但 B5 的"任一族 ≤50%"硬约束仍未作用于对外 `candidates` 字段（见 §3.5 X5），故 **B5 整体不算完成**。
 
 ## 3. 未验证 / 不得声称已过
 - G14 全量模式 ≤300s：**✅ 已验证**（2026-10-17 18:46 `-Full` → G14 PASS）
 - **⚠️ 门禁绿 ≠ 台账全清（防假绿）**：T3-T7 为已知**占位/深化项**（`deflated_sharpe` 输入近常数、`excess_vs_buy_hold` 硬编码 `0.05/[0.02,0.08]`、`market_regime` 恒 `Bull/0.7`、consensus 未过滤无效候选），门禁 G01-G14 **不直接校验**这些实现深度；本轮未动它们（墙钟超限 + 门禁已绿），是否推进留待下轮或人工决策
 - A2/A3/A5…A11 的契约细节：`pytest` 覆盖到的部分已过；未在真实 600519 数据上逐条取证的，一律记为**未验证**
 - 退出码 40（untradeable）路径：未验证
+
+### 3.5 2026-10-17 23:1x 独立复核（用户提问触发；主回合亲自跑门禁 + 逐条核契约）
+
+**门禁复跑原始输出**：`pwsh -File tools/check_gates.ps1 -Full` → `PASS 14 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0`（22:56:28）；
+`cd source; python -m pytest tests/ -q` → `28 passed in 16.49s`。工作树 `clean`，但 `main` 领先 `origin/main` **3 个提交**
+（`9b34797`/`d51ea5c`/`d915496`，即 Hermes 化全部工作**尚未推送**）。
+
+**结论：门禁全绿 ≠ 契约全清。** 下列缺口门禁查不到，均有原始证据：
+
+| 编号 | 缺口 | 实测证据 |
+|---|---|---|
+| X1 | ~~**基金侧是空壳**~~ → **本条已更正**：基金**代码路径是通的**，真因是本地缓存 `stock_analysis/data/fund_510300.csv` 只有 56 字节（仅表头、零数据行，某次失败拉取的残留）。触发一次真实拉取后缓存变 **97509 字节 / 1643 行**，`cli.py 510300 --json --fast` → **exit 0 / status ok / bars 1643 / candidates 10**。真正要修的是 **F20**（失败拉取不得写空壳缓存 + README 说明首跑需联网预热）。**但由此查出更严重的 F01：基金在跑股票的 581 组网格** |
+| X2 | **G04 判定过松（假绿）**：`probe.py::cli_json` 接受 exit∈(0,10)，`check_fund_contract` 只校验 `schema_version`+11 个顶层键 → 空壳文档也判 PASS | G04 PASS 与 X1 并存 |
+| X3 | **C5 退出码实际只有 0/10/30**：`cli.py:398 sys.exit(0 if status=='ok' else 10)` → **20 与 40 永不可达**（A3 的 untradeable/40 同为死码，§3 记的"未验证"应升级为"不可达"） | `insufficient_data` 实测退 **10**，契约要求 **20** |
+| X4 | ~~**C3/C7 schema 不同构**：基金输出比股票少 58 个键~~ → **本条已撤销（误判）**：那 58 键差异是拿"数据不足的空壳错误响应"比出来的假象。用真实基金数据（1643 行）重测：`仅股票有(0) / 仅基金有(0)` → **C3/C7 schema 同构已满足**，不要动 |
+| X5 | **B5 族占比硬约束未作用于对外字段**：`cli.py:359` 输出 `candidates[:10]`（原始评分前 10）而非去相关后的 `consensus['members']` | 600519 实测 StochRSI 6 / CCI 4 → 6 > ceil(10/2)=5，契约 B5 验证条目 **FAIL**（members 本身是 1:1，合规） |
+| X6 | **族推断用了契约明令禁止的方式**：`cli.py:224 family = idx.split('(')[0].split()[0]`（契约"关键现状事实"要求取 `_grid_defs()` 的 prefix，理由是与 `VWAP(累计)`/`策略组合 (2 票)` 命名不兼容） | 源码 cli.py:224 |
+| X7 | **B4 n_trials 口径错**：`cli.py:339` 输出 `len(candidates)=10`；`cli.py:260` 顶层 DSR 也用 10；`cli.py:212` 算出的真实值只喂给逐候选 DSR。而 `cli.py:210-211` 注释自称"必须取真实值而不是常数"——**注释与实现矛盾** | 实测 `dsr=0.432`(n_trials=10) vs **0.0452**(n_trials=581)，差 9.6×；同时 `excess_vs_buy_hold.p_positive=0.4975`、CI 跨 0，却报 `significant=True` + `status=ok` |
+| X8 | **B7 未接线**：`evidence.metrics` 9 项**全部只有 `point`，0 项有 `ci_95`**（`scoring.bootstrap_ci` 已实现，CLI 未调用） | 实测含 ci_95 的 metric 数 = 0/9 |
+| X9 | **A4 是占位**：`BacktestResult` **无 `time_in_market` 字段**，`cli.py:352` 靠 `hasattr(...) else 0` 兜底 → 输出恒 `{"point": 0}` | 实测 `time_in_market 字段: False`（`equity_curve: True`） |
+| X10 | **`decision/sizing.py` 根本不存在**（契约模块布局明列其负责仓位/止损/止盈/入场区/horizon）；实际全硬编码：`cli.py:324-326` = `last_close×0.98~1.02 / ×0.95 / ×1.10`，`cli.py:285 stop_distance=0.05` → 与 B2 的 ATR 自适应止损脱节，**对外止损价 ≠ 回测实际使用的止损** | `sizing.py 存在: False`、`cli.py 引用 sizing: False` |
+| X11 | **伪造/占位数字进了对外字段**：`score_oos = score×0.9`（实测比值精确 0.9000，伪造 OOS）；`distance_to_trigger` 恒 `{buy_pct:0.0, sell_pct:0.0}`；`invalidation` 把 `len(candidates)` 当交易日天数（实测"或 10 日内未触发"）且缺 B9 模板的"{family} 族共识转为看空"；`zero_trade_configs=0` 硬编码（基线实测 197 组零交易）；`warnings=[]` 硬编码（A3 告警永不触发）；`from_cache=True`/`source='sina'` 硬编码（真实触网也报来自缓存）；`regime_win_rates={}`；`confidence` 含纯常数项 `0.2*0.8` | cli.py 行 231 / 327 / 328 / 363 / 365 / 312-313 / 356 / 265 |
+| X12 | **D6 向后兼容破坏**：argparse 只有 7 个参数，`--detail` / `--no-regime` / `--opt-iters` **三个全部消失**（旧调用方直接 usage error 2） | `python cli.py --help` 实测 MISSING×3 |
+| X13 | **D1 未清干净**：`fund_analysis/utils.py` 仍有 `CONFIG_PATH`/`load_config`/`save_config`/`FUND_CONFIG = load_config()`（4 处）；`fund_analysis/fund_config.example.json` 仍在。（`strategy_master/{config,runner}.py` 保留属 AGENTS.md §5 有意豁免，**不算违规**；G11 只扫 `cli.py` 故判 PASS） | `Select-String source\**\*.py` 命中 4 处 |
+| X14 | **D3(e) 未做**：`source/requirements.txt` = akshare 1.17.44 / numpy 2.3.5 / pandas 3.0.6 / pytest 9.1.1；实测通过全部测试的环境 = akshare 1.18.29 / numpy 2.2.6 / pandas 3.0.1 / pytest 8.3.5 → Hermes `pip install -r` 会装上**未被验证过**的版本组合（契约 D3(e) 点名的正是这一条） | `python -c "import akshare,numpy,pandas"` 实测 |
+| X15 | **C7 基金注册表数字不符**：`registry.grid_size()==43`（契约与本文件 §7 均写 44），且**无 `_grid_defs()`**（契约要求与股票侧同构、含族前缀）→ "族数=6" 无法验证 | 实测 grid_size 43；`dir(registry)` 无 `_grid_defs` |
+
+**已确认真实通过的项**（不只报坏消息）：A1/G08 可负担不变式（`unaffordable_lot_events=0`、`position_fraction=0.146∈[0,0.30]`）；
+A6（`position = cash / price` 0 处匹配，零费率路径已删）；A8（`StrongBull|Crash` 仅出现在测试函数名 `test_advisor_no_crash`，非 regime 标签，单一 regime 已收敛）；
+D3(b)（README 无 `5-13-34`）；D4（`if best_name` 0 处、`cli.py` 418 行 ≤700）；G05 幂等 / G06 三窗口 / G12 / G14；
+C1 股票侧 stdout 纯 JSON（7200 字节）；C6 `advise()` 键集合与 `--json` 一致；
+T3 的 DSR 公式本身正确（实测 n_trials 单调性 10→0.4321 / 581→0.0452，符合多重检验语义）；`NaN/Inf free: True`。
+
+**下一步顺序（按 Hermes 可交付性排，不按契约编号）**：X1+X2（基金侧真数据 + **收紧 G04 判定**）→ X7（n_trials 口径）→
+X11（删伪造字段或如实置 null）→ X3（退出码 20/40 可达）→ X5+X6（族占比 + prefix 真源）→ X8（metrics 接 CI）→
+X12（恢复 3 个旧参数）→ X14（requirements 对齐）→ X10 / X9 / X4 / X13 / X15。
+**每修一项必须同时把它变成门禁项**，否则下轮仍然假绿（X2 就是现成反例）。
 
 ## 4. 每轮固定动作
 
