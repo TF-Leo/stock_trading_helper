@@ -67,10 +67,10 @@ try { $pyTestOut = (& python -m pytest tests/ -q --tb=line 2>&1 | Out-String) } 
 $passed = if ($pyTestOut -match '(\d+) passed') { [int]$Matches[1] } else { 0 }
 $failed = if ($pyTestOut -match '(\d+) failed') { [int]$Matches[1] } else { 0 }
 $errored = if ($pyTestOut -match '(\d+) error') { [int]$Matches[1] } else { 0 }
-if ($failed -eq 0 -and $errored -eq 0 -and $passed -ge 25) {
-    Add-Gate 'G01' '测试网离线全绿（≥25 passed）' 'PASS' "$passed passed / $failed failed" $pyTestOut.Trim()
+if ($failed -eq 0 -and $errored -eq 0 -and $passed -ge 40) {
+    Add-Gate 'G01' '测试网离线全绿（≥40 passed）' 'PASS' "$passed passed / $failed failed" $pyTestOut.Trim()
 } else {
-    Add-Gate 'G01' '测试网离线全绿（≥25 passed）' 'FAIL' "$passed passed / $failed failed / $errored error" $pyTestOut.Trim()
+    Add-Gate 'G01' '测试网离线全绿（≥40 passed）' 'FAIL' "$passed passed / $failed failed / $errored error" $pyTestOut.Trim()
 }
 
 # G09 无硬编码分支
@@ -83,10 +83,12 @@ $lines = (Get-Content $CliPy).Count
 if ($lines -le 700) { Add-Gate 'G10' 'cli.py ≤ 700 行' 'PASS' "$lines 行" }
 else { Add-Gate 'G10' 'cli.py ≤ 700 行' 'FAIL' "$lines 行 > 700" }
 
-# G11 配置残留（仅 CLI，strategy_master 兼容垫片不算）
-$g11 = @(Select-String -Path $CliPy -Pattern 'watchlist|save_config|load_config' -AllMatches)
-if ($g11.Count -eq 0) { Add-Gate 'G11' 'CLI 无 watchlist/save_config/load_config 残留' 'PASS' '0 处' }
-else { Add-Gate 'G11' 'CLI 无 watchlist/save_config/load_config 残留' 'FAIL' "$($g11.Count) 处" }
+# G11 配置残留（F18：范围已从 cli.py 扩大到 source/**，strategy_master 兼容垫片豁免）
+$g11 = @(Get-ChildItem -Path $Src -Recurse -Filter *.py |
+    Where-Object { $_.FullName -notmatch 'strategy_master' } |
+    Select-String -Pattern 'watchlist|save_config|load_config|stock_config|fund_config' -AllMatches)
+if ($g11.Count -eq 0) { Add-Gate 'G11' 'source/** 无 watchlist/save_config/load_config 残留' 'PASS' '0 处（strategy_master 白名单除外）' }
+else { Add-Gate 'G11' 'source/** 无 watchlist/save_config/load_config 残留' 'FAIL' "$($g11.Count) 处: $(($g11 | Select-Object -First 3 | ForEach-Object { "$($_.Filename):$($_.LineNumber)" }) -join ',')" }
 
 # G13 README 契约章节 + 示例 JSON 可解析
 $readmeTxt = if (Test-Path $Readme) { Get-Content $Readme -Raw -Encoding UTF8 } else { '' }
@@ -122,25 +124,47 @@ function Get-ProbeStatus {
 
 if ($null -eq $probe) {
     Add-Gate 'G02' 'CLI --json 契约（C1 纯 JSON + C3 字段齐备）' 'FAIL' '探针未产出 JSON，请先单独运行 tools/probe.py' $probeOut
-    foreach ($g in 'G03', 'G04', 'G05', 'G06', 'G07', 'G08', 'G12') {
+    foreach ($g in 'G03', 'G04', 'G05', 'G06', 'G07', 'G08', 'G12',
+        'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23',
+        'G24', 'G25', 'G26', 'G27', 'G28', 'G29', 'G30', 'G31', 'G32') {
         Add-Gate $g '（探针缺失，无法判定）' 'BLOCKED' 'probe.py 未产出结果'
     }
 }
 else {
-    $m = @{
-        'json'       = @('G02', 'CLI --json 契约（C1 纯 JSON + C3 字段齐备）')
-        'semantic'   = @('G03', '输出语义自洽（C4：无效候选不得给 buy / triggers 非空）')
-        'fund'       = @('G04', '基金同契约（510300 --json）')
-        'idempotent' = @('G05', '幂等确定性（C8：两次运行除时间戳外逐字节相同）')
-        'windows'    = @('G06', '三窗口 action/共识族一致（B6）')
-        'advise'     = @('G07', '单一真源 API（C6：advise() 键集合 == --json 键集合）')
-        'a1'         = @('G08', 'A1 结构性不变式（自适应资金下 100% 可负担一手）')
-    }
-    foreach ($k in $m.Keys) {
+    # 有序：门禁编号顺序即输出顺序
+    $m = @(
+        @('json', 'G02', 'CLI --json 契约（C1 纯 JSON + C3 字段齐备 + 真数据）'),
+        @('semantic', 'G03', '输出语义自洽（C4：无效候选不得给 buy / triggers 非空）'),
+        @('fund', 'G04', '基金同契约（510300 --json，F21 已收紧）'),
+        @('idempotent', 'G05', '幂等确定性（C8：两次运行除时间戳外逐字节相同）'),
+        @('windows', 'G06', '三窗口 action/共识族一致（B6）'),
+        @('advise', 'G07', '单一真源 API（C6：advise() 键集合 == --json 键集合）'),
+        @('a1', 'G08', 'A1 结构性不变式（自适应资金下 100% 可负担一手）'),
+        @('fund_grid', 'G15', '基金候选必须全部来自基金网格（F01）'),
+        @('type_hint', 'G16', '--type 生效（F02）'),
+        @('n_trials', 'G17', 'n_trials ≥ 实际评分配置数（F03/B4）'),
+        @('significance', 'G18', 'significant / no_edge 与超额收益 CI 自洽（F04/B8）'),
+        @('exit_codes', 'G19', '退出码与 status 一一对应（F05/C5）'),
+        @('placeholders', 'G20', '禁止占位常量（F06）'),
+        @('family_map', 'G21', '族名来自注册表 prefix（F14）'),
+        @('family_ratio', 'G22', 'B5 任一族占比 ≤ 50%（F13）'),
+        @('metrics_ci', 'G23', 'metrics CI 覆盖率 ≥5 且点估计在区间内（F10/B7）'),
+        @('time_in_market', 'G24', 'time_in_market 非恒 0（F11/A4）'),
+        @('sizing', 'G25', 'sizing 单一真源，cli 无硬编码止损（F12）'),
+        @('win_rate_share', 'G26', '胜率项贡献 ≤ 40%（F07/B1）'),
+        @('atr_stop', 'G27', 'ATR 自适应止损生效（F08/B2）'),
+        @('walk_forward', 'G28', 'walk-forward 逐折重新寻优（F09/B3）'),
+        @('old_args', 'G29', 'D6 旧参数不报 usage error（F16）'),
+        @('requirements', 'G30', 'requirements 与实测环境一致（F17/D3e）'),
+        @('fund_grid_consistency', 'G31', '基金网格单一真源自洽（F15）'),
+        @('fund_cache', 'G32', '失败拉取不写空壳缓存（F20）')
+    )
+    $quickSkip = @('fund', 'idempotent', 'windows', 'exit_codes', 'type_hint', 'fund_cache')
+    foreach ($row in $m) {
+        $k = $row[0]; $id = $row[1]; $nm = $row[2]
         $r = Get-ProbeStatus $k
-        $id = $m[$k][0]; $nm = $m[$k][1]
         if ($null -eq $r) { Add-Gate $id $nm 'BLOCKED' '探针无此键'; continue }
-        if ($Quick -and $k -in @('fund', 'idempotent', 'windows')) {
+        if ($Quick -and $k -in $quickSkip) {
             Add-Gate $id $nm 'SKIP' '-Quick 跳过了该项（完成声明前必须跑完整门禁）'; continue
         }
         $st = [string]$r.status
