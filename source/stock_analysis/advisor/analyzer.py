@@ -66,6 +66,31 @@ def analyze_market_level(df):
     return level, desc
 
 
+# A8: 全项目唯一的 regime 标签集合。历史序列与"当前判定"必须共用这一套，
+# 否则 engine 的 Bull/Bear/Shock 分市况统计会把 StrongBull/Crash 全部落进 Shock。
+REGIME_LABELS = ("Bull", "Bear", "Shock")
+
+
+def _regime_from_row(close, ma20, ma60, ret_20d, ret_60d, vol) -> tuple:
+    """单行 regime 判定（当前判定与历史序列共用的唯一规则）。"""
+    if close > ma20 and ret_20d > 0:
+        regime, confidence = "Bull", 0.7
+        if close > ma20 > ma60 and ret_20d > 5 and ret_60d > 10:
+            confidence = 0.9          # 强趋势：仍是 Bull，只是置信度更高
+    elif close < ma20 and close < ma60 and ret_20d < -5:
+        regime, confidence = "Bear", 0.7
+        if close < ma60 and ret_60d < -15:
+            confidence = 0.9          # 急跌：仍是 Bear
+    else:
+        regime, confidence = "Shock", 0.5
+    try:
+        if vol is not None and vol > 0.35 and regime == "Bull":
+            regime, confidence = "Shock", confidence * 0.7
+    except Exception:
+        pass
+    return regime, confidence
+
+
 def get_current_market_regime(df):
     if len(df) < 60:
         return "Unknown", 0.5
@@ -76,26 +101,31 @@ def get_current_market_regime(df):
     ret_20d = (curr / close.iloc[-20] - 1) * 100 if len(close) >= 20 else 0
     ret_60d = (curr / close.iloc[-60] - 1) * 100 if len(close) >= 60 else 0
     vol = close.pct_change().rolling(20).std().iloc[-1] * np.sqrt(252)
-    if curr > ma20 > ma60 and ret_20d > 5 and ret_60d > 10:
-        regime = "StrongBull"
-        confidence = 0.9
-    elif curr > ma20 and ret_20d > 0:
-        regime = "Bull"
-        confidence = 0.7
-    elif curr < ma20 and curr < ma60 and ret_20d < -5:
-        regime = "Bear"
-        confidence = 0.7
-    elif curr < ma60 and ret_60d < -15:
-        regime = "Crash"
-        confidence = 0.9
-    else:
-        regime = "Shock"
-        confidence = 0.5
-    if vol > 0.35:
-        if regime in ("Bull", "StrongBull"):
-            regime = "Shock"
-            confidence *= 0.7
-    return regime, confidence
+    return _regime_from_row(curr, ma20, ma60, ret_20d, ret_60d, vol)
+
+
+def market_regime_series(df):
+    """A8: 逐 bar regime 序列（Bull/Bear/Shock），供分市况胜率统计使用。
+
+    与 get_current_market_regime 共用 _regime_from_row，标签集合完全一致。
+    """
+    if df is None or len(df) < 60 or 'close' not in df.columns:
+        return None
+    close = df['close'].astype(float)
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    ret_20d = (close / close.shift(20) - 1) * 100
+    ret_60d = (close / close.shift(60) - 1) * 100
+    vol = close.pct_change().rolling(20).std() * np.sqrt(252)
+    labels = []
+    for c, m20, m60, r20, r60, v in zip(close, ma20, ma60, ret_20d, ret_60d, vol):
+        if any(x != x for x in (c, m20, m60)):   # NaN 检查
+            labels.append('Shock')
+            continue
+        labels.append(_regime_from_row(c, m20, m60, 0 if r20 != r20 else r20,
+                                       0 if r60 != r60 else r60,
+                                       None if v != v else v)[0])
+    return pd.Series(labels, index=df.index)
 
 
 def analyze_volume_chip_structure(df):

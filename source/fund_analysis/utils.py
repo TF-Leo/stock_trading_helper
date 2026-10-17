@@ -9,26 +9,7 @@ import json
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fund_config.json')
-
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"读取配置文件失败: {e}")
-            return {}
-    return {}
-
-def save_config(config):
-    try:
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"保存配置文件失败: {e}")
-
-FUND_CONFIG = load_config()
+# D1: 配置持久化已整体移除（无持久化配置，参数一律显式传参）
 
 def get_data_path(filename):
     if not os.path.exists(DATA_DIR):

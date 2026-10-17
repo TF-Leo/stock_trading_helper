@@ -10,7 +10,7 @@ import datetime
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fund_config.json')
+# D1: 配置持久化已整体移除（不再读写本地 JSON 配置文件）
 
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
@@ -39,21 +39,6 @@ def _expected_latest_trade_date():
     while expected.weekday() >= 5:  # 5=周六, 6=周日
         expected = expected - datetime.timedelta(days=1)
     return expected
-
-
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-
-def save_config(config):
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
 
 
 def fetch_fund_data(code):
