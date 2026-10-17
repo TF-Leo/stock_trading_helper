@@ -44,6 +44,69 @@
 依赖关系：F21 要在 F01 之后（否则 G04 收紧会立刻红）；F13 依赖 F14（先有 prefix 真源才能正确分族）；
 F12 依赖 F08（先有 ATR 止损，sizing 才有真东西可推导）；F04 依赖 F03（n_trials 正确后 significant 才有意义）。
 
+## 0.3 跟踪表（**这是你后续唯一需要逐条勾选的地方**）
+
+### 每轮必读 / 必写的 3 份文件
+
+| 文件 | 角色 | 你要做什么 |
+|---|---|---|
+| **`GOAL_FIXLIST.md`**（本文件） | 修复清单 = 执行依据 | 每修完一条，把下表「状态」列的 `[ ]` 改成 `[x]`，并在该条末尾追加「实测结果」小节（命令 + 原始输出片段 + 退出码 + 时间） |
+| **`PROGRESS.md`** | 唯一台账（AGENTS.md §6 要求每轮先读） | 每轮开始先读 §0/§2/§3.5；每修完一条立刻回写状态 + 证据。**禁止只交总结不写台账** |
+| **`AGENTS.md`** | 硬规则（只读，不要改） | 违反必然重演事故：Edit 只用 ops 语法且 `PUT` 带 body 时 header 以 `:` 结尾；>300 行文件禁止整体 Write；PowerShell 不是 bash；禁止改断言/跳过测试/弱化门禁来"变绿" |
+
+### 裁定器（**只允许加强，禁止弱化** —— AGENTS.md §4）
+
+| 文件 | 说明 |
+|---|---|
+| `tools/check_gates.ps1` | 门禁定义。现在 14 项，修完本清单应增加到约 28 项（G15–G32） |
+| `tools/probe.py` | 真跑取数探针。**F01/F03/F04/F06/F13/F14/F16/F17/F20/F21 都要求在这里加断言** |
+| `tools/validation_snapshot.py` | 生成 `source/docs/validation_600519.md`（A13/B6/F07 的实测快照） |
+| `gates-report.json` | 每次门禁重写的产物，`.gitignore` 已排除，**不入库、不要手改** |
+
+### 契约与文档（改完必须同步，否则 D3 不成立）
+
+| 文件 | 哪些条目会动它 |
+|---|---|
+| `GOAL_CONTRACT.md` | 上游契约（验收标准原始出处）。**F15 若选方案 B** 要改 C7 的"44 组 / 6 族" |
+| `README.md` | F16（旧参数）、F17（Python 版本 D3f）、F20（首次联网预热）、D5（两档实测耗时）、C2（schema 字段表 + 退出码表） |
+| `source/requirements.txt` | F17 |
+| `source/docs/validation_600519.md` | A13 / B6 验证二 / F07 的胜率项占比实测 |
+| `docs/FAILURE_DIAGNOSIS.md` | 只读参考（历史事故） |
+
+### 逐条跟踪表
+
+| 状态 | 条目 | 批次 | 主要改动文件 | 新增门禁 |
+|---|---|---|---|---|
+| `[ ]` | **F01** 基金在跑股票 581 组网格 | P0 | `stock_analysis/backtest/analyzer.py`、`cli.py` | G15 |
+| `[ ]` | **F05** 退出码 20/40 永不可达 | P0 | `decision/schema.py`、`decision/__init__.py`、`cli.py` | G19 |
+| `[ ]` | **F03** n_trials 口径错 → DSR 虚高 9.6× | P0 | `cli.py`（212/260/339） | G17 |
+| `[ ]` | **F04** significant 与 CI 矛盾、B8 未接线 | P0 | `cli.py`（270/282/329）、`analyzer.py`（377-388） | G18 |
+| `[ ]` | **F06** 8 处伪造/占位数字 | P0 | `cli.py`（231/265/312-313/327/328/356/363/365）、`data_loader/meta.py` | G20 |
+| `[ ]` | **F02** `--type` 参数空转 | P0 | `cli.py`（171/176-181） | G16 |
+| `[ ]` | **F21** 收紧 G04（假绿源头） | P0 | `tools/probe.py`（121-138、52） | 收紧 G04/G02 |
+| `[ ]` | **F14** 族推断用了禁止的字符串切分 | P1 | `stock_analysis/strategy/registry.py`（新增 `family_map`）、`cli.py`（224） | G21 |
+| `[ ]` | **F13** B5 族占比 ≤50% 未作用于 candidates | P1 | `decision/consensus.py`（80-104）、`cli.py`（359） | G22 |
+| `[ ]` | **F10** B7 bootstrap CI 未接线（0/9） | P1 | `cli.py`（343-353），复用 `decision/scoring.py:42` | G23 |
+| `[ ]` | **F11** A4 time_in_market 死码 | P1 | `stock_analysis/backtest/engine.py`（45-69、119-219） | G24 |
+| `[ ]` | **F12** `decision/sizing.py` 不存在、止损硬编码 | P1 | **新建** `decision/sizing.py`、`cli.py`（285/324-326） | G25 |
+| `[ ]` | **F07** B1 评分公式根本没换 | P1 | `analyzer.py`（218-235）、`decision/scoring.py`（14-30，含年化 bug） | G26 |
+| `[ ]` | **F08** B2 ATR 自适应止损未接线 | P1 | `engine.py`（31-41、124-131）；**ATR 已存在**于 `indicators/volatility.py:25 calc_atr` | G27 |
+| `[ ]` | **F09** B3 walk-forward 未逐折重新寻优 | P1 | `analyzer.py`（201、316、328-333） | G28 |
+| `[ ]` | **F16** 恢复 `--detail/--no-regime/--opt-iters` | P2 | `cli.py`（376-382）、`decision/__init__.py`（advise 签名） | G29 |
+| `[ ]` | **F17** requirements 与实测环境不一致 | P2 | `source/requirements.txt`、`README.md` | G30 |
+| `[ ]` | **F15** 基金 grid_size 三方矛盾（43/40/44） | P2 | `fund_analysis/fund_strategy/registry.py` | G31 |
+| `[ ]` | **F18** D1 清理未做完 | P2 | `fund_analysis/utils.py`（11-31）、删 `fund_analysis/fund_config.example.json` | G11 扩围到 `source/**` |
+| `[ ]` | **F19** BacktestResult 字段重复声明 | P2 | `engine.py`（68-69 删两行） | 并入 G01 |
+| `[ ]` | **F20** 失败拉取写空壳缓存 + 首跑需联网 | P2 | `data_loader/meta.py`、`cli.py`（183-184）、`README.md` | G32 |
+
+> **代码文件总览**（21 条合计只会动到这些）：`source/cli.py`（12 条会碰，最热点）、
+> `source/stock_analysis/backtest/analyzer.py`、`source/stock_analysis/backtest/engine.py`、
+> `source/decision/{schema,scoring,consensus,__init__}.py` + **新建** `source/decision/sizing.py`、
+> `source/stock_analysis/strategy/registry.py`、`source/fund_analysis/fund_strategy/registry.py`、
+> `source/fund_analysis/utils.py`、`source/stock_analysis/data_loader/meta.py`、`source/requirements.txt`、
+> `tools/{check_gates.ps1,probe.py}`、`README.md`。
+> **`source/tests/` 只允许新增用例，禁止改现有断言**（唯一例外见 F07 第 4 点，且必须在 PROGRESS.md 写明理由）。
+
 ---
 
 # 第一批 P0
@@ -554,10 +617,12 @@ print('OK')"
 
 **改法**
 1. `engine.py:31-41` `BacktestConfig` 增加 4 个字段，默认值按契约（`stop_mode="atr"` 即**默认启用**）。
-2. 新增滚动 ATR 计算。**硬约束（契约原文）：须为滚动历史 ATR，禁止使用当 bar 之后的数据**。
-   实现要点：`TR = max(high-low, |high-prev_close|, |low-prev_close|)`，`ATR = TR.rolling(atr_period).shift(1).mean()`
-   —— 那个 `.shift(1)` 是防 look-ahead 的关键，漏掉就重演基金侧 A5 的老问题。
-   建议放 `stock_analysis/indicators.py`（已有指标模块）并加单测。
+2. **ATR 已有现成实现，不要重写**（本节初稿写错了，据实更正）：`source/stock_analysis/indicators/volatility.py:25`
+   `calc_atr(high, low, close, period=14)`，并已在 `stock_analysis/indicators/__init__.py:31` 导出、`trend.py:130` 有使用先例。
+   实测其实现：`tr2/tr3` 已正确用 `close.shift(1)`（无 look-ahead）；`atr = tr.rolling(period).mean()` **含当根 TR**。
+   → 在"收盘后决策、次日成交"的引擎口径下含当根 TR 不算 look-ahead，但**你必须在接线时显式确认取值时点**：
+   止损距离只能用**入场当根收盘时已知**的 ATR（即 `atr.iloc[entry_i]`），绝不能在持仓期间用未来根的 ATR 回溯改写止损。
+   若改成盘中/当根即用，则必须补 `.shift(1)`。补一条单测锁定这个时点语义。
 3. `run_backtest` 里止损/止盈判定（`engine.py:124-131` 附近，即 F-涨跌停与止损那块）改为：
    `stop_mode=='atr'` 时用 `entry_price - atr_at_entry*atr_stop_mult` / `entry_price + atr_at_entry*atr_profit_mult`；
    `=='fixed'` 时走原 `stop_loss_pct`/`take_profit_pct` 路径（**契约要求保留 fixed 作回归保护**）。
