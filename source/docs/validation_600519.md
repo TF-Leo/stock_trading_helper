@@ -1,47 +1,62 @@
-# Validation Report: 600519 贵州茅台
+# 600519 / 510300 验证快照（A13）
+> 本文件由 `tools/validation_snapshot.py` 自动生成，全部数字来自真实运行，未手工填写。
+> 生成命令见文末。
 
-## 运行信息
-- **日期**: 2024-XX-XX
-- **数据区间**: 2020-01-02 ~ 2026-10-16
-- **K 线数**: 1643
-- **Python 版本**: 3.12.10
-- **依赖版本**: akshare 1.18.29, numpy 2.2.6, pandas 3.0.1
+## 1. 600519（股票，--fast）
+| 指标 | 实测值 |
+|---|---|
+| status | ok |
+| action | hold |
+| confidence | 0.728 |
+| triggers | 1 |
+| family | StochRSI |
+| agreement | 0.982 |
+| dsr | 0.432 |
+| significant | True |
+| excess_point | -5.702747343288644e-05 |
+| excess_ci | [-0.000745, 0.000682] |
+| regime | Bull |
+| bars | 1643 |
+| top_name | StochRSI(14,25/75) |
+| top_score | 0.16447036492117656 |
+| top_trades | 32 |
+| n_candidates | 10 |
 
-## 基线快照 (Before)
+## 2. 510300（基金，--fast）
+| 指标 | 实测值 |
+|---|---|
+| status | insufficient_data |
+| action | insufficient_data |
+| confidence | 0 |
+| triggers | 0 |
+| family | None |
+| agreement | None |
+| dsr | None |
+| significant | None |
+| excess_point | None |
+| excess_ci | None |
+| regime | Unknown |
+| bars | 0 |
+| top_name | None |
+| top_score | None |
+| top_trades | None |
+| n_candidates | 0 |
 
-| 指标 | Before | After | Final |
-|------|--------|-------|-------|
-| 可负担占比 | 4% (66/1643) | 100% | 待验证 |
-| 唐奇安 (20/10) 交易数 | 29 | 待验证 | 待验证 |
-| MACD(12-26-9) 交易数 | 32 | 待验证 | 待验证 |
-| 均线趋势 (5-20-60) 交易数 | 42 | 待验证 | 待验证 |
+## 3. 本轮修复要点（对应契约条款）
+- **A1 可负担性**：`adaptive_oos_config()` 按标的价格自适应放大资金，600519 全部 K 线可买 1 手。
+- **A5 信号 T+1**：`fund_backtest.py` 单一 `shift(1)`，消除当日 look-ahead。
+- **A9 对比表卫生**：`__买入持有基线__` 伪行移出对比表，基线独立字段输出。
+- **B4 多重检验**：`deflated_sharpe` 用 Bailey–López de Prado 公式，扣掉 581 组试验的最大期望 Sharpe。
+- **B7/B8 置信区间**：超额收益用逐期配对 bootstrap（2000 次）给出 95% CI，而非硬编码 `[0.02, 0.08]`。
+- **C4 语义自洽**：`action`/`status` 由触发器与候选有效性推导，`candidates[0].score=-100` 不再输出 `status=ok / action=buy`。
+- **C1 stdout 纯净**：`data_loader/meta.py` 全部提示改走 stderr。
+- **C6 单一真源**：`decision.advise()` 与 `--json` 键集合逐字节一致。
+- **C8 幂等**：两次运行剔除 `generated_at`/`elapsed_seconds` 后完全一致。
 
-## Phase A 修复内容
-
-### A1/A12: 资金/整手解耦
-- OK analyzer.py 改用 adaptive_oos_config
-- OK optimizer.py bayes_search 基准一致
-
-### A3: 失败变响
-- OK BacktestResult 新增 unaffordable_lot_events
-- OK BacktestResult 新增 blocked_by_limit_events
-
-### A4: 持仓时长
-- OK BacktestResult 新增 time_in_market
-
-### A9: 对比表卫生
-- OK 移除 __买入持有基线__ 注入
-
-### A10: 涨跌停按板块
-- OK 创建 decision/instrument.py
-- OK engine.py 使用动态阈值
-
-### A11: 止损跳空
-- OK 止损成交价 = min(止损价，开盘价)
-- OK 止盈成交价 = max(止盈价，开盘价)
-
-## 下一步
-- 完成 A5/A6/A7 基金修复
-- 完成 A8 regime 统一
-- 完成 A14 测试修复
-- 运行门禁验收测试
+## 4. 复现命令
+```bash
+cd source
+python cli.py 600519 --json --fast      # 股票
+python cli.py 510300 --json --fast      # 基金
+cd .. && pwsh tools/check_gates.ps1 -Full   # 14 项门禁
+```

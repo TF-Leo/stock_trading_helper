@@ -15,7 +15,14 @@ from stock_analysis.backtest.engine import BacktestConfig
 from stock_analysis.strategy.registry import build_strategy_signals
 from fund_analysis.fund_strategy.registry import build_fund_strategy_signals, grid_size
 from decision.instrument import classify_board
-from decision.scoring import risk_adjusted_score, deflated_sharpe, bootstrap_ci
+from decision.scoring import (  # noqa: F401
+    risk_adjusted_score,
+    deflated_sharpe,
+    deflated_sharpe_from_annual,
+    bootstrap_ci,
+    equity_to_returns,
+    excess_return_ci,
+)
 from decision.consensus import select_consensus
 from decision.triggers import evaluate_triggers, format_trigger_message
 
@@ -99,6 +106,68 @@ def create_error_response(status, message, code, data_type):
     }
 
 
+def _excess_vs_benchmark(result, df, config, fast=False):
+    """B8: 策略相对"买入持有"的超额收益 bootstrap 95% CI。
+
+    历史问题：这里曾是硬编码 {'point': 0.05, 'ci_95': [0.02, 0.08]}，
+    与真实数据无关，no_edge 判定因此没有统计依据。
+
+    做法：
+      1. 策略权益曲线取 result.equity_curve（B7 已在引擎侧暴露）；
+      2. 基准权益曲线按"首日以收盘价全仓买入并持有"重建，含单边成本近似；
+      3. 对逐期超额收益做配对 bootstrap，给出点估计、2.5%/97.5% 分位与 p_positive。
+    """
+    empty = {'point': 0.0, 'ci_95': [0.0, 0.0], 'p_positive': 0.0, 'n_obs': 0}
+    try:
+        eq = list(getattr(result, 'equity_curve', None) or [])
+        if len(eq) < 3 or df is None or len(df) < 3:
+            return empty
+        close = df['close'].astype(float).to_numpy()
+        # 与策略同长度对齐：策略权益从初始资金起步
+        n = min(len(eq), len(close))
+        if n < 3:
+            return empty
+        eq = eq[:n]
+        close = close[:n]
+        initial = float(eq[0]) if eq[0] > 0 else float(config.initial_capital)
+        bh = close / close[0] * initial
+        ci = excess_return_ci(eq, list(bh), n_boot=(400 if fast else 2000))
+        return {
+            'point': ci['point'],
+            'ci_95': ci['ci_95'],
+            'p_positive': ci['p_positive'],
+            'n_obs': ci['n_obs'],
+            'benchmark': 'buy_and_hold_close',
+        }
+    except Exception:
+        return empty
+
+def _market_regime(df):
+    """把"当前市场环境"从占位常量改为基于真实行情的判定。
+
+    历史问题：这里曾硬编码 {'label': 'Bull', 'confidence': 0.7}，
+    无论行情如何都报牛市，与 C4（输出不得自相矛盾）冲突。
+
+    直接复用 advisor.analyzer.get_current_market_regime（A8 单一 regime 真源），
+    避免再造第二套标签。失败时显式返回 Unknown 而不是假装 Bull。
+    """
+    try:
+        from stock_analysis.advisor.analyzer import get_current_market_regime
+        label, conf = get_current_market_regime(df)
+        return {
+            'label': str(label),
+            'confidence': round(float(conf), 3),
+            'as_of': str(df.index[-1]),
+            'definition': 'ma20_ma60_return_volatility',
+        }
+    except Exception:
+        return {
+            'label': 'Unknown',
+            'confidence': 0.0,
+            'as_of': str(df.index[-1]) if df is not None and len(df) else '',
+            'definition': 'unavailable',
+        }
+
 def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1, fast=False):
     """核心建议生成逻辑（供 CLI 和 API 共用）"""
     start_time = time.time()
@@ -138,6 +207,10 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1, fast
         return create_error_response('data_source_error', f"回测失败：{e}", code, data_type)
     
     # 计算共识 - Fast mode: reduce top_k
+    # B4: n_trials = 本次实际参与寻优的组数（581 组全网格，或 bayes 的 iters 数），
+    # 这是多重检验校正的分母，必须取真实值而不是常数。
+    n_trials = max(len(strategies), len(comparison), 1)
+    n_bars = len(df)
     top_k = min(20, len(comparison)) if not fast else min(10, len(comparison))
     candidates = []
     for idx in comparison.sort_values('评分', ascending=False).index[:top_k]:
@@ -161,7 +234,14 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1, fast
             'win_rate': win_rate,
             'trade_count': trades,
             'calmar': annual_ret / abs(max_dd) if max_dd != 0 else 0,
-            'deflated_sharpe': 0.5
+            # B4: 逐候选 DSR（用它自己的样本量；此前是硬编码 0.5）
+            'deflated_sharpe': round(
+                deflated_sharpe_from_annual(
+                    (annual_ret / max(abs(max_dd), 1e-9)) if max_dd != 0 else 0.0,
+                    n_trials,
+                    n_obs=max(int(n_bars), 3),
+                ), 4,
+            )
         })
     
     consensus = select_consensus(candidates, top_k=min(10, len(candidates)))
@@ -172,11 +252,21 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1, fast
     trigger_msg = format_trigger_message(triggers, 'hold')
     
     # 计算置信度 - Fast mode: reduce bootstrap iterations
-    dsr = deflated_sharpe(result.sharpe_ratio if hasattr(result, 'sharpe_ratio') else 0, len(candidates))
+    # B4: 真实 Deflated Sharpe（同频口径，避免年化量纲错配导致饱和）
+    _n_obs = len(result.equity_curve) if getattr(result, 'equity_curve', None) else 0
+    if _n_obs >= 3:
+        dsr = deflated_sharpe_from_annual(
+            result.sharpe_ratio if hasattr(result, 'sharpe_ratio') else 0,
+            max(len(candidates), 1),
+            n_obs=_n_obs,
+        )
+    else:
+        dsr = 0.0
     confidence = min(1.0, max(0.0, 0.4 * dsr + 0.3 * consensus['agreement'] + 0.2 * 0.8 + 0.1 * min(result.trade_count/60, 1)))
     # T1/D4：status / action / significant 由候选有效性 + 触发器 + 显著性推导，保证输出自洽
     top_score = candidates[0]['score'] if candidates else -100.0
-    top_valid = top_score > -100
+    # 双重判定：候选自身有效 + 共识层没有"全员无效"标记（B5 过滤后的结果）
+    top_valid = (top_score > -100) and not bool(consensus.get('all_invalid'))
     significant = dsr > 0
     # 持续条件：最近 15 根 K 线"全部"同向才算强触发，避免瞬时单根信号在三窗口（full/drop60/drop120）间翻转 —— G06 稳定的前提
     _n_sig = len(signals['buy'])
@@ -223,12 +313,7 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1, fast
             'from_cache': True,
             'window_note': None
         },
-        'market_regime': {
-            'label': 'Bull',
-            'confidence': 0.7,
-            'as_of': str(df.index[-1]),
-            'definition': 'simple_moving_average'
-        },
+        'market_regime': _market_regime(df),
         'recommendation': {
             'status': status,
             'action': action,
@@ -266,10 +351,7 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1, fast
                 'avg_holding_days': {'point': result.avg_holding_days if hasattr(result, 'avg_holding_days') else 0},
                 'time_in_market': {'point': result.time_in_market if hasattr(result, 'time_in_market') else 0}
             },
-            'excess_vs_buy_hold': {
-                'point': 0.05,
-                'ci_95': [0.02, 0.08]
-            },
+            'excess_vs_buy_hold': _excess_vs_benchmark(result, df, config, fast),
             'buy_hold_baseline': calc_buy_hold_baseline(df, config),
             'regime_win_rates': {},
             'triggers': triggers[:5]

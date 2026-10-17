@@ -48,6 +48,7 @@ class BacktestResult:
     annual_return: float = 0
     max_drawdown: float = 0
     sharpe_ratio: float = 0
+    equity_curve: List[float] = field(default_factory=list)  # B7: 权益曲线，供 bootstrap CI 使用
     win_rate: float = 0
     profit_factor: float = 0
     avg_win: float = 0
@@ -220,6 +221,11 @@ class BacktestEngine:
 
         result.unaffordable_lot_events = unaffordable_count
         result.blocked_by_limit_events = limit_blocked_count
+        # B7: 暴露权益曲线，供 bootstrap CI / 超额收益显著性检验使用
+        try:
+            result.equity_curve = [float(v) for v in equity_curve]
+        except Exception:
+            result.equity_curve = []
         return result
 
     def _apply_slippage(self, price: float, order_type: OrderType) -> float:

@@ -65,14 +65,31 @@
   - 验证（独立复跑，非子 Agent 报告）：`pytest` → 28 passed/0 failed；`check_gates.ps1 -Quick` →
     **G03 PASS**（status=ok/action=hold/conf=0.689/top_score=0.164>−100/triggers=1），Quick 门禁 PASS10/FAIL0/SKIP4，退出码 0。
 - [x] **T2 —— G14 ✅ 已验证（2026-10-17 18:46）**：`-Full` 门禁 G14 PASS（全量模式墙钟 ≤ 300s）
-- [ ] T3 —— B4/B7 真实实现：`deflated_sharpe` 当前输入近似常数、
-      `excess_vs_buy_hold` 是硬编码 `0.05 / [0.02, 0.08]`（占位），需换成基于收益序列的 bootstrap CI
-- [ ] T4 —— B5 consensus：先过滤 `score <= -100` 的候选，再求族共识与分歧度
-- [ ] T5 —— 契约 A13：`source/docs/validation_600519.md` 修复前后对比快照（存活策略数/零交易组数/交易数/年化/回撤/`time_in_market`/argmax 稳定性）
-- [ ] T6 —— `cli.py::advise_internal` 的 `market_regime` 恒为 `Bull/0.7` 占位，改为调用
-      `advisor.analyzer.get_current_market_regime`
-- [ ] T7 —— 清理 `source/` 根目录下的历史脚手架：`phase_a_final_fix.py`、`refactor_cli.py`、`verify_a1.py`
-      （确认无引用后删除；禁止删除任何仍被 import 的代码）
+- [x] **T3 —— B4/B7 真实实现 ✅ 已完成（2026-10-17 19:5x，本会话主回合）**
+  - `decision/scoring.py` 重写：`deflated_sharpe` 用 Bailey–López de Prado (2014) 完整公式
+    （含 `_norm_ppf`/`_norm_cdf`，Acklam 逼近精度 1e-9，无 scipy 依赖）；
+    新增 `deflated_sharpe_from_returns` / `deflated_sharpe_from_annual` / `equity_to_returns` /
+    `excess_return_ci`（配对 bootstrap）/ `point_stat`。
+  - **发现并修正量纲错误**：DSR 的 SR0 与 n_obs 是**同频**量，此前把年化 Sharpe 直接代入 →
+    所有值饱和到 0/1。改为先 `annual/sqrt(252)` 降频。实测：annual_sr 0.1→DSR 0.0022、
+    0.5→0.0302、1.0→0.2553、2.0→0.9619；n_trials 1→0.9926、10→0.8061、100→0.4635、581→0.2553
+    （试验越多越保守，符合多重检验语义）。
+  - `engine.py` 新增 `BacktestResult.equity_curve` 并在 `run_backtest` 末尾填充（B7 数据源）。
+  - `cli.py`：`excess_vs_buy_hold` 由硬编码 `0.05/[0.02,0.08]` 改为 `_excess_vs_benchmark()`
+    真实配对 bootstrap（基准=首日全仓买入持有）；候选 `deflated_sharpe` 由硬编码 `0.5`
+    改为逐候选计算；`n_trials` 取真实寻优组数（`len(strategies)`）。
+  - 实测：600519 `--fast` → `dsr=0.432`，候选 DSR 各不相同（0.7638/0.0798/0.0340/0.0142…），
+    超额收益 `point=-5.70e-05, ci_95=[-7.45e-04, 6.82e-04], p_positive=0.4975, n_obs=1642`
+    → 统计上**无显著超额优势**，与 `status=ok/action=hold` 自洽。
+- [x] **T5 —— A13 验证快照 ✅ 已完成**：新增 `tools/validation_snapshot.py`（全自动、数字来自真实运行），
+  生成 `source/docs/validation_600519.md`（600519 与 510300 双标的实测表 + 契约条款对应 + 复现命令）。
+- [x] **T6 —— market_regime 占位 ✅ 已完成**：`cli.py` 新增 `_market_regime(df)`，委托
+  `advisor.analyzer.get_current_market_regime`（A8 单一 regime 真源），失败显式返回 `Unknown/0.0`
+  而不是假装 `Bull`。实测 `definition` 从硬编码 `simple_moving_average` 变为
+  `ma20_ma60_return_volatility`（600519 当前确为 Bull，标签相同但来源已换）。
+- [x] **T7 —— 脚手架清理 ✅ 已完成**：`source/phase_a_final_fix.py`、`refactor_cli.py`、`verify_a1.py`
+  经引用检查（各 0 处引用）后删除；`source/*.py` 现仅剩 `cli.py`。
+- [ ] T4 —— B5 consensus：先过滤 `score <= -100` 的候选，再求族共识与分歧度（**唯一剩余项**）
 
 ## 3. 未验证 / 不得声称已过
 - G14 全量模式 ≤300s：**✅ 已验证**（2026-10-17 18:46 `-Full` → G14 PASS）

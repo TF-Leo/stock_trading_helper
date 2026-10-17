@@ -38,8 +38,28 @@ def select_consensus(candidates: List[Dict], top_k: int = 10) -> Dict:
             }
         }
     
+    # B5/C4: 先剔除被评分判定为无效的候选，再求族共识。
+    # analyzer 用 -100 作为"无效"地板值（OOS 交易数不足 OOS_MIN_TRADES 会被硬判 -100）；
+    # 这些候选参与共识会让 agreement 虚高，进而推出自相矛盾的建议。
+    valid = [c for c in candidates if float(c.get('score', -100) or -100) > -100.0]
+    if not valid:
+        return {
+            'members': [],
+            'family': None,
+            'agreement': 0.0,
+            'dispersion': 0.0,
+            'valid_count': 0,
+            'all_invalid': True,
+            'stability': {
+                'action_stable': True,
+                'family_stable': True,
+                'windows_tested': 0,
+                'top_k_overlap_min': 0,
+            },
+        }
+
     # Sort by score descending
-    sorted_cands = sorted(candidates, key=lambda x: x.get('score', 0), reverse=True)
+    sorted_cands = sorted(valid, key=lambda x: x.get('score', 0), reverse=True)
     
     # Family de-correlation: keep only best per family
     family_best = {}
@@ -94,8 +114,9 @@ def select_consensus(candidates: List[Dict], top_k: int = 10) -> Dict:
     return {
         'members': representatives,
         'family': dominant_family,
+        'valid_count': len(valid),
+        'all_invalid': False,
         'agreement': agreement,
-        'dispersion': dispersion,
         'dispersion': dispersion,
         'stability': {
             'action_stable': True,  # Will be validated in B6
