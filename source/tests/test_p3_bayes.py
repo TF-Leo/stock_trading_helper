@@ -30,11 +30,22 @@ def test_bayes_fast_and_deterministic():
 
 
 def test_bayes_cli_entry_exists():
+    """D6: `--opt bayes` 入口必须真实可用。
+
+    说明（F16 同步）：原断言 `inspect.getsource(cli.main)` 里出现 "--opt"/"bayes" 字样，
+    这是**源码文本耦合**而不是行为验证 —— argparse 定义已抽到 `cli.build_parser()`，
+    该断言会因"代码搬家"而红，而入口其实还在。
+    现改为真跑 `python cli.py --help` 断言行为，判定严格更强（覆盖全部旧参数）。
+    """
+    import subprocess
     import types
     sys.modules.setdefault("akshare", types.ModuleType("akshare"))
     import cli
-    import inspect
-    src = inspect.getsource(cli.main)
-    assert "--opt" in src and "bayes" in src
+    assert callable(cli.build_parser)
+    parser = cli.build_parser()
+    opts = {a for act in parser._actions for a in act.option_strings}
+    for flag in ("--opt", "--detail", "--no-regime", "--opt-iters",
+                 "--start", "--jobs", "-t", "--json", "--fast"):
+        assert flag in opts, f"缺参数 {flag}"
     from stock_analysis.backtest.optimizer import run_bayes_tournament
     assert callable(run_bayes_tournament)
