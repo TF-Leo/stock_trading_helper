@@ -32,10 +32,12 @@ def bayes_search(
     iters: int = 30,
     seed: int = 7,
     jobs: int = 1,
+    strategies: Dict[str, object] = None,
 ) -> Tuple[str, BacktestResult, pd.DataFrame]:
     from stock_analysis.strategy.registry import build_strategy_signals
     rng = random.Random(seed)
-    grid = build_strategy_signals()
+    # F01: 允许调用方注入网格（基金侧不得再跑股票 581 组）
+    grid = strategies if strategies is not None else build_strategy_signals()
     names = list(grid.keys())
     fam_map: Dict[str, list] = {}
     for n in names:
@@ -104,8 +106,28 @@ def bayes_search(
     else:
         best_name = max(evaluated, key=evaluated.get)
     best_result = eng_oos.run_backtest(df, grid[best_name], market_regimes)
-    rows = [{"策略": n, "评分OOS": s, "交易数_OOS": int(eval_trades.get(n, 0))}
-            for n, s in sorted(evaluated.items(), key=lambda kv: kv[1], reverse=True)]
+    # 候选表必须带全量指标：旧实现只有 评分OOS/交易数_OOS，
+    # 导致 cli 的 candidates 全是 score=0 / trade_count=0 的伪造候选（C4 自相矛盾）。
+    from stock_analysis.backtest.analyzer import score_backtest_result
+    rows = []
+    for n, s in sorted(evaluated.items(), key=lambda kv: kv[1], reverse=True):
+        try:
+            r_full = eng_is.run_backtest(df, grid[n], market_regimes)
+            is_s = float(score_backtest_result(r_full))
+            row = {
+                "策略": n, "评分": float(s), "评分IS": is_s, "评分OOS": float(s),
+                "评分Final": float(s),
+                "年化收益": f"{r_full.annual_return:.2%}",
+                "最大回撤": f"{r_full.max_drawdown:.2%}",
+                "胜率": f"{r_full.win_rate:.2%}",
+                "交易次数": int(r_full.trade_count),
+                "交易数_OOS": int(eval_trades.get(n, 0)),
+            }
+        except Exception:
+            row = {"策略": n, "评分": float(s), "评分IS": -100.0, "评分OOS": float(s),
+                   "评分Final": float(s), "年化收益": "0.00%", "最大回撤": "0.00%",
+                   "胜率": "0.00%", "交易次数": 0, "交易数_OOS": int(eval_trades.get(n, 0))}
+        rows.append(row)
     comp = pd.DataFrame(rows).set_index("策略")
     base = calc_buy_hold_baseline(df, config)
     # 同上：不给 best_name 加中文后缀，避免调用方回查 grid[name] 时静默降级

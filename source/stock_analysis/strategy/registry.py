@@ -5,6 +5,7 @@
 所有参数网格只在此定义，两处均委托到本模块。
 """
 from __future__ import annotations
+import functools
 import itertools
 from typing import Dict, Tuple, Type
 
@@ -215,3 +216,31 @@ def build_strategy_signals() -> Dict[str, object]:
 
 def grid_size() -> int:
     return sum(len(p) for _, _, p, _ in _grid_defs())
+
+
+@functools.lru_cache(maxsize=1)
+def family_map() -> Dict[str, str]:
+    """B5: {策略名: 族前缀}，真源 = `_grid_defs()` 的 prefix（581 键）。
+
+    契约「关键现状事实」明令：族分组必须取自 `_grid_defs()` 的 prefix，
+    **禁止**用字符串按 `(` 切分重新推断（`VWAP(累计)`、`策略组合(2票)` 等命名会切错）。
+    """
+    mapping: Dict[str, str] = {}
+    for prefix, _cls, params_list, namer in _grid_defs():
+        for kw in params_list:
+            mapping[namer(kw)] = prefix
+    return mapping
+
+
+def family_of(name: str) -> str:
+    """name -> 族前缀；不在网格中返回 'unknown'。"""
+    return family_map().get(name, "unknown")
+
+
+def family_names() -> list:
+    """全部族前缀（去重，保持注册顺序）。"""
+    seen = []
+    for prefix, _cls, _params, _namer in _grid_defs():
+        if prefix not in seen:
+            seen.append(prefix)
+    return seen

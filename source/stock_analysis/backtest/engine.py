@@ -12,6 +12,10 @@ class OrderType(Enum):
     SELL = "sell"
 
 
+# B2: ATR 内容指纹缓存（{指纹: pd.Series}）。只在本进程内有效，不参与序列化。
+_ATR_CACHE = {}
+
+
 @dataclass
 class Trade:
     entry_date: datetime
@@ -39,6 +43,11 @@ class BacktestConfig:
     take_profit_pct: float = 0.15
     enable_stop_loss: bool = True
     enable_take_profit: bool = True
+    # B2: 波动率自适应止损止盈。默认 "atr"（契约要求默认启用），"fixed" 保留旧逻辑做回归保护。
+    stop_mode: str = "atr"
+    atr_period: int = 14
+    atr_stop_mult: float = 2.5
+    atr_profit_mult: float = 4.0
 
 
 @dataclass
@@ -65,8 +74,9 @@ class BacktestResult:
     var_95: float = 0
     unaffordable_lot_events: int = 0
     blocked_by_limit_events: int = 0
-    unaffordable_lot_events: int = 0
-    blocked_by_limit_events: int = 0
+    # A4: 持仓 bar 数与占比（此前 holding_bar_count 从未被赋值，time_in_market 恒 0）
+    holding_bar_count: int = 0
+    time_in_market: float = 0.0
 
     def to_dict(self):
         return {
@@ -93,12 +103,49 @@ class BacktestEngine:
     def __init__(self, config: BacktestConfig = None):
         self.config = config or BacktestConfig()
 
+    def _atr_series(self, df: pd.DataFrame):
+        """B2: 逐 bar ATR（带缓存，避免 581 组网格重复计算）。
+
+        同一份 df 会被 581 个策略共用（compare_strategies 直接传同一个对象），
+        因此把结果按"内容指纹"缓存即可把 581 次 calc_atr 降为 1 次。
+        注意：不能把 Series 塞进 `df.attrs` —— pandas 的 `__finalize__` 会做
+        `attrs == attrs` 比较，dict 里含 Series 会抛
+        "The truth value of a Series is ambiguous"（实测踩过）。
+        取不到 OHLC 或计算出错时返回 None（调用方回落固定百分比止损）。
+        """
+        if str(getattr(self.config, 'stop_mode', 'atr')).lower() != 'atr':
+            return None
+        if df is None or len(df) == 0:
+            return None
+        if not {'high', 'low', 'close'}.issubset(set(df.columns)):
+            return None
+        period = int(getattr(self.config, 'atr_period', 14) or 14)
+        try:
+            key = (len(df), float(df['close'].iloc[0]), float(df['close'].iloc[-1]),
+                   round(float(df['high'].sum()), 4), round(float(df['low'].sum()), 4), period)
+        except Exception:
+            key = None
+        if key is not None and key in _ATR_CACHE:
+            return _ATR_CACHE[key]
+        try:
+            from stock_analysis.indicators.volatility import calc_atr
+            series = calc_atr(df['high'], df['low'], df['close'], period=period)
+        except Exception:
+            series = None
+        if key is not None:
+            if len(_ATR_CACHE) > 64:
+                _ATR_CACHE.clear()
+            _ATR_CACHE[key] = series
+        return series
+
     def run_backtest(
         self,
         df: pd.DataFrame,
         signal_generator: Callable,
         market_regimes: pd.Series = None,
     ) -> BacktestResult:
+        # B2: 在 copy 之前取 ATR（同 df 对象共享缓存，581 组只算一次）
+        atr_cached = self._atr_series(df)
         df = df.copy()
         signals = signal_generator(df)
         # P0: 消除同收盘偏差 — 信号T日收盘算出，T+1日才能执行
@@ -121,6 +168,11 @@ class BacktestEngine:
         equity_curve = []
 
         prev_close = float(df['close'].iloc[0]) if len(df) else 0.0
+        # B2: 逐 bar 滚动历史 ATR（含当根 TR；本引擎为"收盘后决策、次日成交"，
+        # 入场当根收盘时该值已知，不构成前视）。取不到 ATR 时该笔回落固定百分比。
+        atr_series = atr_cached
+        entry_stop_dist = None      # 入场时锁定的止损距离（比例）
+        entry_profit_dist = None    # 入场时锁定的止盈距离（比例）
         for i in range(len(df)):
             row = df.iloc[i]
             date = df.index[i]
@@ -134,8 +186,12 @@ class BacktestEngine:
 
             if position > 0 and not is_limit_down:
                 if self.config.enable_stop_loss:
-                    # A11: 止损成交价考虑跳空
-                    stop_threshold = entry_price * (1 - self.config.stop_loss_pct)
+                    # A11: 止损成交价考虑跳空；B2: 止损距离优先用入场时已知的 ATR
+                    if entry_stop_dist is None:
+                        stop_dist = float(self.config.stop_loss_pct)
+                    else:
+                        stop_dist = float(entry_stop_dist)
+                    stop_threshold = entry_price * (1 - stop_dist)
                     if low <= stop_threshold:
                         exit_price = min(stop_threshold, open_px)
                         exit_price = self._apply_slippage(exit_price, OrderType.SELL)
@@ -148,13 +204,19 @@ class BacktestEngine:
                         cash += self._apply_commission(exit_price * position, OrderType.SELL)
                         position = 0
                         entry_cost_total = 0.0
+                        entry_stop_dist = None
+                        entry_profit_dist = None
                         equity_curve.append(cash)
                         prev_close = float(close)
                         continue
 
                 if self.config.enable_take_profit:
-                    # A11: 止盈成交价考虑跳空
-                    profit_threshold = entry_price * (1 + self.config.take_profit_pct)
+                    # A11: 止盈成交价考虑跳空；B2: 止盈距离优先用入场时已知的 ATR
+                    if entry_profit_dist is None:
+                        profit_dist = float(self.config.take_profit_pct)
+                    else:
+                        profit_dist = float(entry_profit_dist)
+                    profit_threshold = entry_price * (1 + profit_dist)
                     if high >= profit_threshold:
                         exit_price = max(profit_threshold, open_px)
                         exit_price = self._apply_slippage(exit_price, OrderType.SELL)
@@ -167,6 +229,8 @@ class BacktestEngine:
                         cash += self._apply_commission(exit_price * position, OrderType.SELL)
                         position = 0
                         entry_cost_total = 0.0
+                        entry_stop_dist = None
+                        entry_profit_dist = None
                         equity_curve.append(cash)
                         prev_close = float(close)
                         continue
@@ -182,6 +246,8 @@ class BacktestEngine:
                 cash += self._apply_commission(exit_price * position, OrderType.SELL)
                 position = 0
                 entry_cost_total = 0.0
+                entry_stop_dist = None
+                entry_profit_dist = None
 
             elif position == 0 and row['buy_signal'] and not is_limit_up:
                 max_shares = self._calc_max_shares(cash, close)
@@ -197,7 +263,21 @@ class BacktestEngine:
                         entry_cost_total = cost + commission
                         entry_date = date
                         entry_reason = "信号买入"
+                        # B2: 用**入场当根收盘时已知**的 ATR 锁定止损/止盈距离，
+                        # 持仓期间不再回溯改写（否则等于用未来波动调整当前止损）。
+                        entry_stop_dist = None
+                        entry_profit_dist = None
+                        if atr_series is not None:
+                            try:
+                                _atr = float(atr_series.iloc[i])
+                            except Exception:
+                                _atr = float('nan')
+                            if _atr == _atr and _atr > 0 and entry_price > 0:
+                                entry_stop_dist = (self.config.atr_stop_mult * _atr) / entry_price
+                                entry_profit_dist = (self.config.atr_profit_mult * _atr) / entry_price
 
+            if position > 0:
+                result.holding_bar_count += 1
             equity_curve.append(cash + position * close)
             prev_close = float(close)
 
@@ -214,9 +294,9 @@ class BacktestEngine:
             equity_curve.append(cash)
 
         from stock_analysis.backtest.analyzer import _calculate_metrics
-        # A4: 计算持仓时长
-        if len(df) > 0 and hasattr(result, "holding_bar_count"):
-            result.time_in_market = result.holding_bar_count / len(df)
+        # A4: 持仓时长 = 持仓 bar 数 / 总 bar 数（holding_bar_count 已在循环内累加）
+        if len(df) > 0:
+            result.time_in_market = float(result.holding_bar_count) / float(len(df))
         _calculate_metrics(result, equity_curve, market_regimes, df)
 
         result.unaffordable_lot_events = unaffordable_count

@@ -215,19 +215,82 @@ def walk_forward_splits(df: pd.DataFrame, n_splits: int = 3):
     return folds
 
 
+def walk_forward_optimize(
+    df: pd.DataFrame,
+    strategies: Dict[str, Callable],
+    config: BacktestConfig = None,
+    n_splits: int = 3,
+    top_n: int = TOP_N_OOS,
+    preselect: List[str] = None,
+    market_regimes: pd.Series = None,
+) -> dict:
+    """B3: 真正的 walk-forward —— **每折在该折训练集上独立重新选参**，再用该折测试集评估。
+
+    历史缺陷：旧实现把"已在 IS 选定的固定候选"直接在各折子窗口重跑，对参数选择零防过拟合。
+    本函数返回:
+        {'folds': [{'best','train_score','test_score','test_trades'}, ...],
+         'by_name': {策略名: [该策略被选中那几折的 test 分数]},
+         'global_best': 全局 IS 最优（用于"各折最优不完全相同"的验证）}
+    """
+    folds = walk_forward_splits(df, n_splits)
+    names = list(preselect) if preselect else list(strategies)
+    names = [n for n in names if n in strategies]
+    out: dict = {"folds": [], "by_name": {}, "global_best": None}
+    if not folds or not names:
+        return out
+    base_cfg = config or BacktestConfig()
+    oos_cfg = adaptive_oos_config(df, base_cfg)
+    for ftr, fte in folds:
+        tr_reg, te_reg = split_regimes(market_regimes, ftr, fte)
+        eng_tr = BacktestEngine(adaptive_oos_config(ftr, base_cfg))
+        best_name, best_score = None, float("-inf")
+        for nm in names:
+            try:
+                r_tr = eng_tr.run_backtest(ftr, strategies[nm], tr_reg)
+                s_tr = score_backtest_result(r_tr)
+            except Exception:
+                continue
+            if s_tr > best_score:
+                best_score, best_name = float(s_tr), nm
+        if best_name is None:
+            continue
+        eng_te = BacktestEngine(oos_cfg)
+        r_te = eng_te.run_backtest(fte, strategies[best_name], te_reg)
+        s_te = float(score_oos_result(r_te))
+        out["folds"].append({
+            "best": best_name,
+            "train_score": float(best_score),
+            "test_score": s_te,
+            "test_trades": int(r_te.trade_count),
+        })
+        out["by_name"].setdefault(best_name, []).append(s_te)
+    if out["folds"]:
+        out["global_best"] = max(out["folds"], key=lambda f: f["train_score"])["best"]
+    return out
+
+
 def score_backtest_result(r: "BacktestResult") -> float:
-    """P1: 统一评分 Wilson*0.5+年化*0.2-回撤*0.3，低于MIN_TRADE_COUNT判-100。"""
+    """B1: 统一评分委托到 decision.scoring（Calmar 主项 0.6 / 胜率 0.2 / 稳定性 0.2）。
+
+    历史缺陷：此处曾用 `Wilson×0.5 + 年化×0.2 − 回撤×0.3`，胜率项主导（Top12 中占 72.8%），
+    且 decision.scoring.risk_adjusted_score 是死码。现在权重只在 scoring.py 定义一次。
+    """
     if r.trade_count < MIN_TRADE_COUNT:
         return -100.0
-    adj = _wilson_lower_bound(r.win_rate, r.trade_count)
-    return adj * 0.5 + r.annual_return * 0.2 - r.max_drawdown * 0.3
+    from decision.scoring import risk_adjusted_score
+    return float(risk_adjusted_score(
+        r.annual_return, r.max_drawdown, r.win_rate, r.trade_count
+    ))
 
 
 def score_oos_result(r: "BacktestResult") -> float:
+    """OOS 评分：同 B1 公式，地板阈值用 OOS_MIN_TRADES，另加 Calmar 软惩罚。"""
     if r.trade_count < OOS_MIN_TRADES:
         return -100.0
-    adj = _wilson_lower_bound(r.win_rate, r.trade_count)
-    s = adj * 0.5 + r.annual_return * 0.2 - r.max_drawdown * 0.3
+    from decision.scoring import risk_adjusted_score
+    s = float(risk_adjusted_score(
+        r.annual_return, r.max_drawdown, r.win_rate, r.trade_count
+    ))
     # P1: Calmar过滤软惩罚
     try:
         calmar = r.calmar_ratio if r.calmar_ratio else 0.0
@@ -263,25 +326,36 @@ def run_strategy_tournament(
     n_splits: int = 3,
     oos_weight: float = 0.7,
     jobs: int = 1,
+    strategies: Dict[str, Callable] = None,
+    wf_top_n: int = 15,
 ) -> Tuple[str, BacktestResult, pd.DataFrame]:
     """P1: 样本内选优→样本外验证两阶段锦标赛，按样本外排名。
 
-    - 全量IS评分取Top50，再在test slice + walk-forward folds上算OOS；
+    - 全量IS评分取Top50，再在test slice + 逐折重新寻优的walk-forward上算OOS；
     - final = (1-oos_weight)*IS + oos_weight*OOS均值，OOS交易数<5判-100，Calmar<0.5软惩罚-0.1；
     - 保持返回 (best_name, best_result全量回测, comparison含IS/OOS列) 向后兼容。
-    """
-    strategies = _build_strategy_grid()
-    oos_cfg = adaptive_oos_config(df, config)
-    engine_is = BacktestEngine(config)
-    engine_oos = BacktestEngine(oos_cfg)
-    engine = BacktestEngine(config)
 
-    comparison = compare_strategies(df, strategies, market_regimes, config, jobs=jobs)
+    F01: `strategies` 形参让调用方（基金侧）注入自己的网格；不传则用股票 581 组网格。
+    历史缺陷：本函数内部无条件自建股票网格，导致基金侧 `build_fund_strategy_signals()`
+    被丢弃，510300 的 10 个候选全部来自股票族（配对交易等），且回查策略表必然失败。
+    """
+    strategies = strategies if strategies is not None else _build_strategy_grid()
+    # A1/A12: IS 选优、OOS 评估、最终报告必须共用**同一资金基准**（按标的价格自适应）。
+    # 历史缺陷：只有 engine_oos 用了 adaptive_oos_config，compare_strategies 仍用 10 万，
+    # 导致同一个 JSON 里 candidates 的"交易次数/回撤"（10 万口径，41 次买不起）与
+    # evidence.metrics（自适应口径）互相矛盾。
+    oos_cfg = adaptive_oos_config(df, config)
+    engine_is = BacktestEngine(oos_cfg)
+    engine_oos = BacktestEngine(oos_cfg)
+    engine = BacktestEngine(oos_cfg)
+
+    comparison = compare_strategies(df, strategies, market_regimes, oos_cfg, jobs=jobs)
 
     def parse_pct(s):
         return float(s.replace('%', '')) / 100
 
-    # 评分IS：Wilson下界*0.5+年化*0.2-回撤*0.3，<MIN_TRADE_COUNT判-100
+    # 评分IS：委托 decision.scoring（Calmar 主项），<MIN_TRADE_COUNT 判 -100
+    from decision.scoring import risk_adjusted_score as _ras
     scores = {}
     adj_win_rates = {}
     for name in comparison.index:
@@ -293,9 +367,9 @@ def run_strategy_tournament(
             scores[name] = -100
             adj_win_rates[name] = 0.0
         else:
-            adj_wr = _wilson_lower_bound(win_rate, trade_count)
-            adj_win_rates[name] = adj_wr
-            scores[name] = adj_wr * 0.5 + annual_ret * 0.2 - max_dd * 0.3
+            adj_win_rates[name] = _wilson_lower_bound(win_rate, trade_count)
+            # 年化收益已是年化值 → n_bars 不传，避免二次年化
+            scores[name] = float(_ras(annual_ret, max_dd, win_rate, trade_count))
     comparison['评分IS'] = [scores.get(n, -100) for n in comparison.index]
     comparison['评分'] = comparison['评分IS']  # 向后兼容旧列名
     comparison['样本调整胜率'] = [
@@ -313,10 +387,16 @@ def run_strategy_tournament(
             candidates = [n for n, _s in ranked_is[:TOP_N_OOS]]
         train_df, test_df = split_train_test(df, train_ratio)
         train_reg, test_reg = split_regimes(market_regimes, train_df, test_df)
-        wf_folds = walk_forward_splits(df, n_splits)
         oos_cfg = adaptive_oos_config(df, config)
         engine_oos = BacktestEngine(oos_cfg)
-        # 切分regime到fold
+        # B3: 逐折在训练集上**重新寻优**（不再用固定候选重跑子窗口）。
+        # 性能：逐折寻优只在 IS Top-N 子集上进行（契约 B3 允许），默认 15 组；
+        # 全 50 组 × 3 折会把 --fast 墙钟推过 60s（G12）。
+        wf = walk_forward_optimize(
+            df, strategies, config=config, n_splits=n_splits,
+            top_n=TOP_N_OOS, preselect=candidates[:max(int(wf_top_n), 1)],
+            market_regimes=market_regimes,
+        )
         for name in candidates:
             sig = strategies[name]
             # test slice OOS（自适应资金保证高价股可买1手）
@@ -324,15 +404,8 @@ def run_strategy_tournament(
             s_test = score_oos_result(r_test)
             oos_calmars[name] = float(r_test.calmar_ratio or 0.0)
             oos_trades[name] = int(r_test.trade_count)
-            # walk-forward均值
-            wf_scores = []
-            for ftr, fte in wf_folds:
-                try:
-                    ftr_reg, fte_reg = split_regimes(market_regimes, ftr, fte)
-                    r_fte = engine_oos.run_backtest(fte, sig, fte_reg)
-                    wf_scores.append(score_oos_result(r_fte))
-                except Exception:
-                    continue
+            # walk-forward：该策略在"它被该折选为最优"的那些折上的 test 得分均值
+            wf_scores = wf["by_name"].get(name) or []
             s_wf = float(sum(wf_scores) / len(wf_scores)) if wf_scores else s_test
             # 综合OOS：test与WF平均
             s_oos = (s_test + s_wf) / 2.0
