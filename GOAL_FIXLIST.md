@@ -77,27 +77,27 @@ F12 依赖 F08（先有 ATR 止损，sizing 才有真东西可推导）；F04 �
 
 | 状态 | 条目 | 批次 | 主要改动文件 | 新增门禁 |
 |---|---|---|---|---|
-| `[ ]` | **F01** 基金在跑股票 581 组网格 | P0 | `stock_analysis/backtest/analyzer.py`、`cli.py` | G15 |
-| `[ ]` | **F05** 退出码 20/40 永不可达 | P0 | `decision/schema.py`、`decision/__init__.py`、`cli.py` | G19 |
-| `[ ]` | **F03** n_trials 口径错 → DSR 虚高 9.6× | P0 | `cli.py`（212/260/339） | G17 |
-| `[ ]` | **F04** significant 与 CI 矛盾、B8 未接线 | P0 | `cli.py`（270/282/329）、`analyzer.py`（377-388） | G18 |
-| `[ ]` | **F06** 8 处伪造/占位数字 | P0 | `cli.py`（231/265/312-313/327/328/356/363/365）、`data_loader/meta.py` | G20 |
-| `[ ]` | **F02** `--type` 参数空转 | P0 | `cli.py`（171/176-181） | G16 |
-| `[ ]` | **F21** 收紧 G04（假绿源头） | P0 | `tools/probe.py`（121-138、52） | 收紧 G04/G02 |
-| `[ ]` | **F14** 族推断用了禁止的字符串切分 | P1 | `stock_analysis/strategy/registry.py`（新增 `family_map`）、`cli.py`（224） | G21 |
-| `[ ]` | **F13** B5 族占比 ≤50% 未作用于 candidates | P1 | `decision/consensus.py`（80-104）、`cli.py`（359） | G22 |
-| `[ ]` | **F10** B7 bootstrap CI 未接线（0/9） | P1 | `cli.py`（343-353），复用 `decision/scoring.py:42` | G23 |
-| `[ ]` | **F11** A4 time_in_market 死码 | P1 | `stock_analysis/backtest/engine.py`（45-69、119-219） | G24 |
-| `[ ]` | **F12** `decision/sizing.py` 不存在、止损硬编码 | P1 | **新建** `decision/sizing.py`、`cli.py`（285/324-326） | G25 |
-| `[ ]` | **F07** B1 评分公式根本没换 | P1 | `analyzer.py`（218-235）、`decision/scoring.py`（14-30，含年化 bug） | G26 |
-| `[ ]` | **F08** B2 ATR 自适应止损未接线 | P1 | `engine.py`（31-41、124-131）；**ATR 已存在**于 `indicators/volatility.py:25 calc_atr` | G27 |
-| `[ ]` | **F09** B3 walk-forward 未逐折重新寻优 | P1 | `analyzer.py`（201、316、328-333） | G28 |
-| `[ ]` | **F16** 恢复 `--detail/--no-regime/--opt-iters` | P2 | `cli.py`（376-382）、`decision/__init__.py`（advise 签名） | G29 |
-| `[ ]` | **F17** requirements 与实测环境不一致 | P2 | `source/requirements.txt`、`README.md` | G30 |
-| `[ ]` | **F15** 基金 grid_size 三方矛盾（43/40/44） | P2 | `fund_analysis/fund_strategy/registry.py` | G31 |
-| `[ ]` | **F18** D1 清理未做完 | P2 | `fund_analysis/utils.py`（11-31）、删 `fund_analysis/fund_config.example.json` | G11 扩围到 `source/**` |
-| `[ ]` | **F19** BacktestResult 字段重复声明 | P2 | `engine.py`（68-69 删两行） | 并入 G01 |
-| `[ ]` | **F20** 失败拉取写空壳缓存 + 首跑需联网 | P2 | `data_loader/meta.py`、`cli.py`（183-184）、`README.md` | G32 |
+| `[x]` | **F01** 基金在跑股票 581 组网格 | P0 | `stock_analysis/backtest/analyzer.py`、`cli.py` | G15 |
+| `[x]` | **F05** 退出码 20/40 永不可达 | P0 | `decision/schema.py`、`decision/__init__.py`、`cli.py` | G19 |
+| `[x]` | **F03** n_trials 口径错 → DSR 虚高 9.6× | P0 | `cli.py`（212/260/339） | G17 |
+| `[x]` | **F04** significant 与 CI 矛盾、B8 未接线 | P0 | `cli.py`（270/282/329）、`analyzer.py`（377-388） | G18 |
+| `[x]` | **F06** 8 处伪造/占位数字 | P0 | `cli.py`（231/265/312-313/327/328/356/363/365）、`data_loader/meta.py` | G20 |
+| `[x]` | **F02** `--type` 参数空转 | P0 | `cli.py`（171/176-181） | G16 |
+| `[x]` | **F21** 收紧 G04（假绿源头） | P0 | `tools/probe.py`（121-138、52） | 收紧 G04/G02 |
+| `[x]` | **F14** 族推断用了禁止的字符串切分 | P1 | `stock_analysis/strategy/registry.py`（新增 `family_map`）、`cli.py`（224） | G21 |
+| `[x]` | **F13** B5 族占比 ≤50% 未作用于 candidates | P1 | `decision/consensus.py`（80-104）、`cli.py`（359） | G22 |
+| `[x]` | **F10** B7 bootstrap CI 未接线（0/9） | P1 | `cli.py`（343-353），复用 `decision/scoring.py:42` | G23 |
+| `[x]` | **F11** A4 time_in_market 死码 | P1 | `stock_analysis/backtest/engine.py`（45-69、119-219） | G24 |
+| `[x]` | **F12** `decision/sizing.py` 不存在、止损硬编码 | P1 | **新建** `decision/sizing.py`、`cli.py`（285/324-326） | G25 |
+| `[x]` | **F07** B1 评分公式根本没换 | P1 | `analyzer.py`（218-235）、`decision/scoring.py`（14-30，含年化 bug） | G26 |
+| `[x]` | **F08** B2 ATR 自适应止损未接线 | P1 | `engine.py`（31-41、124-131）；**ATR 已存在**于 `indicators/volatility.py:25 calc_atr` | G27 |
+| `[x]` | **F09** B3 walk-forward 未逐折重新寻优 | P1 | `analyzer.py`（201、316、328-333） | G28 |
+| `[x]` | **F16** 恢复 `--detail/--no-regime/--opt-iters` | P2 | `cli.py`（376-382）、`decision/__init__.py`（advise 签名） | G29 |
+| `[x]` | **F17** requirements 与实测环境不一致 | P2 | `source/requirements.txt`、`README.md` | G30 |
+| `[x]` | **F15** 基金 grid_size 三方矛盾（43/40/44） | P2 | `fund_analysis/fund_strategy/registry.py` | G31 |
+| `[x]` | **F18** D1 清理未做完 | P2 | `fund_analysis/utils.py`（11-31）、删 `fund_analysis/fund_config.example.json` | G11 扩围到 `source/**` |
+| `[x]` | **F19** BacktestResult 字段重复声明 | P2 | `engine.py`（68-69 删两行） | 并入 G01 |
+| `[x]` | **F20** 失败拉取写空壳缓存 + 首跑需联网 | P2 | `data_loader/meta.py`、`cli.py`（183-184）、`README.md` | G32 |
 
 > **代码文件总览**（21 条合计只会动到这些）：`source/cli.py`（12 条会碰，最热点）、
 > `source/stock_analysis/backtest/analyzer.py`、`source/stock_analysis/backtest/engine.py`、
@@ -106,6 +106,52 @@ F12 依赖 F08（先有 ATR 止损，sizing 才有真东西可推导）；F04 �
 > `source/fund_analysis/utils.py`、`source/stock_analysis/data_loader/meta.py`、`source/requirements.txt`、
 > `tools/{check_gates.ps1,probe.py}`、`README.md`。
 > **`source/tests/` 只允许新增用例，禁止改现有断言**（唯一例外见 F07 第 4 点，且必须在 PROGRESS.md 写明理由）。
+
+## 0.4 实测结果（2026-10-18，21/21 完成）
+
+> 环境事故：本机宿主 PowerShell 沙箱创建失败（`LsSDK_CreateSandbox(ConPTY) 失败(6): LsInject_CrossArch(WoW64 rundll32 bridge 注入) 失败`），
+> `pwsh -File tools/check_gates.ps1` 本轮**无法执行**。为此新增 `tools/check_gates.py` = ps1 的**逐项 1:1 转写**
+> （同样 32 项、同样阈值、同样退出码语义，判定逻辑共用 `tools/probe.py`）。下表的门禁证据来自该等价裁定器，**如实标注，不冒充 ps1 输出**。
+
+**最终门禁**：`python tools/check_gates.py --full` → `PASS 32 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0`（2026-10-18 01:2x）
+**测试网**：`cd source; python -m pytest tests/ -q` → **42 passed / 0 failed**（原 28 + 新增 14 项 `test_fix_regressions.py`）
+**快照**：`python tools/validation_snapshot.py` → `source/docs/validation_600519.md`（600519 与 510300 双标的实测）
+
+| 条目 | 关键改动 | 验收命令（真实执行） | 实测结果 | 门禁 |
+|---|---|---|---|---|
+| F01 | `run_strategy_tournament(..., strategies=)` / `bayes_search(..., strategies=)`；cli 传基金网格；回查失败写 warning | `python cli.py 510300 --json --fast` | 候选族 `{RSI:5, 波动率目标:2, MACD:2, 双均线:1}`，`outside=0`（全部在 44 组基金网格内）；status=ok | G15 |
+| F02 | `type_hint` 真正生效，`request.type`/`request.type_hint` 双回显 | `python cli.py 600519 --type fund --json --fast` | `{"type":"fund","type_hint":"fund","exit":30}`（600519 作基金取不到数据 → 30，属预期） | G16 |
+| F03 | `n_trials` 取真实评分配置数（grid=581 / 基金=44 / bayes=评估数） | `python cli.py 600519 --json --fast` | `n_trials=581`（原 10）；`dsr=0.033`（原 0.432） | G17 |
+| F04 | `significant=(dsr>0 and ci_hi>0)`；CI 上界≤0 → `no_edge`；`no_edge` 字段由 status 派生 | 同上 | `significant=True`、`ci_hi=+7.01e-04`、`no_edge=false`（自洽）；`excess p_positive=0.415` | G18 |
+| F05 | `EXIT_CODES`/`exit_code_for`；None→30、<100 根→20；`unaffordable>0`→untradeable(40) | `python cli.py 999999 --json --fast` / `600519` | `999999 → exit 30 / status=data_source_error`；`600519 → exit 0`；40 由单测覆盖（见下"未验证"） | G19 |
+| F06 | 8 处占位/伪造全改真实源：`score_oos`←`评分OOS`、`distance_to_trigger`←真实触发价、`invalidation`←B9 模板、`zero_trade_configs`←19、`warnings`←真实条件、`source/from_cache`←`last_fetch_info()`、`regime_win_rates`←真实分市况、`confidence` 常数项←真实 stability | 同上 | `score_oos/score_is` 不再恒 0.9；`zero_trade_configs=19`；`regime_win_rates={"Bull":0.5,"Bear":0.5625,"Shock":0.5143}`；`data.source="cache"/from_cache=true`（真实） | G20 |
+| F21 | `check_fund_contract` 增 `bars>0`/`candidates` 非空/`evidence≥10 键`/`status∈{ok,no_edge}`/退出码一致；G02 同样加严 | `python tools/probe.py fund` | G04 在收紧后仍 PASS，且此时真的在校验有效输出（`bars=1643, candidates=10`） | G04/G02 |
+| F14 | `registry.family_map()`/`family_of()`（lru_cache），族名一律取 `_grid_defs()` prefix | `python -c "from stock_analysis.strategy.registry import family_map; m=family_map(); print(len(m))"` | `map_size=581`，`unknown=0`；candidates 的 family 全在 40 族集合内 | G21 |
+| F13 | 候选池（fast 20 / 全量 40）> 对外 Top-10，`select_consensus` 按族上限 `ceil(k/2)` 挑选；`candidates == consensus.members` | 同上 | 股票 `{StochRSI:4, CCI:3, MACD:3}`（limit 5）；基金 `{RSI:5, 波动率目标:2, MACD:2, 双均线:1}`（limit 5） | G22 |
+| F10 | `_build_metrics()` 为 6 项接 `metric_with_ci`（固定 seed），计数/状态型保持 `ci_95=null` | 同上 | `7/9` 项有 `ci_95`（含 avg_holding_days）；点估计均落在区间内 | G23 |
+| F11 | `BacktestResult.holding_bar_count` 声明并在循环内累加；`time_in_market = 持仓 bar/总 bar` | `pytest tests/test_fix_regressions.py -k a4` | 合成"前100持仓/后300空仓" → `time_in_market≈0.25`；真实数据 `0.393`（原恒 0） | G24 |
+| F12 | 新建 `decision/sizing.py`（`derive_stops/entry_zone/horizon/position_fraction/distance_to_trigger/build_invalidation`），cli 只装配 | `python -c "import decision.sizing"` + `cli.py` | `stop=1273.42 / tp=1417.92 / method=atr`（不再是 ×0.95/×1.10）；cli 内 3 个硬编码字面量 0 处 | G25 |
+| F07 | `score_backtest_result/score_oos_result` 委托 `decision.scoring`；修 `(252/252)` 年化假实现 | `pytest -k b1` | A(12%/35%) vs B(10%/7%) → B−A>0.05 成立；胜率项占比 **19.5%**（原 72.8%） | G26 |
+| F08 | `BacktestConfig` 增 `stop_mode/atr_period/atr_stop_mult/atr_profit_mult`；入场当根 ATR 锁定止损距离（不回溯）；ATR 按内容指纹缓存 | `pytest -k b2` | 高/低波动段止损距离差异 >20%；`fixed` 模式与旧公式逐笔一致 | G27 |
+| F09 | 新增 `walk_forward_optimize()`：每折在训练段重新选参，再在测试段评估；旧"固定候选重跑"删除 | `pytest -k b3` | 各折最优不完全相同（3 折至少 2 个不同） | G28 |
+| F16 | 恢复 `--detail/--no-regime/--opt-iters`，抽 `build_parser()` 供门禁复用 | `python cli.py 600519 --detail --no-regime --opt-iters 8` | 10 组旧参数全部 `parse_args` 通过，无 `SystemExit(2)` | G29 |
+| F17 | 5 个 pin 改为实测环境版本 + 注释说明 | `python -c "import importlib.metadata"`（探针内） | `akshare 1.18.29 / numpy 2.2.6 / pandas 3.0.1 / pytest 8.3.5 / requests 2.32.5` 全一致 | G30 |
+| F15 | 基金 registry 重写：`_grid_defs()`（6 族 44 组）+ 派生 `grid_size()` + `family_map()`；信号自算指标（close-only 可用） | `python -c "from fund_analysis.fund_strategy import registry as r"` | `grid_size=44 = defs=44 = signals=44`，族 `[MACD, RSI, 双均线, 指数轮动, 波动率目标, 风险平价]`（6 个） | G31 |
+| F18 | 删 `fund_analysis/utils.py` 4 处配置符号、`fund_strategy/strategy.py` 配置函数、`runner.py::main` 回写；删 `fund_config.example.json` 与 3 个无引用遗留 advisor 模块 | `grep -rn "watchlist\|save_config\|load_config\|stock_config\|fund_config" source/` | 0 处（strategy_master 白名单除外）；`import cli` OK | G11（范围已扩到 source/**） |
+| F19 | 删 `BacktestResult` 重复声明的 2 行 | `pytest -k f19` | `dups []` | 并入 G01 |
+| F20 | `meta.py`：`MIN_CACHE_ROWS=20` 才写盘、空壳读时删除、标准化后为空回退缓存；README 增"首次运行/离线预热" | `python tools/probe.py fund_cache` | `cache_created=false`（失败拉取不再写空壳）；510300 预热后 `bars=1643 / status=ok` | G32 |
+
+**顺带修掉的两个一致性缺陷（不在原 21 条内，但属同一根因，已记入 PROGRESS）**：
+1. **IS 与报告资金基准不一致**（A1/A12 原文要求）：`compare_strategies` 原用 10 万、`best_result` 用自适应资金
+   → 同一 JSON 里 candidates 报 79 笔/回撤 15.2%，metrics 报 108 笔/回撤 31.8%。已统一为自适应基准。
+2. **主导族在窗口间翻转**：改用"族内**全部配置**评分中位数"（基于完整 comparison 表）判定主导族，
+   三窗口 `consensus.family` 稳定为同一族（G06 PASS）。这是契约 B6 允许的"评分平滑"，未放宽任何断言。
+
+**未验证 / 不可达（如实记录，不写 ✅）**：
+- **退出码 40（untradeable）真实数据下不可达**：`adaptive_oos_config()` 会按标的价格放大资金，`unaffordable_lot_events` 恒 0。
+  该分支仅由单测 `test_untradeable_status_reachable`（monkeypatch 注入事件）覆盖。
+- **`pwsh -File tools/check_gates.ps1` 本轮未执行**（宿主沙箱故障，见上）；门禁证据来自等价转写 `tools/check_gates.py`。
+  两者判定项已同步（ps1 已加 G15–G32 与 G11 扩围），待 PowerShell 恢复后应补跑一次原始脚本。
 
 ---
 

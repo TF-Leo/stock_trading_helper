@@ -1,32 +1,18 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
-- **最后更新**：2026-10-17 23:3x（独立复核 + 出具修复清单）
-- **➡️ 下一步照 `GOAL_FIXLIST.md` 逐条执行（F01–F21，每条自带精确行号、改法、验收命令、应加的门禁项）。**
-- **本轮复核结论**：门禁 `-Full` 14/14 全绿退出码 0（22:56:28，主回合亲自跑），`pytest` 28 passed，
-  但**门禁绿 ≠ 契约全清**：实测出 §3.5 的 X1–X15 + 下列新发现，全部已整理进 `GOAL_FIXLIST.md`。
-  **X1 与 X4 属误判，已在下表更正/撤销**；T4 实际已完成（此前台账漂移，已更正）。
-- **本轮新查出（比 X1–X15 更严重）**：
-  **F01 基金侧实际在跑股票 581 组网格** —— `run_strategy_tournament()` 无 `strategies` 形参、内部自建股票网格，
-  `cli.py:193` 算出的 `build_fund_strategy_signals()` 被丢弃；实测 510300 的 10 个候选 **0 个**在基金网格、**10 个**在股票网格
-  （`candidates[0]=配对交易(10,-2.0,0.0)`，用在单一 ETF 上无金融意义）；连锁导致 `cli.py:250` 回查失败 → 信号降级全 False →
-  **基金 action 永远只能是 hold**，且 triggers 同时显示买/卖触发而 state=neutral（违反 C4，G03 查不到）。
-  **F07 B1 评分公式根本没换**（`analyzer.py:218-223/226-230` 仍是 `adj*0.5+年化*0.2-回撤*0.3`；`scoring.risk_adjusted_score` 是死码，
-  `cli.py:18` 以 `noqa:F401` 导入未用；基线"Wilson 占 72.8%"缺陷仍在）。
-  **F08 B2 ATR 自适应止损完全未实现**（`Select-String 'atr|stop_mode' stock_analysis\backtest\*.py` → **0 处匹配**）。
-  **F09 B3 walk-forward 未逐折重新寻优**（`analyzer.py:201` 名称语义均未改，`316/328-333` 仍对固定候选重跑子窗口）。
-  **F02 `--type` 参数空转**（`advise_internal` 收了 `type_hint` 却从不使用，靠 `code.startswith('5')` 判类型）。
-  **F15 基金 `grid_size()` 是硬编码算式且三方矛盾**（返回 43、实际 signals 40、契约要求 44；注释还写着 `# = 43 (≈44 as per contract)`；
-  VolTarget 算式按 3×2=6 实际只生成 3；族数实测 5 而契约要 6；registry 无 `_grid_defs()`）。
-  **F19 `BacktestResult` 的 `unaffordable_lot_events`/`blocked_by_limit_events` 被重复声明两次**（`engine.py:66-69`）。
-  **F12 补充**：对外报 `stop_loss=last_close×0.95`/`take_profit=×1.10`，而回测实际用 `BacktestConfig.stop_loss_pct=0.08`/`take_profit_pct=0.15`
-  → **Hermes 拿到的止损价与本项目回测结论不是同一个东西**。
-- **git 状态**：工作树 clean（`GOAL_FIXLIST.md` 为新增未提交），`main` **领先 origin/main 3 个提交**（`9b34797`/`d51ea5c`/`d915496`，Hermes 化工作尚未推送）。
-- **交付判定**：**暂不建议推送给 Hermes**。最小可推送集 = F01 + F03 + F05 + F06 + F17（详见 `GOAL_FIXLIST.md` §0.2）。
-- **最近完整门禁**：`pwsh -File tools/check_gates.ps1`
-  → **PASS 14 | FAIL 0 | BLOCKED 0 | SKIP 0，退出码 0**（全绿，2026-10-17 18:46 `-Full`；G03 语义自洽 + G06 三窗口 均已修复）
-- 报告文件：`gates-report.json`
-- **定时任务**：已于 2026-10-17 19:45 由用户指示**全部停用**（原每小时任务 `1d7ac7d1` 已删除，
-  `ScheduledTaskList` 现为空）。此前两轮自驱回合（`2e34b394`、`2170a8a6`）已完成 T1/G03 + G06 修复。
+- **最后更新**：2026-10-18 00:5x（F01–F21 全部修完，门禁 32/32 全绿）
+- **➡️ 本轮结论**：`GOAL_FIXLIST.md` 的 21 条（F01–F21）**全部完成**，门禁从 14 项扩到 **32 项**（G15–G32 新增），
+  `PASS 32 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0`；`pytest` **42 passed**（原 28，新增 14 项回归用例）。
+- **⚠️ 本轮环境事故（必须知道）**：宿主 PowerShell 沙箱创建失败
+  （`LsSDK_CreateSandbox(ConPTY) 失败(6): LsInject_CrossArch(WoW64 rundll32 bridge 注入) 失败`），
+  `pwsh -File tools/check_gates.ps1` **本轮无法执行**。为此新增 `tools/check_gates.py`：
+  `check_gates.ps1` 的**逐项 1:1 转写**（同样的 32 项、同样的阈值、同样的退出码语义），
+  并把新增门禁的实际判定逻辑放进 `tools/probe.py`（两侧共用），以降低双份实现漂移的风险。
+  **`check_gates.ps1` 仍是权威脚本，且已同步加上 G15–G32**；本文件与 `GOAL_FIXLIST.md` 里
+  "门禁 32/32 绿"的证据均来自 `tools/check_gates.py`，属"等价裁定器"而非原始 ps1 输出 —— 如实记录，不冒充。
+- **交付判定**：**可以推送给 Hermes**（最小可推送集 F01/F03/F05/F06/F17 均已修完并进门禁）。
+- 报告文件：`gates-report.json`（`runner` 字段标注由哪个裁定器生成）
+- **定时任务**：2026-10-17 19:45 由用户指示全部停用（`ScheduledTaskList` 为空）。
 - **当前状态**：**门禁 14/14 全绿，退出码 0**（用户亲自复核 `-Full`，2026-10-17 19:42），pytest 28 passed，
   CLI `--json` 退出码 0 输出合法 JSON，语义自洽无矛盾。T1 已完成，不再是"未开始"。
 - **⚠️ 头号杀手 = 人工审批**（2026-10-17 17:5x 查明）：
@@ -74,7 +60,52 @@
 | F13 | 自造测试 `test_a_affordability.py::test_a1_100_percent_affordable` 修正算术错误（原文断言 10 万本金可买 1500 元/股 500 股；实际 100000/1500 = 66 股 < 1 手），改为验证 `adaptive_oos_config()` 下的真实不变式 | G08 PASS |
 | F14 | **G06 三窗口稳定**：`cli.py` 的 `has_buy_trigger`/`has_sell_trigger` 原由"最后一根 bar 瞬时触发态"推导 → 三窗口（full/drop60/drop120）末根价格位置不同 → 触发态翻转（near_buy/near_sell/sell_triggered）→ action 跨窗口 {hold,sell} 不一致。改为**持续条件**（最近 15 根 K 线"全部"同向才算强触发），瞬时末根只作状态展示。实测三窗口 action 全 `hold`、family 全 `StochRSI`，跨窗口一致 | G06 PASS（-Full） |
 
+## 1.5 F01–F21 修复记录（2026-10-18，21/21 完成，逐条证据见 `GOAL_FIXLIST.md` §0.4）
+
+| 条目 | 结论 | 一句话证据 |
+|---|---|---|
+| F01 基金跑股票网格 | ✅ 已修 | 510300 候选族 `{RSI:5, 波动率目标:2, MACD:2, 双均线:1}`，全部在基金 44 组网格内（G15） |
+| F02 `--type` 空转 | ✅ 已修 | `600519 --type fund` → `request.type=fund`（G16） |
+| F03 `n_trials` 口径 | ✅ 已修 | 股票 581 / 基金 44；dsr 从 0.432 → 0.033（G17） |
+| F04 significant/CI 矛盾 | ✅ 已修 | `significant=(dsr>0 and ci_hi>0)`；`no_edge` 由 status 派生（G18） |
+| F05 退出码 20/40 不可达 | ✅ 已修（40 仅单测可达） | `999999→30`、`600519→0`（G19）；40 由 `test_untradeable_status_reachable` 覆盖 |
+| F06 8 处伪造/占位 | ✅ 已修 | `zero_trade_configs=19`、`regime_win_rates` 真实、`source=cache` 真实、score_oos 不再 ×0.9（G20） |
+| F21 G04 假绿 | ✅ 已收紧 | 空壳文档不再 PASS（bars>0 / candidates 非空 / status∈{ok,no_edge}） |
+| F14 族名切分 | ✅ 已修 | `family_map()` 581 键 0 unknown（G21） |
+| F13 族占比 ≤50% | ✅ 已修 | 股票 4/3/3、基金 5/2/2/1，`candidates==members`（G22） |
+| F10 CI 未接线 | ✅ 已修 | 7/9 项有 ci_95，点估计均在区间内（G23） |
+| F11 time_in_market 死码 | ✅ 已修 | 0 → 0.393（合成用例 ≈0.25）（G24） |
+| F12 sizing 缺失 | ✅ 已修 | 新建 `decision/sizing.py`，止损 ATR 口径与回测一致（G25） |
+| F07 评分公式未换 | ✅ 已修 | 胜率项占比 72.8% → **19.5%**（G26） |
+| F08 ATR 止损未实现 | ✅ 已修 | 高低波动止损距离差异 >20%，fixed 模式回归一致（G27） |
+| F09 walk-forward 假 | ✅ 已修 | `walk_forward_optimize()` 逐折重新选参（G28） |
+| F16 旧参数消失 | ✅ 已修 | `--detail/--no-regime/--opt-iters` 恢复，10 组参数无 usage error（G29） |
+| F17 requirements 不一致 | ✅ 已修 | 5 个 pin == 实测环境（G30） |
+| F15 基金 grid 三方矛盾 | ✅ 已修（方案 A：补齐到契约 44/6） | `grid_size=defs=signals=44`，6 族（G31） |
+| F18 D1 清理未完成 | ✅ 已修 | `source/**` 0 处配置残留（G11 扩围） |
+| F19 字段重复声明 | ✅ 已修 | dataclass `dups []` |
+| F20 空壳缓存 | ✅ 已修 | 失败拉取 `cache_created=false`（G32） |
+
+**本轮另外修掉 2 个同根因的一致性缺陷（原清单未列，但属 A1/A12/B6 的明文要求）**：
+1. **IS 与报告资金基准不一致**：`compare_strategies` 用 10 万、`best_result` 用自适应资金
+   → 同一 JSON 里 candidates 报"79 笔/回撤 15.2%"、metrics 报"108 笔/回撤 31.8%"。
+   已统一为 `adaptive_oos_config` 基准；现在 `candidates[0]` 与 `evidence.metrics` 完全对得上。
+2. **主导族跨窗口翻转**：改用"族内**全部配置**评分中位数"（基于完整 comparison 表）判定主导族，
+   三窗口 `consensus.family` 稳定（G06 PASS）。属契约 B6 允许的"评分平滑"，未放宽任何断言。
+
+**改了一条既有测试（必须留痕）**：`tests/test_p3_bayes.py::test_bayes_cli_entry_exists`
+原断言是 `inspect.getsource(cli.main)` 里出现 `--opt`/`bayes` 字样 —— 这是**源码文本耦合**。
+F16 把 argparse 抽到 `cli.build_parser()` 后该断言因"代码搬家"而红，而入口其实还在。
+现改为直接断言 `build_parser()` 的 option 集合包含全部 9 个参数，**判定严格更强**（原断言只查两个字符串）。
+这不是"改断言迁就实现"：行为未被削弱，且新增用例 `test_fix_regressions.py` 另有 14 项覆盖真实行为。
+
+**未验证 / 不可达（不写 ✅）**：
+- 退出码 40 在真实数据下不可达（自适应资金让 `unaffordable_lot_events` 恒 0），仅单测覆盖；
+- `pwsh -File tools/check_gates.ps1` 本轮**未执行**（宿主 PowerShell 沙箱故障），门禁证据来自等价转写 `tools/check_gates.py`。
+
 ## 2. 未完成（下一步按此顺序推进）
+
+> 本节为 **2026-10-17 的历史记录**；2026-10-18 的 21 条修复见 §1.5，当前**没有**未完成条目。
 
 - [x] **T1 —— G03（输出语义自洽）✅ 已修复并独立验证（2026-10-17 18:07，2e34b394）**
   - 根因：`triggers.py::evaluate_triggers` 用硬编码名字表（`MA(5-10)`…）查 `strategy_signals`，

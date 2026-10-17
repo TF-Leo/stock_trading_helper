@@ -26,11 +26,17 @@ python cli.py 600519 --start 20200101 --json
 |------|------|--------|------|
 | code | str | 必填 | 股票代码或基金代码 |
 | --json | bool | False | 输出 JSON 格式（stdout），文本日志走 stderr |
-| --fast | bool | False | 快速模式：减少 bootstrap 次数、缩减候选池 |
+| --fast | bool | False | 快速模式：减少 bootstrap 次数、缩减候选池、walk-forward 折数 3→2 |
 | --start | str | None | 数据起始日期（YYYYMMDD） |
-| --type | str | auto | 类型：auto/stock/fund |
+| --type / -t | str | auto | 类型：auto/stock/fund。`auto` 按代码前缀推断（5 开头视为基金） |
 | --jobs | int | 1 | 并行任务数 |
-| --opt | str | grid | 优化方式：grid/bayes |
+| --opt | str | grid | 优化方式：grid（全网格）/ bayes（贝叶斯寻优） |
+| --detail | bool | False | 文本模式追加详细内容（触发器 / 候选表 / 指标 / 告警） |
+| --no-regime | bool | False | 跳过市场环境计算，输出 `Unknown` + `definition=disabled`（不假装 Bull） |
+| --opt-iters | int | 30 | `--opt bayes` 的迭代次数；`--fast` 时上限 12 |
+
+> 退出码：`0`=ok、`10`=no_edge、`20`=insufficient_data、`30`=data_source_error、`40`=untradeable。
+> 进程退出码由 `recommendation.status` 唯一决定（`decision/schema.py::EXIT_CODES`），**不是**"ok 就 0、其他都 10"。
 
 ## JSON Schema
 
@@ -184,7 +190,8 @@ python cli.py 600519 --start 20200101 --json
 
 ### request
 - **code**: 股票代码或基金代码（字符串）
-- **type**: 标的类型（"stock" / "fund"）
+- **type**: **实际判定**的标的类型（"stock" / "fund"），`--type` 会真正生效
+- **type_hint**: 用户入参回显（"auto" / "stock" / "fund"）
 - **start**: 数据起始日期（可选）
 - **opt**: 优化方式（"grid" / "bayes"）
 - **jobs**: 并行任务数（整数）
@@ -199,17 +206,18 @@ python cli.py 600519 --start 20200101 --json
 
 ### recommendation
 - **status**: 状态枚举（见上表）
-- **action**: 交易动作枚举（见上表）
+- **action**: 交易动作枚举（见上表）。`no_edge` / `untradeable` 时固定为 `avoid`
 - **action_reason**: 行动理由列表（字符串数组）
-- **confidence**: 置信度（0-1 浮点数）
-- **position_fraction**: 仓位比例（0-0.30 浮点数）
-- **horizon_days**: 时间窗口 [最小天数，最大天数]
-- **entry_zone**: 入场区间 [最低价，最高价] 或 null
-- **stop_loss**: 止损价 或 null
-- **take_profit**: 止盈价 或 null
-- **distance_to_trigger**: 距离触发器百分比
-- **invalidation**: 失效条件字符串
-- **no_edge**: 是否无优势（布尔值）
+- **confidence**: 置信度（0-1 浮点数）= `0.4×DSR + 0.3×consensus.agreement + 0.2×stability + 0.1×min(trade_count/60,1)`
+- **position_fraction**: 仓位比例（0-0.30 浮点数），`action ∈ {avoid, insufficient_data}` 时为 0
+- **horizon_days**: 时间窗口 `[max(2,⌊0.5×平均持仓⌋), min(60,⌈1.5×平均持仓⌉)]`
+- **entry_zone**: 入场区间 `[last−0.5ATR, last+0.5ATR]`（不低于最近买入触发价）；`action=sell` 时为 null
+- **stop_loss**: 止损价 = `last − 2.5×ATR(14)`，`stop_distance` 被 clamp 到 `[0.03, 0.20]`；无 ATR 时用 `BacktestConfig.stop_loss_pct`（0.08）
+- **take_profit**: 止盈价 = `last + 4.0×ATR(14)`；无 ATR 时用 `take_profit_pct`（0.15）
+- **stop_method**: `"atr"` 或 `"fixed"` —— 明确告诉调用方止损是用哪种口径算的（**与回测引擎同一口径**）
+- **distance_to_trigger**: `{buy_pct, sell_pct}`，由"最近一次该向信号所在 bar 的收盘价"与 `last_close` 实算；无该向信号时为 null
+- **invalidation**: 失效条件，模板 `收盘跌破 {stop_loss}，或 {family} 族共识转为看空，或 {n} 个交易日内未触发入场`
+- **no_edge**: 是否无优势（布尔值），恒等于 `status == "no_edge"`
 
 ### evidence.metrics
 每个指标包含：
@@ -236,45 +244,76 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
 ```json
 {
   "schema_version": "1.0",
-  "generated_at": "2026-10-17T13:30:00",
-  "request": { "code": "600519", "type": "stock", "start": "20200101", "opt": "grid", "jobs": 1, "fast": true },
+  "generated_at": "2026-10-18T01:17:41.453283",
+  "request": { "code": "600519", "type": "stock", "type_hint": "auto", "start": null, "opt": "grid", "jobs": 1, "fast": true },
   "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false },
-  "data": { "bars": 1643, "start": "2020-01-02", "end": "2026-10-16", "last_close": 1520.0, "source": "sina", "from_cache": true, "window_note": null },
-  "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16", "definition": "simple_moving_average" },
+  "data": { "bars": 1643, "start": "2020-01-02 00:00:00", "end": "2026-10-16 00:00:00", "last_close": 1329.0, "source": "cache", "from_cache": true, "window_note": null },
+  "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility" },
   "recommendation": {
-    "status": "no_edge",
+    "status": "ok",
     "action": "hold",
-    "action_reason": ["无统计显著优势：多重检验校正后不显著"],
-    "confidence": 0.2,
-    "position_fraction": 0.0,
-    "horizon_days": [5, 20],
-    "entry_zone": [1490.0, 1550.0],
-    "stop_loss": 1444.0,
-    "take_profit": 1672.0,
-    "distance_to_trigger": { "buy_pct": 1.2, "sell_pct": 3.4 },
-    "invalidation": "跌破 1444.0 或 20 个交易日内未触发",
-    "no_edge": true
+    "action_reason": ["暂无明确交易信号，建议观望"],
+    "confidence": 0.539,
+    "position_fraction": 0.129,
+    "horizon_days": [9, 29],
+    "entry_zone": [1317.88, 1340.12],
+    "stop_loss": 1273.42,
+    "take_profit": 1417.92,
+    "stop_method": "atr",
+    "distance_to_trigger": { "buy_pct": -5.3, "sell_pct": -2.87 },
+    "invalidation": "收盘跌破 1273.42，或 StochRSI 族共识转为看空，或 29 个交易日内未触发入场",
+    "no_edge": false
   },
   "evidence": {
-    "consensus": { "family": "MACD", "agreement": 0.6, "members": ["MACD(12-26-9)"] },
-    "dispersion": 0.12,
-    "stability": { "action_stable": true, "family_stable": true, "windows_tested": 3, "top_k_overlap_min": 3 },
+    "consensus": { "family": "StochRSI", "agreement": 0.89, "members": ["MACD(3-34-3)", "CCI(20,-150/150)", "StochRSI(14,25/75)"] },
+    "dispersion": 0.11,
+    "stability": { "action_stable": true, "family_stable": true, "windows_tested": 3, "top_k_overlap_min": 5 },
     "n_trials": 581,
-    "n_survivors": 17,
-    "deflated_sharpe": 0.31,
-    "significant": false,
+    "n_survivors": 522,
+    "deflated_sharpe": 0.033,
+    "significant": true,
     "metrics": {
-      "annual_return": { "point": 0.12, "ci_95": [0.02, 0.22] },
-      "max_drawdown": { "point": 0.18, "ci_95": [0.10, 0.30] }
+      "annual_return": { "point": 0.053762, "ci_95": [-0.040951, 0.156577] },
+      "max_drawdown": { "point": 0.163564, "ci_95": [0.119227, 0.375632] },
+      "win_rate": { "point": 0.528302, "ci_95": [0.377358, 0.660377] },
+      "sharpe": { "point": 0.49233, "ci_95": [-0.313136, 1.195496] },
+      "calmar": { "point": 0.328692, "ci_95": [-0.118693, 1.192933] },
+      "profit_factor": { "point": 1.437227, "ci_95": [0.690927, 2.662773] },
+      "trade_count": { "point": 53, "ci_95": null },
+      "avg_holding_days": { "point": 18.849057, "ci_95": [15.787736, 22.378302] },
+      "time_in_market": { "point": 0.393183, "ci_95": null }
     },
-    "excess_vs_buy_hold": { "point": 0.01, "ci_95": [-0.05, 0.07] },
-    "triggers": [{ "name": "MACD(12-26-9)", "state": "watch", "message": "MACD 柱状体尚未上穿 0 轴" }]
+    "excess_vs_buy_hold": { "point": -0.000112, "ci_95": [-0.000754, 0.000701], "p_positive": 0.415, "n_obs": 1642, "benchmark": "buy_and_hold_close" },
+    "buy_hold_baseline": { "total_return": 0.386, "annual_return": 0.0513 },
+    "regime_win_rates": { "Bull": 0.5, "Bear": 0.5625, "Shock": 0.5143 },
+    "triggers": [{
+      "indicator": "MACD(3-34-3)",
+      "current": 1329.0,
+      "buy_trigger": "买入信号触发价 1258.62（最近一次买入信号收盘价）",
+      "sell_trigger": "卖出信号触发价 1290.88（最近一次卖出信号收盘价）",
+      "state": "near_buy",
+      "buy_price": 1258.62,
+      "sell_price": 1290.88
+    }]
   },
-  "candidates": [{ "name": "MACD(12-26-9)", "family": "MACD", "score": 0.42, "trade_count": 32 }],
-  "diagnostics": { "unaffordable_lot_events": 0, "blocked_by_limit_events": 0, "warnings": [], "elapsed_seconds": 48.7 },
+  "candidates": [
+    { "name": "MACD(3-34-3)", "family": "MACD", "score": 0.9655, "score_is": 0.4533, "score_oos": 1.185, "annual_return": 0.0538, "max_drawdown": 0.1636, "win_rate": 0.5283, "trade_count": 53, "calmar": 0.3289, "deflated_sharpe": 0.012 }
+  ],
+  "diagnostics": {
+    "unaffordable_lot_events": 0,
+    "blocked_by_limit_events": 0,
+    "zero_trade_configs": 19,
+    "survivor_configs": 484,
+    "warnings": [],
+    "elapsed_seconds": 42.29
+  },
   "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
 }
 ```
+
+> 上表数值取自 2026-10-18 01:17 对 600519 的真实运行（`--fast`，1643 根），
+> 为便于阅读删减了 `candidates` 其余 9 条；**完整未删减样例**见
+> `source/docs/example_output_600519.json`（同样由命令现跑生成）。
 
 ## 幂等性保证
 
@@ -282,8 +321,57 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
 
 ## 兼容性
 
-CLI 向后兼容所有旧参数：
+CLI 向后兼容所有旧参数（`probe.py::check_old_args` 与 `tools/check_gates` 的 G29 每次都会验证）：
 - `--detail`, `--no-regime`, `--start`, `--jobs`, `--opt`, `--opt-iters`, `-t|--type`
 - 新增 `--json`, `--fast`
 
-语义变更已在本文档标注。
+语义变更：
+- `--type` 以前被忽略（只按代码前缀猜），现在真正生效；`request.type` 回显**实际判定值**，`request.type_hint` 回显入参
+- 退出码以前只有 0/10（所有非 ok 状态都被压成 10），现在严格按 `status` 映射到 0/10/20/30/40
+
+## 性能（D5 两档实测）
+
+| 模式 | 命令 | 实测墙钟 | 契约上限 |
+|---|---|---|---|
+| `--fast` | `python cli.py 600519 --json --fast` | **≈ 40–55s**（含 581 组网格 + 2 折 walk-forward） | ≤ 60s |
+| 全量 | `python cli.py 600519 --json --jobs 4` | **≈ 60–120s**（3 折 walk-forward + 2000 次 bootstrap） | ≤ 300s |
+
+> 数值随机器与缓存状态浮动；门禁 G12/G14 每次都会实测这两档并判定。
+> 若机器上 `akshare` 首次探测超时，会额外增加约 10s（股票名称查询已加本地缓存 `data/.name_cache.json`）。
+
+## 首次运行 / 离线预热（重要）
+
+`.gitignore` 排除了 `source/stock_analysis/data/` 与 `source/fund_analysis/data/`，
+因此**刚 clone 下来时缓存为空，首次运行必须联网**。预热命令：
+
+```bash
+cd source
+python -c "from stock_analysis.data_loader import get_stock_daily, get_fund_daily; \
+[get_stock_daily(c) for c in ['600519','688981','002371','300750']]; get_fund_daily('510300')"
+```
+
+- 预热成功后会写 `stock_{code}_qfq.csv` / `fund_{code}.csv`，之后**可完全离线运行**（`pytest` 就是离线全绿的）。
+- **无缓存 + 无网络 → 退出码 30（data_source_error）**，不是 20。
+- 有缓存但不足 100 根 → 退出码 20（insufficient_data）。
+- 拉取失败**不会**再写出空壳缓存文件（0 行 CSV）；若历史上已存在空壳，读取时会自动识别并删除后重拉。
+
+## 依赖与 Python 版本（D3f）
+
+- Python **3.12.10**（实测通过全部门禁的环境）
+- `source/requirements.txt` 的 pin 与实测环境一致：`akshare==1.18.29 / numpy==2.2.6 / pandas==3.0.1 / pytest==8.3.5 / requests==2.32.5`
+- 门禁 G30 会对比 `requirements.txt` 与实际已安装版本，不一致直接 FAIL
+
+## 实现要点（与结论可靠性直接相关）
+
+- **walk-forward 是逐折重新寻优**：`analyzer.walk_forward_optimize()` 在每折的**训练段**上重新给候选打分选优，
+  再用该折测试段评估所选参数；不是"固定策略重跑子窗口"。
+- **止损止盈与回测同源**：`decision/sizing.py` 是唯一实现（ATR 2.5×/4.0×，`stop_distance` clamp 到 [0.03,0.20]），
+  回测引擎 `BacktestConfig.stop_mode="atr"` 默认启用同一套口径，`stop_method` 字段会告诉你实际用的是哪种。
+- **多重检验校正**：`evidence.n_trials` 是本次**实际评分过的配置数**（股票 581 / 基金 44），
+  不是候选个数；DSR 用它做分母，试验越多越保守。
+- **显著性判定**：`significant = (deflated_sharpe > 0) and (excess_vs_buy_hold.ci_95[1] > 0)`；
+  超额收益 CI 上界 ≤ 0 时 `status=no_edge`。
+- **族去相关**：`candidates` 与 `evidence.consensus.members` 是同一份列表，任一族占比 ≤ `ceil(n/2)`；
+  族名取自注册表 `_grid_defs()` 的 prefix（不做字符串切分）。
+- **基金网格**：`fund_analysis/fund_strategy/registry.py::_grid_defs()`，44 组 / 6 族（RSI 16、双均线 9、MACD 8、
+  波动率目标 6、指数轮动 4、风险平价 1），`grid_size()` 由该定义派生。

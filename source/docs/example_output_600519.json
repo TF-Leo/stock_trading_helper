@@ -1,17 +1,18 @@
 {
   "schema_version": "1.0",
-  "generated_at": "2026-10-17T13:21:55.205513",
+  "generated_at": "2026-10-18T01:17:41.453283",
   "request": {
     "code": "600519",
     "type": "stock",
-    "start": "20200101",
+    "type_hint": "auto",
+    "start": null,
     "opt": "grid",
     "jobs": 1,
     "fast": true
   },
   "instrument": {
     "code": "600519",
-    "name": "����ę́",
+    "name": "贵州茅台",
     "board": "sh_main",
     "price_limit_pct": 0.1,
     "is_st": false
@@ -21,7 +22,7 @@
     "start": "2020-01-02 00:00:00",
     "end": "2026-10-16 00:00:00",
     "last_close": 1329.0,
-    "source": "sina",
+    "source": "cache",
     "from_cache": true,
     "window_note": null
   },
@@ -29,234 +30,291 @@
     "label": "Bull",
     "confidence": 0.7,
     "as_of": "2026-10-16 00:00:00",
-    "definition": "simple_moving_average"
+    "definition": "ma20_ma60_return_volatility"
   },
   "recommendation": {
     "status": "ok",
-    "action": "buy",
+    "action": "hold",
     "action_reason": [
-      "������ȷ�����źţ��������"
+      "MACD(3-34-3): 买入信号 (1329.00)"
     ],
-    "confidence": 0.694,
-    "position_fraction": 0.139,
+    "confidence": 0.539,
+    "position_fraction": 0.129,
     "horizon_days": [
-      5,
-      20
+      9,
+      29
     ],
     "entry_zone": [
-      1302.42,
-      1355.58
+      1317.88,
+      1340.12
     ],
-    "stop_loss": 1262.55,
-    "take_profit": 1461.9,
+    "stop_loss": 1273.42,
+    "take_profit": 1417.92,
+    "stop_method": "atr",
     "distance_to_trigger": {
-      "buy_pct": 0.0,
-      "sell_pct": 0.0
+      "buy_pct": -5.3,
+      "sell_pct": -2.87
     },
-    "invalidation": "����ֹ��� 1262.55 �� 10 ����δ����",
+    "invalidation": "收盘跌破 1273.42，或 StochRSI 族共识转为看空，或 29 个交易日内未触发入场",
     "no_edge": false
   },
   "evidence": {
     "consensus": {
-      "family": "��������",
-      "agreement": 1.0,
+      "family": "StochRSI",
+      "agreement": 0.89,
       "members": [
-        "��������(3-5-8)"
+        "MACD(3-34-3)",
+        "CCI(20,-150/150)",
+        "StochRSI(14,25/75)",
+        "CCI(14,-100/100)",
+        "MACD(3-26-3)",
+        "StochRSI(9,25/75)",
+        "CCI(14,-100/150)",
+        "StochRSI(9,20/75)",
+        "MACD(3-20-3)",
+        "StochRSI(9,20/80)"
       ]
     },
-    "dispersion": 0.0,
+    "dispersion": 0.11,
     "stability": {
       "action_stable": true,
       "family_stable": true,
       "windows_tested": 3,
       "top_k_overlap_min": 5
     },
-    "n_trials": 10,
-    "n_survivors": 0,
-    "deflated_sharpe": 0.335,
+    "n_trials": 581,
+    "n_survivors": 522,
+    "deflated_sharpe": 0.033,
     "significant": true,
     "metrics": {
       "annual_return": {
-        "point": 0.06646194510712489
+        "point": 0.053762,
+        "ci_95": [
+          -0.040951,
+          0.156577
+        ]
       },
       "max_drawdown": {
-        "point": 0.448975429248485
+        "point": 0.163564,
+        "ci_95": [
+          0.119227,
+          0.375632
+        ]
       },
       "win_rate": {
-        "point": 0.5569620253164557
+        "point": 0.528302,
+        "ci_95": [
+          0.377358,
+          0.660377
+        ]
       },
       "sharpe": {
-        "point": 0.5499627663096431
+        "point": 0.49233,
+        "ci_95": [
+          -0.313136,
+          1.195496
+        ]
       },
       "calmar": {
-        "point": 0.14803025015950616
+        "point": 0.328692,
+        "ci_95": [
+          -0.118693,
+          1.192933
+        ]
       },
       "profit_factor": {
-        "point": 1.4081221222401632
+        "point": 1.437227,
+        "ci_95": [
+          0.690927,
+          2.662773
+        ]
       },
       "trade_count": {
-        "point": 79
+        "point": 53,
+        "ci_95": null
       },
       "avg_holding_days": {
-        "point": 11.860759493670885
+        "point": 18.849057,
+        "ci_95": [
+          15.787736,
+          22.378302
+        ]
       },
       "time_in_market": {
-        "point": 0
+        "point": 0.393183,
+        "ci_95": null
       }
     },
     "excess_vs_buy_hold": {
-      "point": 0.05,
+      "point": -0.00011214024321421509,
       "ci_95": [
-        0.02,
-        0.08
-      ]
+        -0.0007539712765164091,
+        0.0007006431075294988
+      ],
+      "p_positive": 0.415,
+      "n_obs": 1642,
+      "benchmark": "buy_and_hold_close"
     },
     "buy_hold_baseline": {
       "total_return": 0.38599757211566177,
       "annual_return": 0.05134012393751841
     },
-    "regime_win_rates": {},
-    "triggers": []
+    "regime_win_rates": {
+      "Bull": 0.5,
+      "Bear": 0.5625,
+      "Shock": 0.5143
+    },
+    "triggers": [
+      {
+        "indicator": "MACD(3-34-3)",
+        "current": 1329.0,
+        "buy_trigger": "买入信号触发价 1258.62（最近一次买入信号收盘价）",
+        "sell_trigger": "卖出信号触发价 1290.88（最近一次卖出信号收盘价）",
+        "state": "near_buy",
+        "buy_price": 1258.62,
+        "sell_price": 1290.88
+      }
+    ]
   },
   "candidates": [
     {
-      "name": "��������(3-5-8)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": -0.01,
-      "max_drawdown": 0.0633,
-      "win_rate": 0.0,
-      "trade_count": 3,
-      "calmar": -0.1579778830963665,
-      "deflated_sharpe": 0.5
+      "name": "MACD(3-34-3)",
+      "family": "MACD",
+      "score": 0.9654855155554442,
+      "score_is": 0.45329652767541295,
+      "score_oos": 1.185,
+      "annual_return": 0.0538,
+      "max_drawdown": 0.1636,
+      "win_rate": 0.5283,
+      "trade_count": 53,
+      "calmar": 0.32885085574572126,
+      "deflated_sharpe": 0.012
     },
     {
-      "name": "��������(3-5-10)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": -0.0128,
-      "max_drawdown": 0.08070000000000001,
-      "win_rate": 0.0,
-      "trade_count": 4,
-      "calmar": -0.15861214374225527,
-      "deflated_sharpe": 0.5
+      "name": "CCI(20,-150/150)",
+      "family": "CCI",
+      "score": 0.8865043351020493,
+      "score_is": 0.4027885427940596,
+      "score_oos": 1.0938,
+      "annual_return": 0.0708,
+      "max_drawdown": 0.2072,
+      "win_rate": 0.5882000000000001,
+      "trade_count": 34,
+      "calmar": 0.34169884169884174,
+      "deflated_sharpe": 0.013
     },
     {
-      "name": "��������(3-5-13)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": -0.0203,
-      "max_drawdown": 0.1284,
-      "win_rate": 0.0,
-      "trade_count": 3,
-      "calmar": -0.15809968847352027,
-      "deflated_sharpe": 0.5
+      "name": "StochRSI(14,25/75)",
+      "family": "StochRSI",
+      "score": 0.8196040777076542,
+      "score_is": 0.4165971420351766,
+      "score_oos": 0.9923,
+      "annual_return": 0.0859,
+      "max_drawdown": 0.4054,
+      "win_rate": 0.5556,
+      "trade_count": 81,
+      "calmar": 0.21188949185989148,
+      "deflated_sharpe": 0.0053
     },
     {
-      "name": "��������(3-5-20)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": -0.0144,
-      "max_drawdown": 0.0935,
-      "win_rate": 0.25,
-      "trade_count": 4,
-      "calmar": -0.15401069518716576,
-      "deflated_sharpe": 0.5
+      "name": "CCI(14,-100/100)",
+      "family": "CCI",
+      "score": 0.7250281186763948,
+      "score_is": 0.4191548831912498,
+      "score_oos": 0.8561,
+      "annual_return": 0.073,
+      "max_drawdown": 0.2773,
+      "win_rate": 0.537,
+      "trade_count": 54,
+      "calmar": 0.26325279480706815,
+      "deflated_sharpe": 0.0076
     },
     {
-      "name": "��������(3-5-30)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": -0.0073,
-      "max_drawdown": 0.0867,
-      "win_rate": 0.3333,
-      "trade_count": 3,
-      "calmar": -0.08419838523644751,
-      "deflated_sharpe": 0.5
+      "name": "MACD(3-26-3)",
+      "family": "MACD",
+      "score": 0.6895177228447902,
+      "score_is": 0.5602433379165821,
+      "score_oos": 0.7449,
+      "annual_return": 0.07780000000000001,
+      "max_drawdown": 0.16690000000000002,
+      "win_rate": 0.6182,
+      "trade_count": 55,
+      "calmar": 0.4661473936488915,
+      "deflated_sharpe": 0.0283
     },
     {
-      "name": "��������(3-5-60)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": 0.0189,
-      "max_drawdown": 0.0277,
-      "win_rate": 0.5,
-      "trade_count": 2,
-      "calmar": 0.6823104693140795,
-      "deflated_sharpe": 0.5
+      "name": "StochRSI(9,25/75)",
+      "family": "StochRSI",
+      "score": 0.6855517849840311,
+      "score_is": 0.5064704111905872,
+      "score_oos": 0.7623,
+      "annual_return": 0.1229,
+      "max_drawdown": 0.3372,
+      "win_rate": 0.5321,
+      "trade_count": 109,
+      "calmar": 0.3644721233689205,
+      "deflated_sharpe": 0.0151
     },
     {
-      "name": "��������(3-5-120)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": 0.0,
-      "max_drawdown": 0.0,
-      "win_rate": 0.0,
-      "trade_count": 0,
-      "calmar": 0,
-      "deflated_sharpe": 0.5
+      "name": "CCI(14,-100/150)",
+      "family": "CCI",
+      "score": 0.6785265587172502,
+      "score_is": 0.37329797173170987,
+      "score_oos": 0.8093,
+      "annual_return": 0.0655,
+      "max_drawdown": 0.3184,
+      "win_rate": 0.5714,
+      "trade_count": 49,
+      "calmar": 0.20571608040201006,
+      "deflated_sharpe": 0.0051
     },
     {
-      "name": "��������(3-8-10)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": -0.0147,
-      "max_drawdown": 0.09230000000000001,
-      "win_rate": 0.0,
-      "trade_count": 3,
-      "calmar": -0.15926327193932827,
-      "deflated_sharpe": 0.5
+      "name": "StochRSI(9,20/75)",
+      "family": "StochRSI",
+      "score": 0.6762317943556335,
+      "score_is": 0.49811468436049416,
+      "score_oos": 0.7526,
+      "annual_return": 0.1219,
+      "max_drawdown": 0.3448,
+      "win_rate": 0.5229,
+      "trade_count": 109,
+      "calmar": 0.353538283062645,
+      "deflated_sharpe": 0.0141
     },
     {
-      "name": "��������(3-8-13)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": -0.0097,
-      "max_drawdown": 0.0795,
-      "win_rate": 0.0,
-      "trade_count": 2,
-      "calmar": -0.1220125786163522,
-      "deflated_sharpe": 0.5
+      "name": "MACD(3-20-3)",
+      "family": "MACD",
+      "score": 0.6231865722662844,
+      "score_is": 0.3515170569064859,
+      "score_oos": 0.7396,
+      "annual_return": 0.0177,
+      "max_drawdown": 0.17679999999999998,
+      "win_rate": 0.5832999999999999,
+      "trade_count": 60,
+      "calmar": 0.1001131221719457,
+      "deflated_sharpe": 0.0022
     },
     {
-      "name": "��������(3-8-20)",
-      "family": "��������",
-      "score": -100.0,
-      "score_is": -100.0,
-      "score_oos": -90.0,
-      "annual_return": -0.0148,
-      "max_drawdown": 0.11710000000000001,
-      "win_rate": 0.0,
-      "trade_count": 2,
-      "calmar": -0.1263877028181042,
-      "deflated_sharpe": 0.5
+      "name": "StochRSI(9,20/80)",
+      "family": "StochRSI",
+      "score": 0.617938132884899,
+      "score_is": 0.5005924678353328,
+      "score_oos": 0.6682,
+      "annual_return": 0.11779999999999999,
+      "max_drawdown": 0.33640000000000003,
+      "win_rate": 0.5463,
+      "trade_count": 108,
+      "calmar": 0.35017835909631384,
+      "deflated_sharpe": 0.0138
     }
   ],
   "diagnostics": {
     "unaffordable_lot_events": 0,
     "blocked_by_limit_events": 0,
-    "zero_trade_configs": 0,
-    "survivor_configs": 10,
+    "zero_trade_configs": 19,
+    "survivor_configs": 484,
     "warnings": [],
-    "elapsed_seconds": 48.73
+    "elapsed_seconds": 42.29
   },
-  "disclaimer": "�����������Ͷ�ʽ��飬�г��з��գ�Ͷ���������"
+  "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
 }
