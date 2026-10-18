@@ -35,12 +35,28 @@ def test_bayes_cli_entry_exists():
     说明（F16 同步）：原断言 `inspect.getsource(cli.main)` 里出现 "--opt"/"bayes" 字样，
     这是**源码文本耦合**而不是行为验证 —— argparse 定义已抽到 `cli.build_parser()`，
     该断言会因"代码搬家"而红，而入口其实还在。
-    现改为真跑 `python cli.py --help` 断言行为，判定严格更强（覆盖全部旧参数）。
+
+    现分两层，都是行为验证：
+      1. 真跑 `python cli.py --help`（subprocess），断言退出码 0 且帮助里列出全部旧参数
+         —— 证明这些参数在**真实进程**里被 argparse 接受，而不只是"源码里有字符串"；
+      2. 进程内检查 `build_parser()` 的 option 集合，覆盖 --help 可能折叠显示的短选项。
     """
     import subprocess
     import types
     sys.modules.setdefault("akshare", types.ModuleType("akshare"))
     import cli
+
+    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    help_txt = subprocess.run(
+        [sys.executable, "cli.py", "--help"],
+        cwd=src_dir, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=120,
+    )
+    assert help_txt.returncode == 0, f"--help 退出码 {help_txt.returncode}: {help_txt.stderr[:300]}"
+    for flag in ("--opt", "--detail", "--no-regime", "--opt-iters",
+                 "--start", "--jobs", "-t", "--json", "--fast"):
+        assert flag in help_txt.stdout, f"--help 未列出 {flag}"
+
     assert callable(cli.build_parser)
     parser = cli.build_parser()
     opts = {a for act in parser._actions for a in act.option_strings}

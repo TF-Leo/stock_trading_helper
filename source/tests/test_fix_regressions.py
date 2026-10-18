@@ -278,3 +278,42 @@ def test_f19_no_duplicate_dataclass_fields():
     from stock_analysis.backtest.engine import BacktestResult as B
     fields = list(B.__dataclass_fields__)
     assert len(fields) == len(set(fields)), f"重复字段: {[f for f in set(fields) if fields.count(f) > 1]}"
+
+
+# ---------------------------------------------------------------------------
+# F20 / G33 / G34 数据层：--start 生效、缓存不被截断、降级可见
+# ---------------------------------------------------------------------------
+def test_g34_start_window_applied_and_cache_not_truncated():
+    """`--start` 必须真正截取窗口；空/全区间不得改变数据。"""
+    from stock_analysis.data_loader import meta
+    df = _toy(400)
+    sub = meta._apply_start(df, "2021-06-01")
+    assert 0 < len(sub) < len(df), f"未截取: {len(sub)} / {len(df)}"
+    assert sub.index[0] >= pd.Timestamp("2021-06-01")
+    assert meta._apply_start(df, None) is df
+    assert len(meta._apply_start(df, "1990-01-01")) == len(df)
+    assert len(meta._apply_start(df, "2030-01-01")) == 0
+
+
+def test_g33_degraded_fetch_is_visible():
+    """触网失败→回退旧缓存时，降级事实必须结构化可见（否则 Hermes 无从知晓数据陈旧）。"""
+    from stock_analysis.data_loader import meta
+    df = _toy(300)
+    meta._reset_fetch_info("sina")
+    meta._mark_degraded("simulated network down", df)
+    info = meta.last_fetch_info()
+    assert info["degraded"] is True
+    assert info["source"] == "cache" and info["from_cache"] is True
+    assert info["requested_source"] == "sina"
+    assert info["cache_last_date"] == df.index[-1].date().isoformat()
+    assert info["lag_days"] is not None and info["lag_days"] >= 0
+    assert "simulated network down" in info["degraded_reason"]
+    # 新鲜命中时不得误报降级
+    meta._reset_fetch_info("sina")
+    assert meta.last_fetch_info()["degraded"] is False
+
+
+def test_expected_trade_date_never_weekend():
+    """期望最新交易日必须落在工作日（否则非交易日会无谓触网 → 每次 40s+）。"""
+    from stock_analysis.data_loader import meta
+    assert meta._expected_latest_trade_date().weekday() < 5
