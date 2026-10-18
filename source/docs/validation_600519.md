@@ -1,7 +1,7 @@
 # 600519 / 510300 验证快照（A13 / B6 / B1）
 
 > 本文件由 `tools/validation_snapshot.py` 自动生成，**全部数字来自真实运行**，未手工填写。
-> 生成时间：2026-10-18 01:13:59　Python 3.12.10　数据区间见各表 `bars` 字段（600519 自 2020-01-02 起）
+> 生成时间：2026-10-18 09:29:27　Python 3.12.10　数据区间见各表 `bars` 字段（600519 自 2020-01-02 起）
 
 ## 1. 600519（股票，`--json --fast`）
 
@@ -132,5 +132,5 @@ cd source
 python cli.py 600519 --json --fast      # 股票
 python cli.py 510300 --json --fast      # 基金
 python -m pytest tests/ -q              # 测试网（离线）
-cd .. && python tools/check_gates.py     # 32 项门禁（ps1 版的等价转写）
+cd .. && pwsh -File tools/check_gates.ps1 -Full   # 34 项门禁（唯一权威裁定器）
 ```

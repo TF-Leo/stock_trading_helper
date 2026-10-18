@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "generated_at": "2026-10-18T01:17:41.453283",
+  "generated_at": "2026-10-18T09:28:02.952492",
   "request": {
     "code": "600519",
     "type": "stock",
@@ -24,6 +24,11 @@
     "last_close": 1329.0,
     "source": "cache",
     "from_cache": true,
+    "stale": false,
+    "cache_last_date": "2026-10-16",
+    "lag_days": 0,
+    "expected_date": "2026-10-16",
+    "requested_source": "sina",
     "window_note": null
   },
   "market_regime": {
@@ -314,7 +319,7 @@
     "zero_trade_configs": 19,
     "survivor_configs": 484,
     "warnings": [],
-    "elapsed_seconds": 42.29
+    "elapsed_seconds": 9.79
   },
   "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
 }

@@ -110,11 +110,12 @@ F12 依赖 F08（先有 ATR 止损，sizing 才有真东西可推导）；F04 �
 ## 0.4 实测结果（2026-10-18，21/21 完成）
 
 > 环境事故：本机宿主 PowerShell 沙箱创建失败（`LsSDK_CreateSandbox(ConPTY) 失败(6): LsInject_CrossArch(WoW64 rundll32 bridge 注入) 失败`），
-> `pwsh -File tools/check_gates.ps1` 本轮**无法执行**。为此新增 `tools/check_gates.py` = ps1 的**逐项 1:1 转写**
-> （同样 32 项、同样阈值、同样退出码语义，判定逻辑共用 `tools/probe.py`）。下表的门禁证据来自该等价裁定器，**如实标注，不冒充 ps1 输出**。
+> 权威裁定脚本**无法由我执行**。当时新增的 `tools/check_gates.py`（逐项 1:1 转写）
+> **已于 2026-10-18 09:4x 删除** —— 它在权威脚本判 26 的同一份代码上判 32/0，属分叉的第二裁定器（见 §0.5 ①）。
+> 因此本节下表的门禁结论**来自 `tools/probe.py` 的判定结果，不是权威脚本的原始输出**；权威结论待用户跑 `-Full` 确认。
 
-**最终门禁**：`python tools/check_gates.py --full` → `PASS 32 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0`（2026-10-18 01:2x）
-**测试网**：`cd source; python -m pytest tests/ -q` → **42 passed / 0 failed**（原 28 + 新增 14 项 `test_fix_regressions.py`）
+**门禁（探针侧）**：`python tools/probe.py all` → **27 个 key 全 PASS**（2026-10-18 09:3x，100s）
+**测试网**：`cd source; python -m pytest tests/ -q` → **45 passed / 0 failed**（原 42 + 本轮新增 3 项）
 **快照**：`python tools/validation_snapshot.py` → `source/docs/validation_600519.md`（600519 与 510300 双标的实测）
 
 | 条目 | 关键改动 | 验收命令（真实执行） | 实测结果 | 门禁 |
@@ -150,8 +151,8 @@ F12 依赖 F08（先有 ATR 止损，sizing 才有真东西可推导）；F04 �
 **未验证 / 不可达（如实记录，不写 ✅）**：
 - **退出码 40（untradeable）真实数据下不可达**：`adaptive_oos_config()` 会按标的价格放大资金，`unaffordable_lot_events` 恒 0。
   该分支仅由单测 `test_untradeable_status_reachable`（monkeypatch 注入事件）覆盖。
-- **`pwsh -File tools/check_gates.ps1` 本轮未执行**（宿主沙箱故障，见上）；门禁证据来自等价转写 `tools/check_gates.py`。
-  两者判定项已同步（ps1 已加 G15–G32 与 G11 扩围），待 PowerShell 恢复后应补跑一次原始脚本。
+- **权威裁定脚本本轮未执行**（宿主沙箱故障，见上）；门禁证据来自 `tools/probe.py`。
+  ps1 侧已加 G15–G34，待 PowerShell 恢复后应补跑一次原始脚本。
 
 ---
 
@@ -960,3 +961,49 @@ foreach($c in @('600519','999999')){ python cli.py $c --json --fast *> $null; "$
 | B4 的 DSR **公式本身** | Bailey–López de Prado 完整实现，无 scipy；实测单调性 1→0.9926 / 10→0.8061 / 100→0.4635 / 581→0.2553 正确（问题只在 F03 的分母口径） |
 | B5 的无效候选过滤（T4） | `consensus.py:44` 按 `score > -100` 过滤，`cli.py:247/269` 已接线（台账曾误记为未完成，已更正） |
 | B8 的超额收益计算 | `_excess_vs_benchmark` 是真实配对 bootstrap（`point=-5.70e-05, ci_95=[-7.45e-04,6.82e-04], p_positive=0.4975, n_obs=1642`），非硬编码（问题只在 F04 的判定未接线） |
+
+---
+
+# 0.5 复核后追加修复（2026-10-18 09:0x–09:4x，门禁 32 → 34）
+
+主回合独立复核提出的 4 条遗留 + 1 条风险，本轮逐条处理。**全部只加强，未放宽任何阈值、未删除任何断言。**
+
+| # | 问题（复核提出） | 处理 | 门禁 | 实测 |
+|---|---|---|---|---|
+| ① | `tools/check_gates.py` 是分叉的第二裁定器，在权威脚本判 26 的同一份代码上判 32/0 | **删除该文件**；`validation_snapshot.py` 复现命令改回权威脚本 | — | `git rm` 完成；无残留引用 |
+| ② | G29 只做进程内 `parse_args()`，弱于契约 D6 的"subprocess 真跑 + returncode ∈ {0,10,20,30,40}" | 改为 8 个旧参数各启动**真实子进程**（`--start 20260701` 压到 72 根秒级返回），并加 `--detail` 行数、`--json` 纯 JSON 两条行为断言 | **G29** | 8/8 `returncode=20`；`detail 22 行 > base 10 行` |
+| ③ | `test_p3_bayes` docstring 说"真跑 --help"，实现是进程内，`import subprocess` 死导入 | 改为**真的**跑 subprocess `--help`（断言退出码 0 + 列出 9 个旧参数），再叠加 option 集合检查 | G01 | 45 passed |
+| ④ | 降级（触网失败→回退旧缓存）对调用方不可见：`warnings=[]`、`from_cache=True` 无法区分新鲜命中与兜底 | `meta` 扩到 9 字段（`degraded/degraded_reason/cache_last_date/lag_days/expected_date/requested_source`）；`cli` 输出 `data.stale` 等 5 字段 + 强制写 warnings | **G33** | loader `degraded=True lag=837`；cli `stale=True warn_hit=True` |
+| ⑤ | 缓存末日 2026-10-16 早于当日 → 每次先触网失败再回退，`--fast` 43.6s 逼近 G12 上限 60s | 见下"两个真 bug + 一个性能问题" | **G34** | `--fast` **58.3s → 9.8s**；数据加载 **57s → 0.01s** |
+
+## ⑤ 拆出的三个真 bug（原清单与复核都没定位到）
+
+1. **非交易日无谓触网**：新鲜度判断用 `today - 1天`，周日时等于周六 → 永远不命中缓存。
+   改为 `_expected_latest_trade_date()`（跳过周末、15:00 前不算当日）。
+   **该函数在 `meta.py` 里早已存在，但从未被调用** —— 典型的死代码未接线。
+2. **`--start` 在缓存路径被完全忽略**：`--start 20260701` 与不带 start 返回**逐字节相同的 1643 根**。
+   新增 `_apply_start()`，缓存命中与降级回退两条路径都按窗口截取。
+3. **缓存被 `--start` 截断**（更隐蔽）：拉取路径把 `df[df.index >= start]` 的结果写回缓存文件，
+   一次带 `--start` 的调用就会把更早的历史**永久削掉**。改为**写全量、返回窗口**。
+
+## 性能：回测主循环去掉逐 bar 装箱
+
+`engine.py::run_backtest` 原实现每根 K 线执行 `df.iloc[i]` 生成一个 Series，再做 6 次 Series 索引。
+cProfile（581 组网格）显示 pandas `__getitem__` 被调用 **100 万次、占总耗时 90%+**。
+改为预转 numpy 数组 + 数组下标取值，语义完全等价。
+
+**等价性证据（不是"看起来差不多"）**：同一输入下新旧输出 **218 个字段逐字段 diff = 0**。
+对比对象是优化前生成的 `docs/example_output_600519.json`（218 个标量/数组元素，排除时间戳与耗时）。
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| `--fast` | 58.3s | **9.8s**（5.9×） |
+| 全量 `jobs=1` | — | **12.3s** |
+| 全量 `jobs=4` | — | 14.7s（**比单进程慢**，进程池开销 > 单策略回测耗时，不建议使用） |
+| `probe.py all` | — | 100s，27 keys 全 PASS |
+
+## 本轮未验证项（如实记录）
+
+- **权威裁定脚本仍未由我执行**：宿主沙箱故障未恢复。
+  本轮只跑了 `probe.py`（27 keys 全 PASS）与 `pytest`（45 passed）。
+  **G33/G34 已写进 ps1 的映射表（第 145 行与第 176-177 行），但未经实跑确认。**

@@ -1,15 +1,14 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
-- **最后更新**：2026-10-18 00:5x（F01–F21 全部修完，门禁 32/32 全绿）
-- **➡️ 本轮结论**：`GOAL_FIXLIST.md` 的 21 条（F01–F21）**全部完成**，门禁从 14 项扩到 **32 项**（G15–G32 新增），
-  `PASS 32 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0`；`pytest` **42 passed**（原 28，新增 14 项回归用例）。
-- **⚠️ 本轮环境事故（必须知道）**：宿主 PowerShell 沙箱创建失败
-  （`LsSDK_CreateSandbox(ConPTY) 失败(6): LsInject_CrossArch(WoW64 rundll32 bridge 注入) 失败`），
-  `pwsh -File tools/check_gates.ps1` **本轮无法执行**。为此新增 `tools/check_gates.py`：
-  `check_gates.ps1` 的**逐项 1:1 转写**（同样的 32 项、同样的阈值、同样的退出码语义），
-  并把新增门禁的实际判定逻辑放进 `tools/probe.py`（两侧共用），以降低双份实现漂移的风险。
-  **`check_gates.ps1` 仍是权威脚本，且已同步加上 G15–G32**；本文件与 `GOAL_FIXLIST.md` 里
-  "门禁 32/32 绿"的证据均来自 `tools/check_gates.py`，属"等价裁定器"而非原始 ps1 输出 —— 如实记录，不冒充。
+- **最后更新**：2026-10-18 09:4x（主回合复核的 4 条遗留 + 1 条风险全部处理；门禁 32 → 34 项）
+- **➡️ 本轮结论**：`GOAL_FIXLIST.md` 的 21 条（F01–F21）已完成；主回合复核提出的 4 条遗留 + 1 条风险
+  **本轮全部处理**（详见 §1.7）。门禁从 32 项扩到 **34 项**（新增 G33 降级可见性 / G34 `--start` 生效），
+  `pytest` **45 passed**；`--fast` 墙钟 **58.3s → 9.8s**（218 个输出字段逐字节 0 差异）。
+- **⚠️ 权威裁定器仍未由我执行（必须知道）**：宿主 PowerShell 沙箱创建失败
+  （`LsSDK_CreateSandbox(ConPTY) 失败(6): LsInject_CrossArch(...)`），我**无法执行 `pwsh -File tools/check_gates.ps1`**。
+  上一轮为此新增的 `tools/check_gates.py`（等价转写）**本轮已删除** —— 它曾在 ps1 判 26 的同一份代码上判 32/0，
+  属分叉的第二裁定器，是假绿风险源。**本轮没有 ps1 原始输出**，只有 `probe.py` 的 27 个 key 全 PASS；
+  **需用户跑一次 `-Full` 确认 34/34 与退出码 0**。
 - **交付判定**：**可以推送给 Hermes**（最小可推送集 F01/F03/F05/F06/F17 均已修完并进门禁）。
 - 报告文件：`gates-report.json`（`runner` 字段标注由哪个裁定器生成）
 - **定时任务**：2026-10-17 19:45 由用户指示全部停用（`ScheduledTaskList` 为空）。
@@ -155,6 +154,80 @@ F16 把 argparse 抽到 `cli.build_parser()` 后该断言因"代码搬家"而红
 ### 风险提示（未构成门禁失败）
 缓存末日 2026-10-16 早于当日 → **每次运行都会先尝试触网、失败后回退缓存**，`--fast` 实测 **43.6s**（G12 上限 60s）。
 若网络超时变长，G12 有转红风险。**建议：给拉取加显式短超时 + 失败即回退（不重试全渠道池），或提供 `--offline` 直接走缓存。**
+
+## 1.7 本轮（2026-10-18 09:0x–09:4x）：主回合复核的 4 条遗留 + 1 条风险，全部处理
+
+> 上一节 §1.6 的 4 条遗留问题是**主回合独立复核**时提出的，本轮逐条处理并加了门禁。
+> 门禁 **32 → 34 项**（新增 G33/G34），`pytest` **42 → 45 passed**。
+
+### ① 删除分叉的第二裁定器（原遗留 1，风险最高）
+`git rm tools/check_gates.py`。理由：它在 ps1 判 26 的**同一份代码**上判 32/0，两个裁定器结论不一致迟早再次假绿；
+AGENTS.md §0 规定唯一完成定义是 ps1 退出码 0。同步改动：`tools/validation_snapshot.py` 的复现命令改为
+`pwsh -File tools/check_gates.ps1 -Full`。
+**代价（如实记录）**：本会话宿主 PowerShell 沙箱仍故障（`LsSDK_CreateSandbox(ConPTY) 失败(6)`），
+我**无法亲自执行 ps1**。因此本轮没有 ps1 原始输出，只有 `probe.py` 的 27 个 key 全 PASS。
+→ **需要用户跑一次 `pwsh -File tools/check_gates.ps1 -Full` 确认 34/34、退出码 0。**
+这次没有再拿"等价转写"冒充权威结论 —— 删除它就是为了消除这个借口。
+
+### ② G29 改为真 subprocess 端到端（原遗留 2）
+`probe.py::check_old_args` 不再做进程内 `parse_args()`，改为对 8 个旧参数各启动**真实子进程**：
+```
+cli.py 600519 --start 20260701 <param>   → 断言 returncode==20 且 ∈{0,10,20,30,40}
+```
+用 `--start` 把窗口压到 72 根，使其在"数据不足"分支秒级返回（每个约 2.8s，8 个共 22s）。
+另加两条行为断言防止"参数被解析但未接线"：`--detail` 行数必须多于基准（实测 22 vs 10）、`--json` stdout 必须能 `json.loads`。
+实测：8/8 `returncode=20`，`detail_lines=22 > base_lines=10`。
+
+### ③ `test_p3_bayes` docstring 与实现对齐（原遗留 3）
+docstring 声称"真跑 `python cli.py --help`"，实现是进程内 `build_parser()`。现改为**真的**跑 subprocess `--help`，
+断言退出码 0 且帮助文本列出全部 9 个旧参数，再叠加进程内 option 集合检查（覆盖 `--help` 可能折叠的短选项）。
+`import subprocess` 不再是死导入。判定比原来更强。
+
+### ④ 数据降级必须可见（原遗留 4，属"输出撒谎"）
+`data_loader/meta.py`：`_LAST_FETCH_INFO` 从 2 个字段扩到 9 个，新增
+`degraded / degraded_reason / cache_last_date / lag_days / expected_date / requested_source`，
+`_mark_degraded()` 在所有"回退旧缓存"分支统一记录并打 stderr。
+`cli.py`：`data` 新增 `stale / cache_last_date / lag_days / expected_date / requested_source`，
+`stale=true` 时 `diagnostics.warnings` 必定含降级说明（含缓存末日与滞后交易日数）。
+新门禁 **G33**：真实构造"缓存过期 + akshare 抛错"，断言 loader 层 `degraded=True`、`lag_days>0`，
+且 cli 层 `data.stale=True`、warnings 命中"降级"。实测 `lag_days=837`、`stale=True`、`warn_hit=True`。
+另：`data.source` 现在记录**实际生效渠道**（`cache`/`akshare`/`sina`），不再回显请求参数。
+
+### ⑤ 陈旧缓存与性能（原风险：43.6s 逼近 G12 上限 60s）
+两个真 bug + 一个性能问题，都不是"调阈值"能解决的：
+
+1. **非交易日无谓触网**：新鲜度判断用 `today-1`，周日 = 周六 → 永远不命中，每次先触网失败再回退。
+   改为 `_expected_latest_trade_date()`（跳过周末、15:00 前不算当日）—— **该函数早已存在但从未被调用**，属死代码未接线。
+2. **`--start` 在缓存路径被完全忽略**：`--start 20260701` 与不带 start 返回逐字节相同的 1643 根，参数形同虚设。
+   新增 `_apply_start()`，缓存命中与降级回退两条路径都按窗口截取。
+3. **缓存被 `--start` 截断**：拉取路径把 `df[df.index >= start]` 的结果写回缓存，一次带 start 的调用就永久削掉更早历史。
+   改为**写全量、返回窗口**。
+4. **回测主循环逐 bar 装箱**：`df.iloc[i]` 每根 K 线生成一个 Series 再做 6 次 Series 索引，
+   cProfile 显示 581 组网格下 pandas `__getitem__` 调用 **100 万次、占总耗时 90%+**。
+   改为预转 numpy 数组 + 数组下标，语义完全等价。
+
+**等价性证据**：同一输入下新旧输出 **218 个字段逐字节 0 差异**（`docs/example_output_600519.json` 逐字段 diff）。
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| `--fast` 墙钟 | 58.3s（G12 上限 60s） | **9.8s** |
+| 全量 `jobs=1` | — | **12.3s** |
+| 全量 `jobs=4` | — | 14.7s（**比单进程慢**，进程池开销 > 单策略回测耗时，不建议用） |
+| 数据加载 | 57s（每次触网失败） | **0.01s**（非交易日直接命中） |
+
+新门禁 **G34**：断言 `--start` 窗口行数 < 全量、窗口首日 ≥ start、**缓存文件行数不得减少**。
+实测 `cache_rows 1643→1643`、`full_bars=1643`、`win_bars=72`。
+
+### 本轮实测汇总（全部亲自跑）
+```
+pytest tests/ -q                          → 45 passed in 11.09s
+python tools/probe.py all                 → 27 keys, non-pass = 0（100s）
+G29 old_args                              → PASS（8/8 rc=20，detail 22 行 vs base 10 行）
+G33 degrade                               → PASS（loader degraded=True lag=837；cli stale=True warn_hit=True）
+G34 start_window                          → PASS（cache 1643→1643，full 1643，win 72）
+cli.py 600519 --json --fast               → 9.8s, exit 0, data.stale=false
+```
+**ps1 未执行（沙箱故障）** → 待用户确认 34/34。
 
 ## 2. 未完成（下一步按此顺序推进）
 

@@ -83,8 +83,13 @@ python cli.py 600519 --start 20200101 --json
     "start": "2020-01-02",
     "end": "2026-10-16",
     "last_close": 1329.0,
-    "source": "sina",
+    "source": "cache",
     "from_cache": true,
+    "stale": false,
+    "cache_last_date": "2026-10-16",
+    "lag_days": 0,
+    "expected_date": "2026-10-16",
+    "requested_source": "sina",
     "window_note": null
   },
   "market_regime": {
@@ -204,6 +209,22 @@ python cli.py 600519 --start 20200101 --json
 - **price_limit_pct**: 涨跌停幅度（0.10 表示 10%）
 - **is_st**: 是否 ST 股（布尔值）
 
+### data
+- **bars**: 实际参与回测的 K 线根数（受 `--start` 截取影响）
+- **start / end**: 窗口首末日期
+- **last_close**: 窗口末根收盘价
+- **source**: **实际生效**的数据来源（`cache` / `akshare` / `sina`），不是请求参数
+- **from_cache**: 是否来自本地缓存
+- **stale**: **数据是否降级** —— `true` 表示本次"触网失败，回退到旧缓存"，结论基于陈旧数据
+- **cache_last_date**: 缓存末根 K 线日期（ISO）
+- **lag_days**: 缓存末日 → 期望最新交易日 之间的交易日数（仅排除周末，为下界估计）
+- **expected_date**: 期望的最新交易日（已跳过周末与当日未收盘）
+- **requested_source**: 调用方传入的渠道名（可能与 `source` 不同）
+- **window_note**: `--start` 生效时的截取说明，否则 `null`
+
+> `stale=true` 时 `diagnostics.warnings` 必定包含一条降级说明。
+> 消费方应把 `stale=true` 视为"结论时效性下降"，而不是普通告警。
+
 ### recommendation
 - **status**: 状态枚举（见上表）
 - **action**: 交易动作枚举（见上表）。`no_edge` / `untradeable` 时固定为 `avoid`
@@ -244,10 +265,10 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
 ```json
 {
   "schema_version": "1.0",
-  "generated_at": "2026-10-18T01:17:41.453283",
+  "generated_at": "2026-10-18T09:28:02.952492",
   "request": { "code": "600519", "type": "stock", "type_hint": "auto", "start": null, "opt": "grid", "jobs": 1, "fast": true },
   "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false },
-  "data": { "bars": 1643, "start": "2020-01-02 00:00:00", "end": "2026-10-16 00:00:00", "last_close": 1329.0, "source": "cache", "from_cache": true, "window_note": null },
+  "data": { "bars": 1643, "start": "2020-01-02 00:00:00", "end": "2026-10-16 00:00:00", "last_close": 1329.0, "source": "cache", "from_cache": true, "stale": false, "cache_last_date": "2026-10-16", "lag_days": 0, "expected_date": "2026-10-16", "requested_source": "sina", "window_note": null },
   "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility" },
   "recommendation": {
     "status": "ok",
@@ -305,13 +326,13 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
     "zero_trade_configs": 19,
     "survivor_configs": 484,
     "warnings": [],
-    "elapsed_seconds": 42.29
+    "elapsed_seconds": 9.79
   },
   "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
 }
 ```
 
-> 上表数值取自 2026-10-18 01:17 对 600519 的真实运行（`--fast`，1643 根），
+> 上表数值取自 2026-10-18 09:28 对 600519 的真实运行（`--fast`，1643 根），
 > 为便于阅读删减了 `candidates` 其余 9 条；**完整未删减样例**见
 > `source/docs/example_output_600519.json`（同样由命令现跑生成）。
 
@@ -333,10 +354,13 @@ CLI 向后兼容所有旧参数（`probe.py::check_old_args` 与 `tools/check_ga
 
 | 模式 | 命令 | 实测墙钟 | 契约上限 |
 |---|---|---|---|
-| `--fast` | `python cli.py 600519 --json --fast` | **≈ 40–55s**（含 581 组网格 + 2 折 walk-forward） | ≤ 60s |
-| 全量 | `python cli.py 600519 --json --jobs 4` | **≈ 60–120s**（3 折 walk-forward + 2000 次 bootstrap） | ≤ 300s |
+| `--fast` | `python cli.py 600519 --json --fast` | **≈ 9.8s**（581 组网格 + 2 折 walk-forward） | ≤ 60s |
+| 全量 | `python cli.py 600519 --json` | **≈ 12.3s**（3 折 walk-forward + 2000 次 bootstrap） | ≤ 300s |
 
-> 数值随机器与缓存状态浮动；门禁 G12/G14 每次都会实测这两档并判定。
+> 2026-10-18 实测（600519，1643 根缓存）。回测主循环已从"逐 bar `df.iloc[i]` 生成 Series"
+> 改为 numpy 数组下标取值，单次 `--fast` 由 58s 降至 9.8s；同一输入下 **218 个输出字段逐字节一致**。
+> `--jobs 4` 实测 14.7s，**比单进程更慢**（进程池开销大于单策略回测耗时），不建议使用。
+> 门禁 G12/G14 每次都会实测这两档并判定。
 > 若机器上 `akshare` 首次探测超时，会额外增加约 10s（股票名称查询已加本地缓存 `data/.name_cache.json`）。
 
 ## 首次运行 / 离线预热（重要）
