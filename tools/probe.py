@@ -25,18 +25,24 @@ REQUIRED_TOP_KEYS = [
     "market_regime", "recommendation", "evidence", "candidates",
     "diagnostics", "disclaimer",
 ]
-# stop_method（F12）纳入必备字段：它标明止损价是 ATR 推导还是固定百分比，
+
+# stop_method（F12）纳入必备字段：它标明止损价是 ATR 推导还是固定百分比。
+# no_edge（2026-10-18 补登）：读取方用它做"是否可交易"的二分判断，
+#   与 status 必须自洽（G18 已断言 no_edge == (status == "no_edge")）。
+#   此前它实际一直输出，但没进必备清单 —— 意味着可以被静默移除而不被发现。
 REQUIRED_REC_KEYS = [
     "status", "action", "action_reason", "confidence", "position_fraction",
     "horizon_days", "entry_zone", "stop_loss", "take_profit",
-    "distance_to_trigger", "invalidation", "stop_method",
+    "distance_to_trigger", "invalidation", "stop_method", "no_edge",
 ]
 # F06f/F20 的数据新鲜度字段同样锁定，防止"降级不可见"回归。
-# 注意：错误响应路径（create_error_response）目前只输出 4 个 data 键，
-# 因此该列表只在**成功路径**（G02/G04）校验；错误路径的 schema 同构属待办项。
+# window_note（2026-10-18 补登）：`--start` 生效时的截取说明，两条路径都输出。
+# 注意：错误响应路径（create_error_response）已与成功路径同构（G35 锁定），
+# 因此该列表在两侧都应成立。
 REQUIRED_DATA_KEYS = [
     "bars", "start", "end", "last_close", "source", "from_cache",
     "stale", "cache_last_date", "lag_days", "expected_date", "requested_source",
+    "window_note",
 ]
 
 EXIT_CODES = {"ok": 0, "no_edge": 10, "insufficient_data": 20,

@@ -598,6 +598,67 @@ G36 observed                  → {used_source: sina_stock, rows: 1643}
 `python tools/warm_cache.py` 即可，东财封了会自动走新浪。
 若某只票在新浪也没有数据，`warm_cache.py` 会逐票报出来（不会假成功）。
 
+## 1.13 Hermes 全项自查通过 + 三个待定性问题的答复（2026-10-18）
+
+**Hermes 在 e006211 上跑完 A–D 全部通过**：3.14.7 装依赖无冲突、`pytest` 47 passed、
+`warm_cache.py` **5/5 落盘 exit 0**（东财被封但渠道池自动移出、落到新浪）、
+接口三条 exit 0/0/30、契约键数符合、`n_trials` 581/44 未退化、
+`stale` 三字段自洽、族占比合规、CI 7/9、`time_in_market` 0.393/0.202、幂等一致、
+错误路径 exit 20 且 `bars=21` 与 invalidation 文本一致、`horizon_days=[null,null]`。
+
+它按我的要求**自己不下结论**，把三处交给我定性。以下是实测答复。
+
+### ① 那 9 条 `ci_95[]`/`entry_zone[]` 差集 —— **不是契约问题，是 walker 粒度差异**
+我用两种 walker 各算一次，**结果完全相同**：
+```
+A) 只在"列表元素是 dict"时下钻（G35 口径）: ok=134 err=116 缺=18 独有=0 越界=0
+B) 递归展开所有 list（Hermes 口径）        : ok=134 err=116 缺=18 独有=0 越界=0
+```
+它得 27 条、我算 18 条，差异来自它把 **float 数组元素**也算成路径（`ci_95[0]`、`ci_95[1]`…）。
+逐路径核查后确认是**键在、值变 null**：
+```
+/evidence/metrics/annual_return/ci_95   成功=[-0.040951, 0.156577]  错误=None
+/evidence/metrics/sharpe/ci_95          成功=[-0.313136, 1.195496]  错误=None
+/evidence/excess_vs_buy_hold/ci_95      成功=[-7.5e-04, 7.0e-04]    错误=None
+/recommendation/entry_zone              成功=[1317.88, 1340.12]     错误=None
+```
+**定性：契约内。** 契约要求"不适用时为显式 null"，实现正确；是校验器的粒度问题。
+已写进 README「关于'数组变 null'：键在、值变，不是缺键」，并给出判据：**看键在不在，别看数组元素**。
+
+### ② `no_edge` / `window_note` 该不该进契约 —— **该，已补登（真漏登记）**
+实测两个键在成功与错误两条路径**都存在**（`rec 键数=13 / data 键数=12`），
+但**都没进 `REQUIRED_REC_KEYS` / `REQUIRED_DATA_KEYS`** —— 意味着可以被静默移除而不被门禁发现。
+已补进必备清单（REC 12→13、DATA 11→12），并做变异测试：
+```
+基线  G02=PASS G04=PASS
+变异  注入 __missing_rec__/__missing_data__ → G02=FAIL G04=FAIL   MUTATION_TEST_OK
+```
+`no_edge` 尤其重要：读取方用它做"是否可交易"的二分判断，且 G18 已断言
+`no_edge == (status == "no_edge")`。此前它是"实际输出但未锁定"，属真实缺口。
+
+### ③ qfq 混源可比性 —— **实测一致，并做成了可重跑的工具**
+它的担心是对的（缓存不记录来源，`data.source` 缓存命中时恒为 `cache`）。
+但我实测**新浪与缓存（东财历史）逐列逐日完全一致**：
+```
+600519，1643 个重叠交易日
+open/high/low/close/volume: 最大绝对差=0.000000  超差点数=0/1643  全部一致
+```
+新增 `tools/check_source_parity.py`（可重跑，退出码 0/1/2 可机读），
+README 增加「跨通道数据一致性（混源还能不能比）」章节。
+**结论：换通道不影响历史数值跨版本对比**；将来若返回 1，需把差异样本写进验证快照再讨论。
+
+### 顺带修正一处我自己的误述
+此前我在报告里说"基金缓存在 `fund_analysis/data/`"，**错**：
+`meta.DATA_DIR` 就是 `source/stock_analysis/data`，基金缓存也在那里
+（`fund_analysis/data/` 一直是空目录，未被使用）。
+
+### 收口
+```
+pytest                       → 47 passed
+pwsh check_gates.ps1 -Full   → PASS 36 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0
+python tools/check_source_parity.py 600519 → 一致，exit 0
+```
+
 ## 2. 未完成（下一步按此顺序推进）
 
 > 本节为 **2026-10-17 的历史记录**；2026-10-18 的 21 条修复见 §1.5，当前**没有**未完成条目。
