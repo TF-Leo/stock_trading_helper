@@ -474,40 +474,54 @@ cd source && python -m pytest tests/ -q     # 无缓存也必须是 47 passed
 
 ## 依赖与 Python 版本（D3f）
 
-### 推荐：Python 3.12（唯一被门禁验证过的组合）
+**支持 Python 3.11+**，不限定小版本。`source/requirements.txt` 在 3.11 / 3.12 / 3.13 / 3.14 上均可解析安装。
 
-| 组件 | 版本 |
-|---|---|
-| Python | **3.12.10** |
-| akshare | 1.18.29 |
-| requests | 2.32.5 |
-| numpy | 2.2.6 |
-| pandas | 3.0.1 |
-| pytest | 8.3.5 |
+### 为什么会有版本差异
 
-验证：`pwsh -File tools/check_gates.ps1 -Full` → **PASS 35 / 退出码 0**；`pytest` → **47 passed**。
-
-### Python 3.14 的已知冲突（**已修正**）
-
-`pandas 3.0.1` 的元数据是条件依赖：
+差异**只来自 numpy 的 wheel 覆盖范围**，与本项目代码无关。`pandas 3.0.x` 的元数据是条件依赖：
 
 ```
 numpy>=1.26.0 ; python_version <  "3.14"
 numpy>=2.3.3 ; python_version >= "3.14"
 ```
 
-因此对 numpy 用**单一硬 pin 必然在某一侧失败**：早期版本写死 `numpy==2.2.6`，在 3.14 上会
-`ResolutionImpossible`。现在 `requirements.txt` 用 **environment marker** 分档：
+而 `numpy 2.2.x` 没有 cp314 wheel。所以对 numpy 用单一硬 pin 必然在某一侧失败。
+`requirements.txt` 用 **environment marker** 分档解决：
 
 ```
 numpy==2.2.6; python_version < "3.14"
 numpy>=2.3.3,<3; python_version >= "3.14"
 ```
 
-- Python 3.14 组合 = 按 PyPI 元数据推导的**可安装**组合，但**尚未跑过门禁**（本仓库无 3.14 环境）。
-  在 3.14 上请务必跑一遍 `pytest` 与 `python cli.py 600519 --json --fast` 并把结果反馈。
-- 门禁 G30 对比 `requirements.txt` 的 pin 与实际已安装版本；它按 `pkg==x.y.z` 提取，
-  marker 后缀不影响解析（已实测 PASS）。
+`uv pip compile` 实测：四个版本全部解析成功，解析结果如下——
+
+| Python | numpy | pandas | akshare | 状态 |
+|---|---|---|---|---|
+| 3.11 | 2.2.6 | 3.0.1 | 1.18.29 | ✅ **真机跑通**：pytest 47 passed，CLI exit 0/0/30 |
+| 3.12 | 2.2.6 | 3.0.1 | 1.18.29 | ✅ **真机跑通**：pytest 47 passed，门禁 35/35 |
+| 3.13 | 2.2.6 | 3.0.1 | 1.18.29 | ⚠️ 仅依赖解析验证（未运行） |
+| 3.14 | 2.5.4 | 3.0.1 | 1.18.29 | ⚠️ 仅依赖解析验证（未运行） |
+
+> **关于 3.13 / 3.14 的诚实说明**：这两个版本只做了**依赖解析**（`uv pip compile` 通过），
+> **没有做运行验证** —— 验证机上 `uv` 无法安装这两个解释器（写 `vcruntime140.dll` 被安全策略拒绝）。
+> 所以我不声称"3.13/3.14 已验证"。若你在这些版本上遇到问题，把
+> `pytest` 与 `python cli.py 600519 --json --fast` 的原始报错发过来 —— 那会是真 bug。
+
+### 安装
+
+```bash
+cd source
+pip install -r requirements.txt
+```
+
+装完自查（一条命令确认版本组合）：
+
+```bash
+python -c "import sys,akshare,numpy,pandas,pytest;print(sys.version.split()[0],'| akshare',akshare.__version__,'| numpy',numpy.__version__,'| pandas',pandas.__version__,'| pytest',pytest.__version__)"
+```
+
+门禁 G30 会对比 `requirements.txt` 的 pin 与实际已安装版本；它按 `pkg==x.y.z` 提取，
+marker 后缀不影响解析（在 3.11 与 3.12 上均实测 PASS）。
 
 ## 实现要点（与结论可靠性直接相关）
 

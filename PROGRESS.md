@@ -435,10 +435,12 @@ pandas 3.0.1  requires_python: >=3.11
 ```
 我上轮把 pin 改成"实测值"时，只对了我这**一台** 3.12 机器，没考虑 Python 版本差异。
 
-修复：`numpy` 改用 **environment marker** 分档（`==2.2.6` for <3.14；`>=2.3.3,<3` for ≥3.14），
-并在文件头写明"3.12 是唯一被门禁验证的组合；3.14 是按元数据推导的可安装组合，**尚未跑过门禁**"。
+修复：`numpy` 改用 **environment marker** 分档（`==2.2.6` for <3.14；`>=2.3.3,<3` for ≥3.14）。
 实测：G30 仍 PASS（正则按 `pkg==x.y.z` 提取，marker 后缀不影响）。
-**我无法验证 3.14 组合——本机只有 3.12，已如实标注，未声称已验证。**
+
+**后续修正（见 §1.11）**：我最初在文档里写"推荐用 3.12 / 唯一被验证的组合"，
+用户指出这是拿版本规避当修法、把工程问题转嫁给使用者。**该建议已全部移除**，
+改为"支持 Python 3.11+"，并用真实环境验证了 3.11。
 
 ### ③ 预热命令对逐票失败零感知（它提的建议①）—— 采纳并实现
 
@@ -471,6 +473,59 @@ pwsh -File tools/check_gates.ps1 -Full    → PASS 35 | FAIL 0 | BLOCKED 0 | SKI
 ```
 **仍未验证**：Python 3.14 环境下 `pip install` + `pytest` + CLI 全流程（本机无 3.14）；
 Hermes 卡在缓存，第 1–4 节契约自查/正确性/同构/幂等**全部未测**。
+
+## 1.11 移除 Python 版本限制（用户指正，2026-10-18）
+
+**用户指正**：*"你不应该限制 python 版本，并在给 hermes 的提示词中也应当移除该限制。"*
+
+**我接受这条批评。** 我之前的做法（"推荐降到 Python 3.12"）是拿版本规避当修法，
+把依赖规格的工程问题转嫁给使用者。而且它本来就是多余的 —— 依赖解析本身可以覆盖 3.11+。
+
+### 先取事实（PyPI 元数据，非推理）
+```
+pandas 3.0.6 / 3.0.1   requires_python: >=3.11
+                        numpy>=1.26.0 ; python_version <  "3.14"
+                        numpy>=2.3.3 ; python_version >= "3.14"
+   wheel cp tags:       cp311, cp312, cp313, cp314, cp315
+numpy 2.5.4            requires_python: >=3.12 | cp tags: cp312..cp315
+akshare 1.19.1         requires_python: >=3.11
+```
+→ pandas/akshare 本就支持 3.11+，**限制到 3.12 毫无依据**。冲突只是 `numpy==2.2.6` 缺 cp314 wheel。
+
+### 用 uv 做的可解析性实测（不是猜）
+```
+uv pip compile requirements.txt --python-version <v>
+  3.11 → OK   numpy==2.2.6   pandas==3.0.1  akshare==1.18.29
+  3.12 → OK   numpy==2.2.6   pandas==3.0.1  akshare==1.18.29
+  3.13 → OK   numpy==2.2.6   pandas==3.0.1  akshare==1.18.29
+  3.14 → OK   numpy==2.5.4   pandas==3.0.1  akshare==1.18.29   ← marker 自动升 numpy
+```
+四个版本全部解析通过；3.11–3.13 锁定同一套实测版本，只有 3.14 因 wheel 覆盖自动升 numpy。
+
+### 真机运行验证（本机实际装了并跑了）
+`uv venv --python 3.11` + `uv pip install -r requirements.txt` →
+```
+Python 3.11.9 | akshare 1.18.29 | numpy 2.2.6 | pandas 3.0.1 | pytest 8.3.5
+python -m pytest tests/ -q                    → 47 passed in 8.85s
+python cli.py 600519 --json --fast            → exit 0, status=ok,  bars=1643, n_trials=581
+python cli.py 510300 --json --fast            → exit 0, status=ok,  bars=1643
+python cli.py 999999 --json --fast            → exit 30（data_source_error）
+```
+→ **3.11 现在是真机验证过的**（此前我只有 3.12）。
+
+### 3.13 / 3.14：只有解析证据，没有运行证据（如实标注）
+`uv venv --python 3.13/3.14` 在本机失败：解包 `vcruntime140.dll` 被安全策略拒绝（os error 5）。
+故这两个版本**只做了依赖解析验证**，我**不声称已验证**。文档里已明确区分"真机跑通"与"仅解析验证"。
+
+### 改动
+- `source/requirements.txt`：删除"强烈建议优先使用 3.12""唯一被验证的组合"等表述；
+  改为"支持 Python 3.11+、四版本均可解析"，并如实分列"真机跑通（3.11/3.12）"与"仅解析（3.13/3.14）"。
+- `README.md`「依赖与 Python 版本」：删除"推荐：Python 3.12（唯一被门禁验证过的组合）"标题与表格；
+  改为"支持 Python 3.11+"+ 四版本解析结果表 + 真机/仅解析的显式区分 + 安装与版本自查命令。
+- 给 Hermes 的自查提示词中**同步移除**任何"优先 3.12"的限制（改为按其实际环境跑，失败即报）。
+
+**核心原则**：能用规格解决的（environment marker）就不要用"请你换环境"解决；
+确实无法在本机验证的（3.13/3.14 运行验证），如实标注为未验证，不写成建议。
 
 ## 2. 未完成（下一步按此顺序推进）
 
