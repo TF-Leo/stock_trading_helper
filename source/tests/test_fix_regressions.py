@@ -317,3 +317,64 @@ def test_expected_trade_date_never_weekend():
     """期望最新交易日必须落在工作日（否则非交易日会无谓触网 → 每次 40s+）。"""
     from stock_analysis.data_loader import meta
     assert meta._expected_latest_trade_date().weekday() < 5
+
+
+# ---------------------------------------------------------------------------
+# C3 / G35：错误响应必须与成功响应同构（显式 null，不得整块缺失）
+# ---------------------------------------------------------------------------
+def test_g35_error_response_covers_schema_declarations():
+    """错误响应的键集合必须覆盖 schema.py 声明的全部字段。
+
+    历史问题：错误路径只输出 46 个键、成功路径 134 个（缺 88 条路径），
+    且 data.bars 恒 0，与同一文档的 invalidation="仅 72 根 < 100" 自相矛盾。
+    """
+    import types
+    sys.modules.setdefault("akshare", types.ModuleType("akshare"))
+    import cli
+    from decision import schema
+
+    doc = cli.create_error_response(
+        'insufficient_data', '数据不足（仅 23 根 < 100）', '600519', 'stock',
+        bars=23, start='2026-09-08', end='2026-10-16', last_close=1329.0, elapsed=0.01)
+
+    for dc, key in ((schema.Data, 'data'), (schema.Recommendation, 'recommendation')):
+        missing = set(dc.__dataclass_fields__) - set(doc[key])
+        assert not missing, f"{key} 缺 schema 声明字段: {sorted(missing)}"
+
+    # 不适用字段必须是显式 null，不得编造 [1,5] 之类的值
+    assert doc['recommendation']['horizon_days'] == [None, None]
+    assert doc['recommendation']['stop_method'] is None
+    assert doc['recommendation']['position_fraction'] == 0.0
+    assert doc['recommendation']['no_edge'] is True
+
+    # metrics 必须 9 项且 point 全 null（不得整块缺失）
+    assert set(doc['evidence']['metrics']) == set(cli.METRIC_KEYS)
+    assert all(v['point'] is None for v in doc['evidence']['metrics'].values())
+    assert doc['evidence']['n_trials'] == 0
+
+    # bars 如实填真实根数
+    assert doc['data']['bars'] == 23
+    assert '23 根' in doc['recommendation']['invalidation']
+
+
+def test_g35_metric_keys_stay_in_sync():
+    """_build_metrics 的键集合必须与 _empty_metrics 完全一致（否则两侧再次不同构）。"""
+    import types
+    sys.modules.setdefault("akshare", types.ModuleType("akshare"))
+    import cli
+
+    class _R:  # _build_metrics 只读这些属性
+        equity_curve = [100000.0, 101000.0, 100500.0, 102000.0]
+        trades = []
+        annual_return = 0.1
+        max_drawdown = 0.05
+        win_rate = 0.5
+        sharpe_ratio = 1.0
+        calmar_ratio = 2.0
+        profit_factor = 1.5
+        trade_count = 0
+        avg_holding_days = 0.0
+        time_in_market = 0.0
+
+    assert set(cli._build_metrics(_R(), fast=True)) == set(cli.METRIC_KEYS)
+    assert set(cli._empty_metrics()) == set(cli.METRIC_KEYS)

@@ -90,34 +90,106 @@ def parse_pct(s):
         return 0.0
 
 
-def create_error_response(status, message, code, data_type, type_hint='auto'):
-    """创建错误响应（request 键集合必须与正常响应一致，否则 C3 schema 不同构）。"""
+# C3 要求"不适用时为显式 null"，不是"整块缺失"。
+# 历史问题：错误响应只输出 46 个键、成功路径 134 个 —— 缺 88 条路径
+# （evidence.metrics / n_trials / significant / triggers / data 8 字段 / stop_method …），
+# Hermes 必须按 status 分支写防御性解析；且 data.bars 恒 0 与同文档
+# invalidation="仅 72 根 < 100" 自相矛盾。G35 现在逐路径比对两侧结构。
+METRIC_KEYS = (
+    'annual_return', 'max_drawdown', 'win_rate', 'sharpe', 'calmar',
+    'profit_factor', 'trade_count', 'avg_holding_days', 'time_in_market',
+)
+
+
+def _empty_metrics():
+    """C3: 指标块不适用时逐项显式 null（键集合必须与 _build_metrics 完全一致）。"""
+    return {k: {'point': None, 'ci_95': None} for k in METRIC_KEYS}
+
+
+def create_error_response(status, message, code, data_type, type_hint='auto',
+                          bars=0, start=None, end=None, last_close=None,
+                          fetch_info=None, elapsed=0.0, warnings=None):
+    """创建错误响应。
+
+    C3: 键集合必须与正常响应**同构**；不适用处显式 null，并在
+    action_reason / diagnostics.warnings 说明原因。
+    """
+    fi = dict(fetch_info or {})
+    try:
+        board, price_limit_pct, is_st = classify_board(code)
+    except Exception:
+        board, price_limit_pct, is_st = 'unknown', None, None
+    notes = list(warnings or [])
+    if message not in notes:
+        notes.insert(0, message)
     return {
         'schema_version': '1.0',
         'generated_at': datetime.now().isoformat(),
         'request': {'code': code, 'type': data_type, 'type_hint': type_hint,
                     'start': None, 'opt': 'grid', 'jobs': 1, 'fast': False},
-        'instrument': {'code': code, 'name': '', 'board': 'unknown'},
-        'data': {'bars': 0, 'start': '', 'end': '', 'last_close': 0},
-        'market_regime': {'label': 'Unknown', 'confidence': 0},
+        'instrument': {'code': code, 'name': '', 'board': board,
+                       'price_limit_pct': price_limit_pct, 'is_st': is_st},
+        'data': {
+            # bars/start/end/last_close 在"数据太短"时是**已知的真实值**，
+            # 必须如实填（此前恒 0/''/0，与 invalidation 文本互相打脸）
+            'bars': int(bars or 0),
+            'start': '' if start is None else str(start),
+            'end': '' if end is None else str(end),
+            'last_close': None if last_close is None else round(float(last_close), 4),
+            'source': fi.get('source'),
+            'from_cache': fi.get('from_cache'),
+            'stale': (None if 'degraded' not in fi else bool(fi.get('degraded'))),
+            'cache_last_date': fi.get('cache_last_date'),
+            'lag_days': fi.get('lag_days'),
+            'expected_date': fi.get('expected_date'),
+            'requested_source': fi.get('requested_source'),
+            'window_note': None,
+        },
+        'market_regime': {'label': 'Unknown', 'confidence': 0.0,
+                          'as_of': None, 'definition': None},
         'recommendation': {
             'status': status,
             'action': 'insufficient_data' if status in ('insufficient_data', 'data_source_error') else 'avoid',
             'action_reason': [message],
-            'confidence': 0,
-            'position_fraction': 0,
-            'horizon_days': [1, 5],
+            'confidence': 0.0,
+            'position_fraction': 0.0,
+            # 未知持仓时长时给 [null, null] 而不是编造 [1, 5]
+            'horizon_days': [None, None],
             'entry_zone': None,
             'stop_loss': None,
             'take_profit': None,
+            'stop_method': None,
             'distance_to_trigger': {'buy_pct': None, 'sell_pct': None},
             'invalidation': message,
-            'no_edge': True
+            'no_edge': True,
         },
-        'evidence': {'consensus': {}, 'dispersion': 0, 'stability': {}},
+        'evidence': {
+            'consensus': {'family': None, 'agreement': None, 'members': []},
+            'dispersion': None,
+            'stability': {'action_stable': None, 'family_stable': None,
+                          'windows_tested': 0, 'top_k_overlap_min': None},
+            'n_trials': 0,
+            'n_survivors': 0,
+            'deflated_sharpe': None,
+            'significant': False,
+            'metrics': _empty_metrics(),
+            'excess_vs_buy_hold': {'point': None, 'ci_95': None,
+                                   'p_positive': None, 'n_obs': 0,
+                                   'benchmark': 'buy_and_hold_close'},
+            'buy_hold_baseline': {'total_return': None, 'annual_return': None},
+            'regime_win_rates': {'Bull': None, 'Bear': None, 'Shock': None},
+            'triggers': [],
+        },
         'candidates': [],
-        'diagnostics': {'warnings': [message], 'elapsed_seconds': 0},
-        'disclaimer': '本结果不构成投资建议。'
+        'diagnostics': {
+            'unaffordable_lot_events': 0,
+            'blocked_by_limit_events': 0,
+            'zero_trade_configs': 0,
+            'survivor_configs': 0,
+            'warnings': notes,
+            'elapsed_seconds': round(float(elapsed or 0.0), 2),
+        },
+        'disclaimer': '本结果不构成投资建议，市场有风险，投资需谨慎。',
     }
 
 
@@ -225,7 +297,7 @@ def _build_metrics(result, fast=False):
     pnl = [float(t.pnl_pct) for t in trades]
     hold = [float(t.holding_days) for t in trades]
     nb = 400 if fast else 2000
-    return {
+    block = {
         'annual_return': _ci_block(rets, stat_annual_return, getattr(result, 'annual_return', 0), nb),
         'max_drawdown': _ci_block(rets, stat_max_drawdown, getattr(result, 'max_drawdown', 0), nb),
         'win_rate': _ci_block(pnl, stat_win_rate, getattr(result, 'win_rate', 0), nb),
@@ -238,6 +310,14 @@ def _build_metrics(result, fast=False):
         'time_in_market': {'point': round(float(getattr(result, 'time_in_market', 0.0) or 0.0), 6),
                            'ci_95': None},
     }
+    # C3/G35: 与 _empty_metrics() 的键集合必须完全一致，否则成功路径与错误路径再次不同构。
+    # 只在开发者改了其中一侧时才会触发，属自检而非业务校验。
+    if set(block) != set(METRIC_KEYS):
+        raise RuntimeError(
+            'evidence.metrics 键集合漂移（C3 同构被破坏）：'
+            f'仅在一侧存在 {sorted(set(block) ^ set(METRIC_KEYS))}'
+        )
+    return block
 
 
 def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
@@ -263,11 +343,16 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     if df is None:
         return create_error_response(
             'data_source_error', "行情拉取失败（渠道池全失败且无可用缓存）",
-            code, data_type, type_hint)
+            code, data_type, type_hint,
+            fetch_info=last_fetch_info(), elapsed=time.time() - start_time)
     if len(df) < 100:
+        # C3: 数据太短时 bars/start/end/last_close 都是已知真实值，必须如实填
         return create_error_response(
             'insufficient_data', f"数据不足（仅 {len(df)} 根 < 100）",
-            code, data_type, type_hint)
+            code, data_type, type_hint,
+            bars=len(df), start=df.index[0], end=df.index[-1],
+            last_close=float(df['close'].iloc[-1]),
+            fetch_info=last_fetch_info(), elapsed=time.time() - start_time)
 
     fetch_info = last_fetch_info()
     last_close = float(df['close'].iloc[-1])
@@ -316,7 +401,11 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             # F03: n_trials = 本次实际评分过的配置数（多重检验校正的分母）
             n_trials = max(len(strategies), len(comparison), 1)
     except Exception as e:
-        return create_error_response('data_source_error', f"回测失败：{e}", code, data_type, type_hint)
+        return create_error_response(
+            'data_source_error', f"回测失败：{e}", code, data_type, type_hint,
+            bars=len(df), start=df.index[0], end=df.index[-1],
+            last_close=last_close, fetch_info=fetch_info,
+            elapsed=time.time() - start_time)
 
     # 计算共识 - Fast mode: reduce top_k
     n_bars = len(df)
