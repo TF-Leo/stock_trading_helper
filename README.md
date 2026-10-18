@@ -463,14 +463,40 @@ cd source && python -m pytest tests/ -q     # 无缓存也必须是 47 passed
 测试**不依赖** `stock_analysis/data/*.csv`（只用合成序列）。若在空缓存下出现
 `FileNotFoundError: stock_analysis/data/stock_600519_qfq.csv`，说明回归了 —— 请报告。
 
+### 数据源与降级（**多通道自动切换**）
+
+股票日线走**三通道渠道池**，任一成功即返回，全部失败才回退旧缓存：
+
+```
+eastmoney (ak.stock_zh_a_hist)  →  sina_stock (ak.stock_zh_a_daily)  →  sina_fund (ak.fund_etf_hist_sina)
+```
+
+- 每个通道有**冷却 / 连续失败剔除**策略（避免反复撞已封的节点）。
+- `source=` 入参只影响**优先顺序**：`akshare`/`eastmoney` 先试东财；`sina`/`sina_stock` 先试新浪；不给则按池内轮询。
+- 实际使用的通道会写进 `data.source`（`eastmoney` / `sina_stock` / `sina_fund` / `cache`）。
+
+> 这条能力是 2026-10-18 修好的：此前 `get_stock_daily` **只调东财单通道**，
+> 而 `bars.py` 里的三通道池早已实现却从未被调用。后果是——一旦东财封锁出口 IP，
+> 整条取数链就死掉，尽管新浪通道完全可用（实测：东财 TCP 层被拒时，
+> `ak.stock_zh_a_daily` 正常返回 1643 根）。门禁 **G36** 现在锁定这个降级能力。
+
+**实测（模拟东财全封，4 只股票）**：
+
+```
+600519: 1643 根   688981: 1509 根   002371: 1643 根   300750: 1643 根
+OK 预热完成，可离线运行          ← 全部由 sina_stock 接手
+```
+
 ### 行为约定
 
 - 预热成功后会写 `stock_{code}_qfq.csv` / `fund_{code}.csv`，之后**可完全离线运行**。
-- **无缓存 + 无网络 → 退出码 30（data_source_error）**，不是 20。
+- **无缓存 + 所有通道都不可达 → 退出码 30（data_source_error）**，不是 20。
 - 有缓存但不足 100 根 → 退出码 20（insufficient_data）。
-- 拉取失败**不会**再写出空壳缓存文件（0 行 CSV）；若历史上已存在空壳，读取时会自动识别并删除后重拉。
+- 有旧缓存但已过期且全部通道失败 → **降级回退旧缓存**，并在
+  `data.stale=true` / `diagnostics.warnings` / `data.lag_days` 里如实暴露（G33 锁定）。
+- 拉取失败**不会**写出空壳缓存文件（0 行 CSV）；历史上已存在的空壳会被自动识别并删除后重拉。
 - ⚠️ 已知坑：`600519 --type fund` 会从基金通道把**股票 K 线**拉到 `fund_600519.csv`。
-  该文件只用于验证 `--type` 是否生效（G16），不参与任何结论计算，但会占缓存空间，可安全删除。
+  该文件只用于验证 `--type` 是否生效（G16），不参与任何结论计算，可安全删除。
 
 ## 依赖与 Python 版本（D3f）
 

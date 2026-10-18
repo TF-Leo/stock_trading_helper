@@ -9,7 +9,19 @@ import sys
 from stock_analysis.data_loader.bars import (
     DATA_DIR,
     _normalize_daily_df,
+    _STOCK_DATA_SOURCE_POOL,
 )
+
+# 调用方 `source=` 入参 → 渠道池优先顺序。
+#   'akshare'（默认）/ 'eastmoney' → 先试东财
+#   'sina' / 'sina_stock'          → 先试新浪股票
+# 未列出的（含 None）→ 不指定偏好，按渠道池自身的轮询顺序
+_SOURCE_PREFERENCE = {
+    'akshare': ['eastmoney', 'sina_stock', 'sina_fund'],
+    'eastmoney': ['eastmoney', 'sina_stock', 'sina_fund'],
+    'sina': ['sina_stock', 'eastmoney', 'sina_fund'],
+    'sina_stock': ['sina_stock', 'eastmoney', 'sina_fund'],
+}
 
 # F20: 缓存写盘最小行数 —— 低于该值视为"失败拉取的空壳"，绝不落盘。
 MIN_CACHE_ROWS = 20
@@ -176,32 +188,46 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
         except Exception as e:
             print(f"Error reading cache {cache_file}: {e}", file=sys.stderr)
 
-    print(f"正在拉取 {symbol} 历史数据 (渠道池：{source})...", file=sys.stderr)
+    # 2026-10-18：此前这里**只用东财单通道**（ak.stock_zh_a_hist），
+    # 但 bars.py 里早已实现并注册了 `_STOCK_DATA_SOURCE_POOL`（eastmoney →
+    # sina_stock → sina_fund 三通道 + 冷却/剔除策略），却从来没被 meta 调用。
+    # 后果：东财节点一封 IP，整条取数链就死掉，尽管新浪通道完全可用
+    # （实测 Hermes 环境：ak.stock_zh_a_daily 返回正常，东财 TCP 层被拒）。
+    # 现改为走渠道池，任一通道成功即返回，全部失败才回退旧缓存。
+    print(f"正在拉取 {symbol} 历史数据 (渠道池) ...", file=sys.stderr)
+    raw = None
+    used_source = None
     try:
-        import akshare as ak
-        ak_symbol = symbol
-        if symbol.isdigit():
-            if symbol.startswith(('5', '6')):
-                ak_symbol = 'sh' + symbol
-            elif symbol.startswith(('1', '2', '3', '4', '0')):
-                ak_symbol = 'sz' + symbol
-        raw = ak.stock_zh_a_hist(symbol=ak_symbol, period="daily", start_date=start_date.replace('-', ''), end_date="20300101")
-        if raw is not None and not raw.empty:
-            full = raw.rename(columns={'日期': 'date', '收盘': 'close', '开盘': 'open', '最高': 'high', '最低': 'low', '成交量': 'volume'})
+        raw, used_source = _STOCK_DATA_SOURCE_POOL.fetch(
+            symbol, start_date, adjust, preferred=_SOURCE_PREFERENCE.get(source)
+        )
+    except Exception as e:
+        print(f"渠道池调用异常：{e}", file=sys.stderr)
+
+    if raw is not None and not raw.empty:
+        try:
+            full = raw
+            if 'date' not in full.columns:
+                full = _normalize_daily_df(full)
+            full = full.copy()
             full['date'] = pd.to_datetime(full['date'])
             full = full.set_index('date').sort_index()
-            full['close'] = pd.to_numeric(full['close'], errors='coerce')
-            full['volume'] = pd.to_numeric(full['volume'], errors='coerce')
+            for col in ('open', 'high', 'low', 'close', 'volume'):
+                if col in full.columns:
+                    full[col] = pd.to_numeric(full[col], errors='coerce')
             # 写盘用全量，返回用截断窗口
             _write_cache(full, cache_file, f'stock_{symbol}')
-            _record_fetch('akshare', False,
+            _record_fetch(used_source or 'unknown', False,
                           cache_last_date=(pd.Timestamp(full.index[-1]).date().isoformat()
                                            if len(full) else None),
                           lag_days=0,
-                          expected_date=expected.isoformat())
+                          expected_date=expected.isoformat(),
+                          requested_source=source)
             return _apply_start(full, start_date)
-    except Exception as e:
-        print(f"拉取股票数据失败：{e}", file=sys.stderr)
+        except Exception as e:
+            print(f"渠道池数据规范化失败（source={used_source}）：{e}", file=sys.stderr)
+    else:
+        print(f"拉取股票数据失败：渠道池全部通道未返回数据", file=sys.stderr)
 
     try:
         if _stale_cache is not None and not _stale_cache.empty:
@@ -360,7 +386,7 @@ def resample_stock_data(df, period='W'):
         resampled = resampled.dropna(subset=['close'])
         return resampled
     except Exception as e:
-        print(f"重采样失败：{e}")
+        print(f"重采样失败：{e}", file=sys.stderr)
         return None
 
 

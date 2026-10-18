@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import datetime
 import os
+import sys
 import requests
 import time
 from dataclasses import dataclass, field
@@ -51,7 +52,7 @@ def get_stock_name(symbol):
                     name = content.split(',')[0]
                     return name.strip() or None
     except Exception as e:
-        print(f"获取名称失败 {symbol}: {e}")
+        print(f"获取名称失败 {symbol}: {e}", file=sys.stderr)
     return None
 
 
@@ -117,14 +118,15 @@ class _DataSourcePool:
             if should_disable:
                 state.disabled = True
         if transient:
-            print(f"[WARN] 数据源 {state.name} 触发冷却 {self._cooldown_seconds}s: {err}")
+            print(f"[WARN] 数据源 {state.name} 触发冷却 {self._cooldown_seconds}s: {err}",
+                  file=sys.stderr)
         if should_disable:
-            print(f"[WARN] 数据源 {state.name} 失败过多，已从渠道池移除")
+            print(f"[WARN] 数据源 {state.name} 失败过多，已从渠道池移除", file=sys.stderr)
 
     def fetch(self, symbol, start_date, adjust, preferred=None):
         candidates = self._ordered_candidates(preferred)
         if not candidates:
-            print("[WARN] 渠道池无可用数据源（均在冷却或已剔除）")
+            print("[WARN] 渠道池无可用数据源（均在冷却或已剔除）", file=sys.stderr)
             return None, None
         last_err = None
         for state in candidates:
@@ -138,7 +140,7 @@ class _DataSourcePool:
                 last_err = err
                 self._mark_failure(state, err)
         if last_err:
-            print(f"[WARN] 渠道池全部失败 {symbol}: {last_err}")
+            print(f"[WARN] 渠道池全部失败 {symbol}: {last_err}", file=sys.stderr)
         return None, None
 
 

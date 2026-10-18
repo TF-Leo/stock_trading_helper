@@ -723,22 +723,29 @@ def check_degrade_visibility():
     from stock_analysis.data_loader import meta
 
     orig_expected = meta._expected_latest_trade_date
-    orig_hist = getattr(ak, "stock_zh_a_hist", None)
+    orig_pool = meta._STOCK_DATA_SOURCE_POOL
     problems, obs = [], {}
     try:
         # --- 1) 真实走一遍降级路径（不改任何文件：只让缓存"看起来过期"）
         meta._expected_latest_trade_date = lambda: datetime.date(2030, 1, 1)
 
-        def _boom(**k):
-            raise RuntimeError("probe: simulated network down")
+        # 2026-10-18 修正：原来只让 `ak.stock_zh_a_hist`（东财）抛错来模拟断网，
+        # 但 data_loader 现已接入三通道渠道池（eastmoney → sina_stock → sina_fund），
+        # 东财失败后新浪会成功取到**新鲜数据**，根本不构成降级 —— 测试前提失效。
+        # 断网的真实语义是"所有通道都失败"，故整体替换渠道池。
+        class _DeadPool:
+            _states = []
 
-        ak.stock_zh_a_hist = _boom
+            def fetch(self, symbol, start_date, adjust, preferred=None):
+                print("[probe] 模拟全部通道不可用", file=sys.stderr)
+                return None, None
+
+        meta._STOCK_DATA_SOURCE_POOL = _DeadPool()
         df = meta.get_stock_daily("600519", source="sina")
         info = meta.last_fetch_info()
     finally:
         meta._expected_latest_trade_date = orig_expected
-        if orig_hist is not None:
-            ak.stock_zh_a_hist = orig_hist
+        meta._STOCK_DATA_SOURCE_POOL = orig_pool
 
     obs["loader"] = {k: info.get(k) for k in
                      ("source", "from_cache", "degraded", "cache_last_date",
@@ -1073,6 +1080,69 @@ def check_advise_keys(code="600519"):
 QUICK_SKIP = ("fund", "idempotent", "windows", "exit_codes", "type_hint", "fund_cache")
 
 
+def check_source_failover():
+    """G36：渠道池多源降级必须真实可用（东财失败→新浪接手）。
+
+    背景（2026-10-18）：`meta.get_stock_daily` 原先**只调东财单通道**
+    （`ak.stock_zh_a_hist`），而 `bars.py` 里早就实现并注册了
+    `_STOCK_DATA_SOURCE_POOL`（eastmoney → sina_stock → sina_fund）却从未被调用。
+    后果：Hermes 的出口 IP 被东财节点封锁后整条取数链死掉，
+    尽管 `ak.stock_zh_a_daily`（新浪）完全可用（实测返回 1643 根）。
+
+    本门禁锁定该能力：**只封东财**，断言新浪能接手并返回足量数据。
+    """
+    sys.path.insert(0, SRC)
+    os.chdir(SRC)
+    import akshare as ak
+    from stock_analysis.data_loader import meta
+
+    problems, obs = [], {}
+    orig = getattr(ak, "stock_zh_a_hist", None)
+
+    class _DeadEastmoney:
+        """只让东财通道失败；新浪保持真实可用。"""
+
+    def _blocked(*a, **k):
+        raise ConnectionError("probe: simulated eastmoney blocked (IP ban)")
+
+    pool = meta._STOCK_DATA_SOURCE_POOL
+    try:
+        ak.stock_zh_a_hist = _blocked
+        # 清空渠道池历史状态，确保从干净状态开始（避免冷却/剔除影响判定）
+        for s in pool._states:
+            s.disabled = False
+            s.cooldown_until = 0.0
+            s.consecutive_failures = 0
+            s.failure_timestamps = []
+        df, used = pool.fetch("600519", "20200101", "qfq",
+                              preferred=meta._SOURCE_PREFERENCE.get("akshare"))
+        obs["used_source"] = used
+        obs["rows"] = 0 if df is None else len(df)
+        if df is None or len(df) < 100:
+            problems.append(
+                f"东财失败后未降级成功（rows={obs['rows']}, used={used}）—— "
+                f"渠道池未接入或新浪通道不可用")
+        elif used == "eastmoney":
+            problems.append("东财已封锁却仍报 eastmoney 成功（打桩失效）")
+        # 降级后数据必须可用于回测（含必要列）
+        if df is not None and len(df):
+            need = {"open", "high", "low", "close", "volume"}
+            miss = sorted(need - set(df.columns))
+            if miss:
+                problems.append(f"降级数据缺列 {miss}")
+    finally:
+        if orig is not None:
+            ak.stock_zh_a_hist = orig
+        for s in pool._states:
+            s.disabled = False
+            s.cooldown_until = 0.0
+            s.consecutive_failures = 0
+            s.failure_timestamps = []
+
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     out = {}
@@ -1125,6 +1195,7 @@ def main():
     run("degrade", check_degrade_visibility)
     run("start_window", check_start_window)
     run("error_shape", check_error_shape)
+    run("source_failover", check_source_failover)
 
     heavy = {
         "idempotent": check_idempotent,

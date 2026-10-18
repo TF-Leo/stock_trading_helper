@@ -527,6 +527,72 @@ python cli.py 999999 --json --fast            → exit 30（data_source_error）
 **核心原则**：能用规格解决的（environment marker）就不要用"请你换环境"解决；
 确实无法在本机验证的（3.13/3.14 运行验证），如实标注为未验证，不写成建议。
 
+## 1.12 修掉真实的取数单点故障（Hermes 报东财封 IP，2026-10-18）
+
+**触发**：Hermes 报告 A（环境/测试）全通过 —— Python 3.14.7 下 `pip install` 无冲突、
+`pytest` 47 passed、冷克隆修复成立。但 0.3 预热失败：4 只股票全部
+`RemoteDisconnected`，只有基金 510300 成功（走新浪）。
+它实测东财 A 记录已轮换（`117.184.40.129`），新节点对该出口 IP
+（38.244.61.250，AS1054 Zont）TCP 层拒绝，而 `api.fund.eastmoney.com` 与百度均 200。
+它按指令停在 0.3，**没有灌异源数据**（这个判断是对的）。
+
+### 我没有选它给的 4 个方案，而是先查了一个事实
+它的方案 1–4 都建立在"要么换数据、要么改代码、要么换网络"的假设上。我先查代码：
+
+**`bars.py` 里早就实现并注册了三通道渠道池**
+```
+_STOCK_DATA_SOURCE_POOL = _DataSourcePool(
+    sources=[("eastmoney", _fetch_from_eastmoney),
+             ("sina_stock", _fetch_from_sina_stock),
+             ("sina_fund", _fetch_from_sina_fund)], ...)
+```
+（含冷却、连续失败剔除、轮询游标）—— **但 `meta.get_stock_daily` 从未调用它**，
+它一直直接调 `ak.stock_zh_a_hist` 单通道。`meta.py` 只从 bars 导入了 `DATA_DIR`
+和 `_normalize_daily_df`，把渠道池和三个 fetcher 一起晾着。
+
+**这不是环境问题，是接线遗漏**：能力写好了但没接上。东财一封 IP 整条链就死。
+
+### 实测证据：新浪通道在封锁下完全可用
+```
+ak.stock_zh_a_daily(symbol='sh600519', start_date='20260801', adjust='qfq')
+  → 49 rows, 尾部 2026-10-16 / 1329.0（与东财缓存一致）
+```
+
+### 修复
+1. `meta.py`：`get_stock_daily` 的取数段改为走 `_STOCK_DATA_SOURCE_POOL.fetch()`，
+   新增 `_SOURCE_PREFERENCE`（`source=` 入参只影响优先顺序，不锁死单通道）。
+   `data.source` 现在回报**实际使用的通道**（`eastmoney`/`sina_stock`/`sina_fund`/`cache`）。
+2. `bars.py`：修 `import sys` 缺失 —— 5 处 `print(..., file=sys.stderr)` 会抛
+   `NameError`，导致"某通道失败过多"分支把整个 fetch 打挂
+   （这正是首轮端到端里 002371 单独失败的根因）。
+3. `bars.py` / `meta.py`：8 处裸 `print` 全部改 `file=sys.stderr`
+   （原样打到 stdout，违反 C1 纯 JSON；G19 就是被这个打成红）。
+4. 新增门禁 **G36**：只封东财，断言新浪接手且返回足量数据；
+   **变异测试**（三通道全封 → FAIL）已做，`MUTATION_TEST_OK`。
+5. `probe.py::check_degrade_visibility`（G33）前提修正：原先只封东财来模拟"断网"，
+   现在东财失败会由新浪接手并成功取到**新鲜**数据，根本不构成降级 → 改为整体替换渠道池
+   （断网的真实语义是**所有通道都失败**）。这是修正失效前提，**不是放宽断言**。
+
+### 端到端实测（模拟 Hermes 的封锁场景）
+清空股票缓存 + 只封东财，跑真实预热：
+```
+600519: 1643 根   688981: 1509 根   002371: 1643 根   300750: 1643 根   510300: 1643 根
+OK 预热完成，可离线运行      退出码 0
+```
+（修复前同样的场景：4 只股票全 0 根、退出码 1）
+
+### 收口
+```
+pytest（热缓存 / 冷克隆）      → 47 passed / 47 passed
+pwsh check_gates.ps1 -Full    → PASS 36 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0
+G36 observed                  → {used_source: sina_stock, rows: 1643}
+```
+
+### 含义（对 Hermes）
+**它不需要灌腾讯数据、不需要代理、不需要改网络** —— 直接 `git pull` 后重跑
+`python tools/warm_cache.py` 即可，东财封了会自动走新浪。
+若某只票在新浪也没有数据，`warm_cache.py` 会逐票报出来（不会假成功）。
+
 ## 2. 未完成（下一步按此顺序推进）
 
 > 本节为 **2026-10-17 的历史记录**；2026-10-18 的 21 条修复见 §1.5，当前**没有**未完成条目。
