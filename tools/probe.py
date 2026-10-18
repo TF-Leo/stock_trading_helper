@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
@@ -24,10 +25,18 @@ REQUIRED_TOP_KEYS = [
     "market_regime", "recommendation", "evidence", "candidates",
     "diagnostics", "disclaimer",
 ]
+# stop_method（F12）纳入必备字段：它标明止损价是 ATR 推导还是固定百分比，
 REQUIRED_REC_KEYS = [
     "status", "action", "action_reason", "confidence", "position_fraction",
     "horizon_days", "entry_zone", "stop_loss", "take_profit",
-    "distance_to_trigger", "invalidation",
+    "distance_to_trigger", "invalidation", "stop_method",
+]
+# F06f/F20 的数据新鲜度字段同样锁定，防止"降级不可见"回归。
+# 注意：错误响应路径（create_error_response）目前只输出 4 个 data 键，
+# 因此该列表只在**成功路径**（G02/G04）校验；错误路径的 schema 同构属待办项。
+REQUIRED_DATA_KEYS = [
+    "bars", "start", "end", "last_close", "source", "from_cache",
+    "stale", "cache_last_date", "lag_days", "expected_date", "requested_source",
 ]
 
 EXIT_CODES = {"ok": 0, "no_edge": 10, "insufficient_data": 20,
@@ -54,7 +63,10 @@ def run_cli_json(args, cache=True, timeout=300):
     """真跑 CLI 并要求 stdout 是纯 JSON（C1 契约）。退出码必须是契约五码之一。"""
     key = tuple(args)
     if cache and key in _CLI_CACHE:
-        return _CLI_CACHE[key]
+        # 必须返回深拷贝：各 check 会往 rec 里写 status/reason，
+        # 若按引用返回，后一个 check 会覆盖前一个 check 的结论（实测 r1 is r2 == True），
+        # 且当某 check 提前 return 而未设 status 时会沿用上一个 check 的 status → 假 PASS 隐患。
+        return copy.deepcopy(_CLI_CACHE[key])
     r = sh(args, timeout=timeout)
     rec = {"cmd": "python cli.py " + " ".join(args), "exit": r["exit"], "sec": r["sec"]}
     if r["exit"] not in EXIT_CODES.values():
@@ -71,7 +83,7 @@ def run_cli_json(args, cache=True, timeout=300):
                              f"stdout 前 200 字: {r['out'][:200]!r}")
             rec["data"] = None
     if cache:
-        _CLI_CACHE[key] = rec
+        _CLI_CACHE[key] = copy.deepcopy(rec)
     return rec
 
 
@@ -107,6 +119,9 @@ def check_json_contract(code="600519", fast=True):
         problems.append(f"缺顶层字段 {missing_top}")
     if missing_rec:
         problems.append(f"缺 recommendation 字段 {missing_rec}")
+    missing_data = [k for k in REQUIRED_DATA_KEYS if k not in (data.get("data") or {})]
+    if missing_data:
+        problems.append(f"缺 data 字段 {missing_data}")
     # F21：空壳文档不得判 PASS
     bars = (data.get("data") or {}).get("bars", 0)
     if not bars or bars <= 0:
@@ -171,6 +186,12 @@ def check_fund_contract(code="510300", fast=True):
     missing = [k for k in REQUIRED_TOP_KEYS if k not in data]
     if missing:
         problems.append(f"缺字段 {missing}")
+    missing_rec = [k for k in REQUIRED_REC_KEYS if k not in (data.get("recommendation") or {})]
+    if missing_rec:
+        problems.append(f"基金缺 recommendation 字段 {missing_rec}")
+    missing_data = [k for k in REQUIRED_DATA_KEYS if k not in (data.get("data") or {})]
+    if missing_data:
+        problems.append(f"基金缺 data 字段 {missing_data}")
     bars = (data.get("data") or {}).get("bars", 0)
     if not bars or bars <= 0:
         problems.append(f"基金 bars={bars}（无有效数据）")

@@ -80,8 +80,15 @@ class Data:
     start: str
     end: str
     last_close: float
-    source: str
+    source: str                # 实际取数渠道（'cache'/'sina'/...）；请求的渠道见 requested_source
     from_cache: bool
+    # F06f/F20（2026-10-18）：数据新鲜度与降级可见性 ——
+    # 让调用方能判断结论是否建立在陈旧数据上（旧行为：降级与新鲜命中都报 from_cache=True）。
+    stale: bool = False                        # True = 触网失败后回退旧缓存；此时 diagnostics.warnings 必有说明
+    cache_last_date: Optional[str] = None      # 缓存最后一根 K 线日期
+    lag_days: Optional[int] = None             # 缓存末日落后期望交易日的自然日数
+    expected_date: Optional[str] = None        # 期望的最新交易日（_expected_latest_trade_date）
+    requested_source: Optional[str] = None     # 调用方请求的渠道，与 source（实际渠道）区分
     window_note: Optional[str] = None
 
 

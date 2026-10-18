@@ -227,7 +227,63 @@ G33 degrade                               → PASS（loader degraded=True lag=83
 G34 start_window                          → PASS（cache 1643→1643，full 1643，win 72）
 cli.py 600519 --json --fast               → 9.8s, exit 0, data.stale=false
 ```
-**ps1 未执行（沙箱故障）** → 待用户确认 34/34。
+**ps1 已由主回合补跑（见 §1.8）→ 实测 `PASS 34 | FAIL 0 | BLOCKED 0 | SKIP 0，退出码 0`，与预期一致。**
+
+## 1.8 主回合第二轮独立复核（2026-10-18 09:5x–10:1x）
+
+**结论：本轮 5 条处理 + 3 个新查出的数据层缺陷全部经我独立验证成立；权威裁定器 34/34 全绿。另查出 3 条文档/规格同步缺口（R1–R3）与 1 个探针假 PASS 隐患（已由我修复）。**
+
+### 我亲自跑出来的原始证据
+```
+pwsh -File tools/check_gates.ps1 -Full  → PASS 34 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0（09:48:46 与 10:0x 各一次，均 0）
+cd source; python -m pytest tests/ -q   → 45 passed in 7.66s
+tools/check_gates.py                    → 已删除（原遗留 ①）
+```
+
+### 等价性：**用我自己的基线验证，不采信子 Agent 的"218 字段 0 差异"**
+把 numpy 优化后的输出与 **§1.6 我上轮亲自记录、当时写进台账的数字**逐字段比对 → **19/19 完全一致，0 处差异**：
+`n_trials=581`、`dsr=0.033`、`time_in_market=0.393183`、`confidence=0.539`、`stop_loss=1273.42`、`take_profit=1417.92`、
+`distance_to_trigger={-5.3,-2.87}`、`zero_trade_configs=19`、`regime_win_rates={0.5,0.5625,0.5143}`、
+`candidates[0].trade_count=53`（与 `metrics.trade_count.point=53` 一致）、`annual_return=0.0538`、`max_drawdown=0.1636`、
+`win_rate=0.5283`、族分布 `{MACD:3,CCI:3,StochRSI:4}`、metrics 有 CI `7/9`。
+→ **性能优化确实零行为变更**（`--fast` 实测 7.9–9.8s，全量 jobs=1 8.4s；上轮是 43.6s）。
+
+### 三个数据层缺陷：独立实测确认已修
+| 缺陷 | 我的实测 |
+|---|---|
+| bug#1 `--start` 被忽略 | `--start 20260701` → **72 根 / exit 20**；全量 → 1643 根。**生效** |
+| bug#2 缓存被截断 | 跑完带 `--start` 的调用后 `cache_rows` **1643 → 1643**。**未截断** |
+| bug#3 `_expected_latest_trade_date` 死代码 | `meta.py` 调用点 **行 60 / 154 / 221**。**已接线**（今日周日 → 期望交易日 2026-10-16 = 缓存末日 → `stale=False, lag_days=0`，不再无谓触网，这正是 58s→8s 的主因之一） |
+
+### 我另外修的 3 处（本轮由主回合动手，均已跑门禁验证）
+1. **`decision/schema.py::Data` 落后 CLI 输出 5 个字段**（声明 7 / 实出 12）——该文件自我定位为"C3/C6 schema 定义"，
+   不同步就等于**规格文件在撒谎**。已补 `stale / cache_last_date / lag_days / expected_date / requested_source`（全带默认值，零行为变更），
+   并注明 `source` 语义 = 实际渠道、`requested_source` = 请求渠道。其余 6 个 dataclass 与实出**完全一致**（已逐个核过）。
+2. **`stop_method` 未纳入契约校验 + `data` 新鲜度字段无门禁锁定**：已把 `stop_method` 加入 `REQUIRED_REC_KEYS`，
+   新增 `REQUIRED_DATA_KEYS`（11 键）并**同时接进 G02 与 G04**（避免两侧标准再次分叉）。
+   **做了变异测试证明断言会咬人**：注入 `nonexistent_probe_field`/`nonexistent_rec_field` 后，
+   股票与基金两侧都从 `PASS` 翻成 `FAIL`（`MUTATION_TEST_OK`）——不是空转常量。
+3. **`tools/probe.py` 缓存别名 → 假 PASS 隐患（新发现）**：`run_cli_json` 命中缓存时**按引用**返回同一个 dict，
+   而各 check 会往该 dict 写 `status`/`reason`。实测 `r1 is r2 == True`，第二次调用的结论会**覆盖**第一次。
+   危险方向是：若某 check 提前 `return rec` 而未设 `status`，就会**沿用上一个 check 的 status** → 可能假 PASS。
+   已改为存取都 `copy.deepcopy`；复测 `r1 is r2 → False`，两次独立调用均 PASS。
+   > 这个 bug 一开始还骗过了我的变异测试（第一次读数被第二次覆盖成 FAIL），所以单独记一笔：**探针内部状态共享是判定器可信度问题，不只是代码洁癖。**
+
+### 仍待处理（R1–R3，均不影响 34/34，需你决策）
+- **R1（最实质）错误响应与成功响应 schema 不同构**：同一标的 600519，成功路径 **116 键**、`insufficient_data` 路径 **46 键**，
+  **70 个键只在成功路径存在**（`evidence.metrics/n_trials/deflated_sharpe/significant/triggers/excess_vs_buy_hold/buy_hold_baseline/regime_win_rates`、
+  `data` 的 8 个字段、`instrument.price_limit_pct/is_st`、`market_regime.as_of/definition`、`diagnostics` 4 项、`recommendation.stop_method`）。
+  契约 C3 要求"不适用时为**显式 null**"，现状是**整块缺失** → Hermes 必须按 status 分支写防御性解析。
+  另有同文档自相矛盾：`data.bars=0` 而 `invalidation="数据不足（仅 72 根 < 100）"`（C4 精神）。
+  门禁只校验成功路径，所以查不到。**注：这与上轮我误判并撤销的 X4 不同**——X4 是拿空壳错误响应去比基金成功响应的假象，R1 是同一标的成功 vs 错误路径的真实对比。
+- **R2 `GOAL_CONTRACT.md` 未同步**：新增的 5 个 `data` 字段在契约里 **0 处命中**，而契约自称"字段名必须逐字一致"的验收基准 → 契约与实现漂移。
+  要么更新契约（注明本轮扩展理由），要么按 AGENTS.md §1 记为显式范围变更。
+- **R3 `source/docs/validation_600519.md` 未补 final 列**：`stale`/`lag_days` **0 处命中**，性能只记了 9.8s、没有 43.6s/58.3s 的 before 对照（A13 要求 before/after/final 三列）。
+
+### 关于推送
+子 Agent 建议"先别推"，理由是 `data` 输出契约变了（新增 5 字段、`source` 语义从"请求参数"变成"实际渠道"）。**我同意这个判断**，
+并补一条：R1 的同构性问题最好在推送前定调——因为一旦 Hermes 按现状写了防御性解析，之后再补齐错误路径字段反而可能打破它的假设。
+当前 `main` 领先 `origin/main` **19 个提交**（加上我本轮的修复提交后为 20）。
 
 ## 2. 未完成（下一步按此顺序推进）
 
