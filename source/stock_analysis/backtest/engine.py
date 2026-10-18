@@ -167,19 +167,39 @@ class BacktestEngine:
         limit_blocked_count = 0
         equity_curve = []
 
-        prev_close = float(df['close'].iloc[0]) if len(df) else 0.0
+        # 性能：逐 bar 取值从 Series 改为 numpy 数组。
+        # 原实现每根 K 线都执行 `df.iloc[i]` 生成一个 Series，再做 6 次 Series 索引；
+        # cProfile 显示 581 组网格下 pandas __getitem__ 被调用 100 万次、占总耗时 90%+。
+        # 数组化后取值语义完全等价（同样是 float/bool），只是去掉逐行装箱。
+        n_bars = len(df)
+        dates = list(df.index)
+        close_arr = df['close'].to_numpy(dtype=float)
+        high_arr = df['high'].to_numpy(dtype=float)
+        low_arr = df['low'].to_numpy(dtype=float)
+        open_arr = (df['open'].to_numpy(dtype=float) if 'open' in df.columns
+                    else close_arr)
+        buy_arr = df['buy_signal'].to_numpy(dtype=bool)
+        sell_arr = df['sell_signal'].to_numpy(dtype=bool)
+        atr_arr = None
+        if atr_cached is not None:
+            try:
+                _a = atr_cached.to_numpy(dtype=float)
+                if len(_a) == n_bars:
+                    atr_arr = _a
+            except Exception:
+                atr_arr = None
+
+        prev_close = float(close_arr[0]) if n_bars else 0.0
         # B2: 逐 bar 滚动历史 ATR（含当根 TR；本引擎为"收盘后决策、次日成交"，
         # 入场当根收盘时该值已知，不构成前视）。取不到 ATR 时该笔回落固定百分比。
-        atr_series = atr_cached
         entry_stop_dist = None      # 入场时锁定的止损距离（比例）
         entry_profit_dist = None    # 入场时锁定的止盈距离（比例）
-        for i in range(len(df)):
-            row = df.iloc[i]
-            date = df.index[i]
-            high = row['high']
-            low = row['low']
-            close = row['close']
-            open_px = row['open'] if 'open' in row else close
+        for i in range(n_bars):
+            date = dates[i]
+            high = high_arr[i]
+            low = low_arr[i]
+            close = close_arr[i]
+            open_px = open_arr[i]
             # A股涨跌停：涨停买不进、跌停卖不出（默认10%）
             is_limit_up = prev_close > 0 and close >= prev_close * 1.099
             is_limit_down = prev_close > 0 and close <= prev_close * 0.901
@@ -235,7 +255,7 @@ class BacktestEngine:
                         prev_close = float(close)
                         continue
 
-            if position > 0 and row['sell_signal'] and not is_limit_down:
+            if position > 0 and sell_arr[i] and not is_limit_down:
                 exit_price = self._apply_slippage(close, OrderType.SELL)
                 trade = self._execute_sell(
                     date, exit_price, position, cash,
@@ -249,7 +269,7 @@ class BacktestEngine:
                 entry_stop_dist = None
                 entry_profit_dist = None
 
-            elif position == 0 and row['buy_signal'] and not is_limit_up:
+            elif position == 0 and buy_arr[i] and not is_limit_up:
                 max_shares = self._calc_max_shares(cash, close)
                 if max_shares <= 0:
                     unaffordable_count += 1
@@ -267,9 +287,9 @@ class BacktestEngine:
                         # 持仓期间不再回溯改写（否则等于用未来波动调整当前止损）。
                         entry_stop_dist = None
                         entry_profit_dist = None
-                        if atr_series is not None:
+                        if atr_arr is not None:
                             try:
-                                _atr = float(atr_series.iloc[i])
+                                _atr = float(atr_arr[i])
                             except Exception:
                                 _atr = float('nan')
                             if _atr == _atr and _atr > 0 and entry_price > 0:
@@ -282,7 +302,7 @@ class BacktestEngine:
             prev_close = float(close)
 
         if position > 0:
-            final_price = self._apply_slippage(df['close'].iloc[-1], OrderType.SELL)
+            final_price = self._apply_slippage(float(close_arr[-1]), OrderType.SELL)
             trade = self._execute_sell(
                 df.index[-1], final_price, position, cash,
                 entry_date, entry_price, entry_cost_total,
