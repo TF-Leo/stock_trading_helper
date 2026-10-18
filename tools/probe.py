@@ -595,6 +595,88 @@ def check_start_window():
             "reason": "; ".join(problems), "observed": obs}
 
 
+def _shape_paths(obj, path=""):
+    """把 JSON 文档展开成路径集合（列表取首个元素的形状）。"""
+    out = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{path}/{k}"
+            out.add(p)
+            out |= _shape_paths(v, p)
+    elif isinstance(obj, list) and obj:
+        out |= _shape_paths(obj[0], path + "[]")
+    return out
+
+
+def check_error_shape():
+    """G35：C3 —— 错误响应必须与成功响应**同构**（不适用处显式 null，不得整块缺失）。
+
+    历史问题：错误路径只输出 46 个键、成功路径 134 个，缺 88 条路径
+    （evidence.metrics / n_trials / significant / triggers / data 8 字段 / stop_method …），
+    Hermes 只能按 status 分支写防御性解析；且 data.bars 恒 0，与同一文档里的
+    invalidation="仅 72 根 < 100" 自相矛盾。
+
+    判据：
+      1. 成功路径的每条路径（`candidates[]` / `triggers[]` 的元素路径除外，
+         因为"没有候选/没有触发器"时列表为空才是正确的）在错误路径必须存在；
+      2. data.bars 必须等于 invalidation 文本里的根数，且不得为 0；
+      3. 不适用字段必须是显式 null（horizon_days=[null,null]、stop_method=null、
+         metrics 9 项 point 全 null），不得编造 [1,5] 之类的值。
+    """
+    import re
+    from datetime import date, timedelta
+
+    ok_rec = run_cli_json(["600519", "--json", "--fast"])
+    ok = ok_rec.get("data")
+    if not ok:
+        return {"status": "BLOCKED", "reason": "成功路径无 JSON，无法比对结构"}
+    # 用近端 --start 造"数据太短"场景：约 28 个交易日 → insufficient_data(20)
+    start = (date.today() - timedelta(days=40)).strftime("%Y%m%d")
+    err_rec = run_cli_json(["600519", "--json", "--fast", "--start", start], cache=False)
+    err = err_rec.get("data")
+    if not err:
+        return {"status": "FAIL",
+                "reason": f"错误路径无 JSON（exit={err_rec.get('exit')}）"}
+    rec = err.get("recommendation") or {}
+    status = rec.get("status")
+    if status != "insufficient_data":
+        return {"status": "FAIL",
+                "reason": f"--start {start} 未触发 insufficient_data（实际 {status}），用例前提不成立"}
+
+    missing = sorted(_shape_paths(ok) - _shape_paths(err))
+    missing = [p for p in missing
+               if not p.startswith(("/candidates[]", "/evidence/triggers[]"))]
+    problems = []
+    if missing:
+        problems.append(f"错误路径缺 {len(missing)} 条路径（前 6 条）: {missing[:6]}")
+
+    bars = (err.get("data") or {}).get("bars")
+    m = re.search(r"(\d+)\s*根", str(rec.get("invalidation", "")))
+    if not bars:
+        problems.append("data.bars 为 0（数据太短时根数是已知真实值，不得填 0）")
+    elif m and int(m.group(1)) != int(bars):
+        problems.append(f"data.bars={bars} 与 invalidation 文本的 {m.group(1)} 根不一致")
+
+    if rec.get("horizon_days") != [None, None]:
+        problems.append(f"horizon_days={rec.get('horizon_days')}（无回测时应为显式 [null,null]）")
+    if rec.get("stop_method") is not None:
+        problems.append(f"stop_method={rec.get('stop_method')}（无回测时应为 null）")
+    metrics = (err.get("evidence") or {}).get("metrics") or {}
+    if len(metrics) != 9:
+        problems.append(f"evidence.metrics 应为 9 项，实际 {len(metrics)} 项")
+    elif any((v or {}).get("point") is not None for v in metrics.values()):
+        problems.append("evidence.metrics 存在非 null 的 point（无回测时不得有数值）")
+    if (err.get("evidence") or {}).get("n_trials") != 0:
+        problems.append("evidence.n_trials 应为 0（未评估任何配置）")
+
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems),
+            "observed": {"err_exit": err_rec.get("exit"), "err_status": status,
+                         "bars": bars, "missing_paths": len(missing),
+                         "ok_paths": len(_shape_paths(ok)),
+                         "err_paths": len(_shape_paths(err))}}
+
+
 def check_degrade_visibility():
     """G33：数据降级（触网失败→回退旧缓存）必须对调用方可见。
 
@@ -1012,9 +1094,10 @@ def main():
     run("requirements", check_requirements)
     run("a1", check_a1_invariant)
     run("advise", check_advise_keys)
-    # 本轮新增：G33 降级可见性 / G34 --start 生效且不截断缓存
+    # 本轮新增：G33 降级可见性 / G34 --start 生效且不截断缓存 / G35 错误路径同构
     run("degrade", check_degrade_visibility)
     run("start_window", check_start_window)
+    run("error_shape", check_error_shape)
 
     heavy = {
         "idempotent": check_idempotent,

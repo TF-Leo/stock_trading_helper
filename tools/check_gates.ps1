@@ -143,7 +143,7 @@ if ($null -eq $probe) {
     foreach ($g in 'G03', 'G04', 'G05', 'G06', 'G07', 'G08', 'G12',
         'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23',
         'G24', 'G25', 'G26', 'G27', 'G28', 'G29', 'G30', 'G31', 'G32',
-        'G33', 'G34') {
+        'G33', 'G34', 'G35') {
         Add-Gate $g '（探针缺失，无法判定）' 'BLOCKED' 'probe.py 未产出结果'
     }
 }
@@ -176,7 +176,8 @@ else {
         @('fund_grid_consistency', 'G31', '基金网格单一真源自洽（F15）'),
         @('fund_cache', 'G32', '失败拉取不写空壳缓存（F20）'),
         @('degrade', 'G33', '数据降级（回退旧缓存）必须对调用方可见（F06f/F20）'),
-        @('start_window', 'G34', '--start 生效且不截断缓存（F20）')
+        @('start_window', 'G34', '--start 生效且不截断缓存（F20）'),
+        @('error_shape', 'G35', '错误响应与成功响应同构（C3：显式 null 而非整块缺失）')
     )
     $quickSkip = @('fund', 'idempotent', 'windows', 'exit_codes', 'type_hint', 'fund_cache')
     foreach ($row in $m) {
