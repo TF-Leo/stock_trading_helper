@@ -103,6 +103,59 @@ F16 把 argparse 抽到 `cli.build_parser()` 后该断言因"代码搬家"而红
 - 退出码 40 在真实数据下不可达（自适应资金让 `unaffordable_lot_events` 恒 0），仅单测覆盖；
 - `pwsh -File tools/check_gates.ps1` 本轮**未执行**（宿主 PowerShell 沙箱故障），门禁证据来自等价转写 `tools/check_gates.py`。
 
+## 1.6 主回合独立复核结论（2026-10-18 08:5x；AGENTS.md §1「验收权在主回合」）
+
+**结论：21 条修复的实质内容全部经我独立验证成立；但报告里"门禁 32/32 退出码 0"在提交当时对权威裁定器并不成立，根因是 ps1 的一个传输层 bug，已由我修复。**
+
+### 我亲自跑出来的原始证据
+
+| 命令 | 结果 |
+|---|---|
+| `pwsh -File tools/check_gates.ps1 -Full`（**修复前**，08:24:59） | `PASS 6 \| FAIL 1 \| BLOCKED 25 → 退出码 26` ← 与报告声称的 32/0 **直接矛盾** |
+| `python tools\probe.py all`（直接跑探针） | 25 个 key **全 PASS**，stdout 是干净 JSON，退出码 0 |
+| `pwsh -File tools/check_gates.ps1 -Full`（**修复后**，08:49:11） | **`PASS 32 \| FAIL 0 \| BLOCKED 0 \| SKIP 0 → 退出码 0`** |
+| `cd source; python -m pytest tests/ -q` | **42 passed in 19.39s**（报告声称 42 ✓） |
+| 7 个旧参数端到端真跑 | `--detail / --no-regime / --opt-iters 8 / --start / --jobs 2 / --opt grid / -t stock` **全部 exit 0** ✓ |
+
+### 退出码 26 的根因（不是判定逻辑问题）
+`check_gates.ps1:115` 旧写法 `& python probe.py $mode 2>&1 | Out-String` 把 **stderr 混进 stdout**。
+本轮新增的门禁会**故意**跑失败拉取（G19 的 `999999`、G32 的空壳缓存），且 F20/F06f 让数据层开始往 stderr 打
+`正在拉取…` / `[WARN] 本次拉取失败，回退到本地旧缓存` → 混流后 `ConvertFrom-Json` 解析失败 → `$probe=$null`
+→ G02 判 FAIL、其余 25 项判 BLOCKED。**探针输出的 JSON 本身完全合法。**
+修复方式：改用 `Start-Process -RedirectStandardOutput/-RedirectStandardError` 分流捕获，stderr 另存并在解析失败时随 FAIL 详情一并输出（便于下次诊断）。
+**未改动任何阈值、断言或状态判定 —— 属 AGENTS.md §4 允许的修复，不是弱化。**
+
+### 复核发现的 4 个遗留问题（不影响本轮 32/0，但需登记）
+1. **`tools/check_gates.py` 是分叉的第二裁定器（风险最高）**：它 stdout/stderr 分开捕获，所以在 ps1 判 26 的同一份代码上判 32/0。
+   AGENTS.md §0 规定唯一完成定义是 `pwsh -File tools/check_gates.ps1` 退出码 0。两个裁定器结论不一致 = 迟早再次假绿。
+   **建议：ps1 已恢复可用 → 删除 `check_gates.py`，或在其文件头显式标注"非权威、仅应急，结论必须以 ps1 为准"并加一条与 ps1 的一致性自检。**
+2. **G29 判定弱于契约 D6**：契约要求"`subprocess` 对每个旧参数各跑一次，断言 `returncode ∈ {0,10,20,30,40}`"，
+   实现（`probe.py::check_old_args`）只做进程内 `parser.parse_args()`，**不能证明参数真的被接线**（可能 argparse 收了却无人使用）。
+   我已手工端到端真跑 7 个参数全部 exit 0 → **D6 实质达标**，但门禁本身证明不了。
+   **建议：在 `check_old_args` 里补 1–2 个真 subprocess 用例（如 `--detail`、`--no-regime`），兼顾耗时与强度。**
+3. **`test_p3_bayes.py` 的 docstring 与代码不符**：docstring 写"现改为真跑 `python cli.py --help` 断言行为"，
+   实际代码是进程内 `cli.build_parser()`，且 `import subprocess` 成了死导入。
+   **断言修改本身正当且更强**（原断言 `inspect.getsource(cli.main)` 属 AGENTS.md §4 反对的源码文本耦合；新断言覆盖全部 9 个参数），只需把 docstring 改成与实现一致或补上真正的 subprocess 调用。
+4. **`diagnostics.warnings` 仍为空，但本轮实际发生了"拉取失败→回退旧缓存"**：stderr 有 `[WARN] 600519 本次拉取失败，回退到本地旧缓存`，
+   JSON 里 `warnings=[]`、`data.source='cache'`、`from_cache=True`。F06e 建好了 warnings 通道，但**这个降级事件没被透出**。
+   Hermes 无从知道数据是陈旧的。**建议：把"回退到旧缓存"写进 `diagnostics.warnings`，并在 `data` 里给出缓存末日与滞后交易日数。**
+
+### 我独立复核过的具体数字（均来自真实运行，非引用报告）
+`n_trials` 股票 **581** / 基金 **44**；`family_map` **581** 键 **40** 族；基金 `grid_size()==signals==44`、**6 族**（新增"风险平价"）；
+胜率项占比 **0.195**（≤0.40）；`time_in_market` **0.393183**（原恒 0）；metrics 有 CI **7/9**；
+`dsr=0.033`、`ci_hi=+7.0e-04>0`、`significant=True` 三者自洽；退出码 `600519→0`、`999999→30(data_source_error)`；
+族占比 股票 `{MACD:3,CCI:3,StochRSI:4}`、基金 `{RSI:5,波动率目标:2,MACD:2,双均线:1}`，均 ≤ `ceil(10/2)=5`；
+`stop_method=atr`、`stop_loss=1273.42`（旧硬编码 ×0.95=1262.55）、`take_profit=1417.92`（旧 ×1.10=1461.9）；
+`distance_to_trigger={-5.3,-2.87}`（旧恒 0）、`invalidation="收盘跌破 1273.42，或 StochRSI 族共识转为看空，或 29 个交易日内未触发入场"`（旧把候选数 10 当天数）、
+`zero_trade_configs=19`（旧硬编码 0）、`regime_win_rates={Bull:0.5,Bear:0.5625,Shock:0.5143}`（旧 `{}`）、`score_oos/score_is=2.6142`（旧恒 0.9000）。
+**自述的"额外修复 1"成立**：`candidates[0].trade_count=53` 与 `evidence.metrics.trade_count.point=53` **精确相等**（修复前是 32 vs 79 的真实基准错配）；
+其余字段是同一数值的不同四舍五入位数（0.0538/0.053762、0.1636/0.163564、0.5283/0.528302）。
+**自述的"额外修复 2"成立**：`consensus.py:106-114` 确用 `np.median(族内全部配置评分)` 判主导族。
+
+### 风险提示（未构成门禁失败）
+缓存末日 2026-10-16 早于当日 → **每次运行都会先尝试触网、失败后回退缓存**，`--fast` 实测 **43.6s**（G12 上限 60s）。
+若网络超时变长，G12 有转红风险。**建议：给拉取加显式短超时 + 失败即回退（不重试全渠道池），或提供 `--offline` 直接走缓存。**
+
 ## 2. 未完成（下一步按此顺序推进）
 
 > 本节为 **2026-10-17 的历史记录**；2026-10-18 的 21 条修复见 §1.5，当前**没有**未完成条目。

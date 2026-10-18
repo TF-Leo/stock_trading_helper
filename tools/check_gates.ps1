@@ -112,7 +112,23 @@ if ($hasSection -and $jsonBlocks.Count -gt 0 -and $badBlocks -eq 0) {
 # 运行时门禁（探针真跑）
 # --------------------------------------------------------------------------
 $probeMode = if ($Quick) { 'all-quick' } else { 'all' }
-$probeOut = & python (Join-Path $PSScriptRoot 'probe.py') $probeMode 2>&1 | Out-String
+# stdout / stderr 必须分流捕获：数据层的 "正在拉取…" / "[WARN] 回退到本地旧缓存" 走 stderr，
+# 旧写法 `2>&1 | Out-String` 会把这些噪声混进 JSON，导致 ConvertFrom-Json 失败、
+# 26 个探针项被误判为 BLOCKED（判定逻辑本身没有问题，纯属传输层 bug）。
+# 本修复只改捕获方式，不改任何阈值、断言或状态判定 —— 属加强而非弱化。
+$probeOutFile = Join-Path $env:TEMP ("probe_out_{0}.json" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+$probeErrFile = Join-Path $env:TEMP ("probe_err_{0}.txt" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+$pyExe = (Get-Command python -ErrorAction Stop).Source
+$probeProc = Start-Process -FilePath $pyExe `
+    -ArgumentList @((Join-Path $PSScriptRoot 'probe.py'), $probeMode) `
+    -NoNewWindow -Wait -PassThru `
+    -RedirectStandardOutput $probeOutFile -RedirectStandardError $probeErrFile
+$probeExit = $probeProc.ExitCode
+$probeOut = if (Test-Path $probeOutFile) { Get-Content $probeOutFile -Raw -Encoding UTF8 } else { '' }
+$probeErr = if (Test-Path $probeErrFile) { Get-Content $probeErrFile -Raw -Encoding UTF8 } else { '' }
+if (-not $probeOut) { $probeOut = '' }
+if (-not $probeErr) { $probeErr = '' }
+Remove-Item $probeOutFile, $probeErrFile -ErrorAction SilentlyContinue
 $probe = $null
 try { $probe = $probeOut | ConvertFrom-Json } catch { }
 
@@ -123,7 +139,7 @@ function Get-ProbeStatus {
 }
 
 if ($null -eq $probe) {
-    Add-Gate 'G02' 'CLI --json 契约（C1 纯 JSON + C3 字段齐备）' 'FAIL' '探针未产出 JSON，请先单独运行 tools/probe.py' $probeOut
+    Add-Gate 'G02' 'CLI --json 契约（C1 纯 JSON + C3 字段齐备 + 真数据）' 'FAIL' "探针未产出可解析 JSON（probe 退出码 $probeExit）。stdout 前 400 字: $($probeOut.Substring(0,[Math]::Min(400,$probeOut.Length)))；stderr 前 400 字: $($probeErr.Substring(0,[Math]::Min(400,$probeErr.Length)))" ($probeOut + "`n--- probe stderr ---`n" + $probeErr)
     foreach ($g in 'G03', 'G04', 'G05', 'G06', 'G07', 'G08', 'G12',
         'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23',
         'G24', 'G25', 'G26', 'G27', 'G28', 'G29', 'G30', 'G31', 'G32') {
