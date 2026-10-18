@@ -16,4 +16,5 @@ from stock_analysis.data_loader.meta import (
     get_fund_daily,
     get_market_index_daily,
     resample_stock_data,
+    last_fetch_info,
 )

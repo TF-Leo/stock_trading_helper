@@ -272,6 +272,15 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     fetch_info = last_fetch_info()
     last_close = float(df['close'].iloc[-1])
 
+    # G33: 数据降级（触网失败→回退旧缓存）必须对调用方可见。
+    # 旧实现里 JSON 只有 from_cache=True，Hermes 无法区分"新鲜命中"与"兜底旧数据"。
+    if fetch_info.get('degraded'):
+        warnings.append(
+            f"数据降级：{fetch_info.get('degraded_reason')}；"
+            f"缓存末日 {fetch_info.get('cache_last_date')}，"
+            f"滞后 {fetch_info.get('lag_days')} 个交易日"
+            f"（期望最新交易日 {fetch_info.get('expected_date')}），结论基于陈旧数据")
+
     # 标的信息
     board, price_limit_pct, is_st = classify_board(code)
     name = get_stock_name(code) if data_type == 'stock' else code
@@ -505,7 +514,13 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             # F06f: 真实取数来源（此前硬编码 'sina' / True）
             'source': fetch_info.get('source'),
             'from_cache': fetch_info.get('from_cache'),
-            'window_note': None
+            # G33: 降级可见性 —— stale=True 表示本次结论基于"拉取失败后回退的旧缓存"
+            'stale': bool(fetch_info.get('degraded')),
+            'cache_last_date': fetch_info.get('cache_last_date'),
+            'lag_days': fetch_info.get('lag_days'),
+            'expected_date': fetch_info.get('expected_date'),
+            'requested_source': fetch_info.get('requested_source'),
+            'window_note': (f"--start {start} 截取后 {len(df)} 根" if start else None)
         },
         'market_regime': ({'label': 'Unknown', 'confidence': 0.0,
                            'as_of': str(df.index[-1]), 'definition': 'disabled'}
