@@ -233,18 +233,18 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     start_time = time.time()
     warnings = []
 
-    # F02: --type 真正生效（只有 auto 才按代码前缀推断）
-    if type_hint == 'fund':
-        data_type = 'fund'
-    elif type_hint == 'stock':
-        data_type = 'stock'
-    else:
-        data_type = 'fund' if code.startswith('5') else 'stock'
-
-    if data_type == 'fund':
-        df = get_fund_daily(code, start_date=start)
-    else:
-        df = get_stock_daily(code, start_date=start, source='sina')
+    # 类型判定与取数统一委托数据层 resolve_and_fetch()：
+    #   旧逻辑 `data_type = 'fund' if code.startswith('5') else 'stock'` 把场外基金
+    #   （023298/006195/001917/001564）判成股票 → data_source_error。
+    #   但 0/1 段不能一律当基金（002270/002415 这些真股票也在基金名录里），
+    #   故改为双向探测，细节见 data_loader.meta.resolve_and_fetch 的 docstring。
+    from stock_analysis.data_loader.meta import resolve_and_fetch
+    df, data_type, type_err = resolve_and_fetch(code, type_hint=type_hint, start_date=start)
+    if df is None and type_err:
+        return create_error_response(
+            'data_source_error', type_err, code, data_type, type_hint,
+            fetch_info=last_fetch_info(), elapsed=time.time() - start_time,
+            requested_start=start)
 
     # F05: 拉取失败(30) 与 数据太短(20) 是两种状态，不得都压成 10
     if df is None:

@@ -264,9 +264,17 @@ def get_fund_daily(symbol, start_date='20200101', adjust='', source='akshare'):
         except Exception as e:
             print(f"Error reading cache {cache_file}: {e}", file=sys.stderr)
 
-    print(f"正在拉取基金 {symbol} 历史数据...", file=sys.stderr)
+    # 基金取数通道（2026-10-18 新增 OTC）：
+    #   1) 场内 ETF：ak.fund_etf_hist_sina —— 只覆盖 510300 这类场内 ETF；
+    #   2) 场外 OTC：ak.fund_open_fund_info_em（单位净值走势）—— 覆盖 023298/001917 等场外基金。
+    # 历史缺口（Hermes 实测暴露）：此前**只有 ETF 通道**，4 只场外基金
+    # （023298/006195/001917/001564）全部 0 行 → data_source_error，
+    # 而同一批基金在 OTC 通道上有 366~2689 行、数据到 2026-10-16。
+    print(f"正在拉取基金 {symbol} 历史数据（ETF → OTC）...", file=sys.stderr)
     df = None
+    fund_channel = None
 
+    # --- 通道 1：场内 ETF（新浪）
     try:
         import akshare as ak
         sina_symbol = symbol
@@ -275,20 +283,48 @@ def get_fund_daily(symbol, start_date='20200101', adjust='', source='akshare'):
                 sina_symbol = 'sh' + symbol
             elif symbol.startswith(('1', '2', '3', '4', '0')):
                 sina_symbol = 'sz' + symbol
-        df = ak.fund_etf_hist_sina(symbol=sina_symbol)
+        etf = ak.fund_etf_hist_sina(symbol=sina_symbol)
+        if etf is not None and not etf.empty:
+            df, fund_channel = etf, 'sina_etf'
+        else:
+            print(f"ETF 通道无数据（{symbol}），尝试 OTC 净值通道", file=sys.stderr)
     except Exception as e:
-        print(f"拉取基金数据失败：{e}", file=sys.stderr)
-        pass
+        print(f"ETF 通道失败：{e}；尝试 OTC 净值通道", file=sys.stderr)
+
+    # --- 通道 2：场外 OTC 单位净值（东财）
+    if df is None or df.empty:
+        try:
+            import akshare as ak  # 已在上面 import，此处防御 ak 未定义情形
+            otc = ak.fund_open_fund_info_em(symbol=symbol, indicator="单位净值走势")
+            if otc is not None and not otc.empty:
+                df, fund_channel = otc, 'eastmoney_otc'
+        except Exception as e:
+            print(f"OTC 净值通道失败：{e}", file=sys.stderr)
 
     if df is None or df.empty:
         if cached_df is not None and not cached_df.empty:
-            _mark_degraded(f"{symbol} 本次拉取失败，回退到本地缓存", cached_df)
+            _mark_degraded(f"{symbol} 两个通道均失败，回退到本地缓存", cached_df)
             return _apply_start(cached_df, start_date)
         _record_fetch(None, None)
         return None
 
     try:
-        full = _normalize_daily_df(df)
+        # OTC 场外基金只提供单位净值，没有 OHLCV。用净值补齐单价格序列：
+        #   open/high/low 全部 = 单位净值（净值无日内波动），volume = 0（场外无成交量）。
+        # 这是场外基金唯一可用的表示；回测里基于 close 的信号/收益不受影响。
+        if fund_channel == 'eastmoney_otc':
+            raw = df.copy()
+            raw = raw.rename(columns={'净值日期': 'date', '单位净值': 'close'})
+            if 'close' not in raw.columns:
+                raise ValueError(f"OTC 净值列缺失，实际列={list(raw.columns)}")
+            raw['close'] = pd.to_numeric(raw['close'], errors='coerce')
+            raw = raw.dropna(subset=['close'])
+            for c in ('open', 'high', 'low'):
+                raw[c] = raw['close']
+            raw['volume'] = 0
+            full = raw[['date', 'open', 'high', 'low', 'close', 'volume']]
+        else:
+            full = _normalize_daily_df(df)
         full['date'] = pd.to_datetime(full['date'], errors='coerce')
         full = full.dropna(subset=['date'])
         full = full.set_index('date').sort_index()
@@ -306,7 +342,7 @@ def get_fund_daily(symbol, start_date='20200101', adjust='', source='akshare'):
         # F20: 空结果不得写盘（历史事故：留下 56 字节、零数据行的空壳缓存）
         # 写盘用全量，避免被 start_date 截断
         _write_cache(full, cache_file, f'fund_{symbol}')
-        _record_fetch('sina', False,
+        _record_fetch(fund_channel or 'sina', False,
                       cache_last_date=(pd.Timestamp(full.index[-1]).date().isoformat()
                                        if len(full) else None),
                       lag_days=0,
@@ -393,3 +429,50 @@ def resample_stock_data(df, period='W'):
 def get_market_index_daily(symbol='000985', start_date='20200101', source='akshare'):
     """获取指数数据。"""
     return None
+
+
+def resolve_and_fetch(code, type_hint='auto', start_date=None):
+    """按 `type_hint` 取数，auto 时做**双向探测**。
+
+    返回 `(df, data_type, error_msg)`；`df is None` 且 error_msg 非空表示彻底失败。
+
+    为什么需要这个函数（2026-10-18，Hermes 实测暴露）：
+      旧逻辑在 cli.py 里写 `data_type = 'fund' if code.startswith('5') else 'stock'`，
+      导致场外基金 023298/006195/001917/001564 被判成**股票** → data_source_error。
+
+      但**不能简单把 0/1 段判成基金**：实测 `ak.fund_name_em()` 名录里
+      002270(华明装备)、002415(海康威视) 这些**真股票**也出现在基金名录中
+      （场外基金代码段与深市股票代码段重叠），纯代码规则无法可靠区分。
+
+      故 auto 改为按通道探测：先按可靠前缀试，取不到再试另一侧；
+      两侧都失败则返回明确错误、提示用 --type，**绝不猜一个当成事实**。
+    """
+    def _fetch(dtype):
+        if dtype == 'fund':
+            return get_fund_daily(code, start_date=start_date)
+        return get_stock_daily(code, start_date=start_date, source='sina')
+
+    if type_hint == 'fund':
+        return _fetch('fund'), 'fund', None
+    if type_hint == 'stock':
+        return _fetch('stock'), 'stock', None
+
+    # auto：5/15/16/18 开头是场内基金的可靠段；其余默认按股票试
+    first = 'fund' if code.startswith(('5', '15', '16', '18')) else 'stock'
+    df = _fetch(first)
+    if df is not None and len(df) >= 100:
+        return df, first, None
+
+    alt = 'stock' if first == 'fund' else 'fund'
+    alt_df = _fetch(alt)
+    if alt_df is not None and len(alt_df) >= 100:
+        print(f"[INFO] {code} 以 {first} 取数失败，已自动按 {alt} 取数成功"
+              f"（如需固定，请用 --type {alt}）", file=sys.stderr)
+        return alt_df, alt, None
+
+    # 两侧都没拿到足量数据：若首选有数据（只是不足 100 根）就返回它，让上层判 insufficient_data
+    if df is not None:
+        return df, first, None
+    return None, first, (
+        f"自动判定失败：按 stock 与 fund 两种类型均无法取到 {code} 的数据。"
+        f"请用 --type stock 或 --type fund 显式指定。")

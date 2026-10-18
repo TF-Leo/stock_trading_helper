@@ -143,7 +143,7 @@ if ($null -eq $probe) {
     foreach ($g in 'G03', 'G04', 'G05', 'G06', 'G07', 'G08', 'G12',
         'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23',
         'G24', 'G25', 'G26', 'G27', 'G28', 'G29', 'G30', 'G31', 'G32',
-        'G33', 'G34', 'G35', 'G36', 'G37') {
+        'G33', 'G34', 'G35', 'G36', 'G37', 'G38', 'G39') {
         Add-Gate $g '（探针缺失，无法判定）' 'BLOCKED' 'probe.py 未产出结果'
     }
 }
@@ -179,7 +179,9 @@ else {
         @('start_window', 'G34', '--start 生效且不截断缓存（F20）'),
         @('error_shape', 'G35', '错误响应与成功响应同构（C3：显式 null 而非整块缺失）'),
         @('source_failover', 'G36', '渠道池多源降级可用（东财失败→新浪接手）'),
-        @('window_note', 'G37', 'data.window_note 如实反映 --start 截取（两路径均不得恒 null）')
+        @('window_note', 'G37', 'data.window_note 如实反映 --start 截取（两路径均不得恒 null）'),
+        @('entry_zone', 'G38', 'entry_zone 必须是有效区间（lower <= upper）'),
+        @('otc_fund', 'G39', '场外基金（OTC 净值）可用 + auto 判定为 fund')
     )
     $quickSkip = @('fund', 'idempotent', 'windows', 'exit_codes', 'type_hint', 'fund_cache')
     foreach ($row in $m) {

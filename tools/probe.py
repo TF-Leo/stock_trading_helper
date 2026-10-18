@@ -784,10 +784,15 @@ def check_degrade_visibility():
             if len(picks) >= 3:
                 break
         orig_build = cli.build_strategy_signals
-        orig_get = cli.get_stock_daily
+        # 2026-10-18：取数已统一走 data_loader.meta.resolve_and_fetch()
+        # （cli.py 不再直接调用 get_stock_daily/get_fund_daily），
+        # 因此打桩点必须跟着改，否则注入无效、G33 会误报 stale=False。
+        import stock_analysis.data_loader.meta as _meta
+        orig_resolve = _meta.resolve_and_fetch
         try:
             cli.build_strategy_signals = lambda: {k: full[k] for k in picks}
-            cli.get_stock_daily = lambda *a, **k: df
+            _meta.resolve_and_fetch = lambda code, type_hint="auto", start_date=None: (
+                df, "stock", None)
             meta._record_fetch("cache", True, degraded=True,
                                degraded_reason="probe:simulated stale cache",
                                cache_last_date=info.get("cache_last_date"),
@@ -796,7 +801,7 @@ def check_degrade_visibility():
             resp = cli.advise_internal("600519", fast=True)
         finally:
             cli.build_strategy_signals = orig_build
-            cli.get_stock_daily = orig_get
+            _meta.resolve_and_fetch = orig_resolve
         data = resp.get("data") or {}
         warns = (resp.get("diagnostics") or {}).get("warnings") or []
         obs["cli"] = {"stale": data.get("stale"),
@@ -1218,6 +1223,96 @@ def check_window_note():
     return {"status": "PASS" if not problems else "FAIL",
             "reason": "; ".join(problems), "observed": obs}
 
+def check_entry_zone_valid():
+    """G38：`recommendation.entry_zone` 必须是**有效区间**（lower <= upper）。
+
+    背景（2026-10-18，Hermes 实测暴露）：`derive_entry_zone` 旧实现做
+    `lower = max(last-0.5ATR, buy_price)` 却不调整上沿，当策略的买入触发价
+    高于 `last+0.5ATR` 时输出**倒置区间**。实测：
+        600522 last=26.62 → [44.71, 27.39]   （差 +17.32）
+        002415 last=33.66 → [35.18, 33.98]   （差 +1.20）
+        300476 last=182.0 → [195.16, 188.49] （差 +6.67）
+
+    判据：
+      1. entry_zone 为 None 时跳过（不适用）；
+      2. 否则必须是长度为 2 的数值列表，且 lower <= upper；
+      3. 区间应围绕 last_close（不做硬性阈值，仅要求两端均为正数）。
+    """
+    problems, obs = [], {}
+    codes = ["600522", "002415", "300476", "002270", "600519"]
+    for code in codes:
+        rec = run_cli_json([code, "--json", "--fast"])
+        d = rec.get("data")
+        if not d:
+            obs[code] = "无JSON"
+            continue
+        r = d["recommendation"]
+        ez = r.get("entry_zone")
+        lc = (d.get("data") or {}).get("last_close")
+        obs[code] = {"entry_zone": ez, "last_close": lc}
+        if ez is None:
+            continue
+        if not isinstance(ez, list) or len(ez) != 2:
+            problems.append(f"{code} entry_zone 不是长度 2 的列表: {ez!r}")
+            continue
+        try:
+            lo, hi = float(ez[0]), float(ez[1])
+        except (TypeError, ValueError):
+            problems.append(f"{code} entry_zone 含非数值: {ez!r}")
+            continue
+        if lo > hi:
+            problems.append(f"{code} entry_zone 倒置: [{lo}, {hi}]（lower > upper）")
+        if lo <= 0 or hi <= 0:
+            problems.append(f"{code} entry_zone 含非正值: [{lo}, {hi}]")
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
+
+
+def check_otc_fund():
+    """G39：场外基金（OTC 净值）必须可用。
+
+    背景（2026-10-18，Hermes 实测暴露）：`get_fund_daily` 曾**只有 ETF 通道**
+    （`ak.fund_etf_hist_sina`），4 只场外基金
+    （023298/006195/001917/001564）全部 0 行 → data_source_error，
+    而同一批基金在 OTC 通道（`ak.fund_open_fund_info_em`）上有 366~2689 行。
+
+    同时锁定 auto 判定：这些 0/1 段代码必须被识别为 fund（不能被当成 stock）。
+
+    判据（每条）：
+      - exit ∈ {0, 10}（ok / no_edge 都算可用；30=取不到 才算失败）
+      - data.bars >= 100
+      - request.type == 'fund'（auto 判定正确）
+    """
+    problems, obs = [], {}
+    for code in ("023298", "001917", "510300"):
+        rec = run_cli_json([code, "--json", "--fast", "--type", "fund"], cache=False)
+        d = rec.get("data")
+        if not d:
+            problems.append(f"{code} 无 JSON（exit={rec.get('exit')}）")
+            obs[code] = {"exit": rec.get("exit")}
+            continue
+        bars = (d.get("data") or {}).get("bars", 0)
+        typ = (d.get("request") or {}).get("type")
+        st = (d.get("recommendation") or {}).get("status")
+        obs[code] = {"exit": rec.get("exit"), "bars": bars,
+                     "type": typ, "status": st,
+                     "source": (d.get("data") or {}).get("source")}
+        if rec.get("exit") not in (0, 10):
+            problems.append(f"{code} --type fund 退出码 {rec.get('exit')}（期望 0 或 10）")
+        if bars < 100:
+            problems.append(f"{code} --type fund 仅 {bars} 根")
+    # auto 判定：0/1 段场外基金必须识别为 fund
+    for code in ("001917", "023298"):
+        rec = run_cli_json([code, "--json", "--fast"], cache=False)
+        d = rec.get("data")
+        typ = ((d or {}).get("request") or {}).get("type")
+        obs.setdefault("auto", {})[code] = {"type": typ, "exit": rec.get("exit")}
+        if typ != "fund":
+            problems.append(f"{code} auto 判定为 {typ}（期望 fund）")
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     out = {}
@@ -1272,6 +1367,8 @@ def main():
     run("error_shape", check_error_shape)
     run("source_failover", check_source_failover)
     run("window_note", check_window_note)
+    run("entry_zone", check_entry_zone_valid)
+    run("otc_fund", check_otc_fund)
 
     heavy = {
         "idempotent": check_idempotent,

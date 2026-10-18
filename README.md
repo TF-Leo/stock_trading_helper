@@ -35,7 +35,7 @@ python cli.py 600519 --start 20200101 --json
 | --json | bool | False | 输出 JSON 格式（stdout），文本日志走 stderr |
 | --fast | bool | False | 快速模式：减少 bootstrap 次数、缩减候选池、walk-forward 折数 3→2 |
 | --start | str | None | 数据起始日期（YYYYMMDD） |
-| --type / -t | str | auto | 类型：auto/stock/fund。`auto` 按代码前缀推断（5 开头视为基金） |
+| --type / -t | str | auto | 类型：auto/stock/fund。**`auto` 双向探测**：5/15/16/18 开头按基金试，其余按股票试；取不到数据再试另一侧（见下方"场外基金与 auto 判定"）。不确定时请显式指定 |
 | --jobs | int | 1 | 并行任务数 |
 | --opt | str | grid | 优化方式：grid（全网格）/ bayes（贝叶斯寻优） |
 | --detail | bool | False | 文本模式追加详细内容（触发器 / 候选表 / 指标 / 告警） |
@@ -239,7 +239,12 @@ python cli.py 600519 --start 20200101 --json
 - **confidence**: 置信度（0-1 浮点数）= `0.4×DSR + 0.3×consensus.agreement + 0.2×stability + 0.1×min(trade_count/60,1)`
 - **position_fraction**: 仓位比例（0-0.30 浮点数），`action ∈ {avoid, insufficient_data}` 时为 0
 - **horizon_days**: 时间窗口 `[max(2,⌊0.5×平均持仓⌋), min(60,⌈1.5×平均持仓⌉)]`；无回测（错误路径）时为 `[null, null]`
-- **entry_zone**: 入场区间 `[last−0.5ATR, last+0.5ATR]`（不低于最近买入触发价）；`action=sell` 时为 null
+- **entry_zone**: 入场区间 `[last−0.5ATR, last+0.5ATR]`，**保证 lower ≤ upper**；
+  买入触发价仅在落入该区间内时才用于抬高下限（高于上沿的触发价属于"等涨到该价"的条件，
+  从 `evidence.triggers[].buy_price` 读取，不混进入场区）。`action=sell` 时为 null。
+  > 历史 bug（2026-10-18 修）：旧实现做 `lower = max(last−0.5ATR, buy_price)` 却不调整上沿，
+  > 于是 `buy_price > last+0.5ATR` 时输出**倒置区间**（实测 600522 `[44.71, 27.39]`、
+  > 002415 `[35.18, 33.98]`、300476 `[195.16, 188.49]`）。门禁 **G38** 现在校验 lower ≤ upper。
 - **stop_loss**: 止损价 = `last − 2.5×ATR(14)`，`stop_distance` 被 clamp 到 `[0.03, 0.20]`；无 ATR 时用 `BacktestConfig.stop_loss_pct`（0.08）
 - **take_profit**: 止盈价 = `last + 4.0×ATR(14)`；无 ATR 时用 `take_profit_pct`（0.15）
 - **stop_method**: `"atr"` 或 `"fixed"` —— 明确告诉调用方止损是用哪种口径算的（**与回测引擎同一口径**）；无回测（错误路径）时为 null
@@ -522,6 +527,47 @@ eastmoney (ak.stock_zh_a_hist)  →  sina_stock (ak.stock_zh_a_daily)  →  sina
 600519: 1643 根   688981: 1509 根   002371: 1643 根   300750: 1643 根
 OK 预热完成，可离线运行          ← 全部由 sina_stock 接手
 ```
+
+### 场外基金与 `auto` 判定（**重要**）
+
+基金取数走**两个通道**：
+
+| 通道 | 接口 | 覆盖 |
+|---|---|---|
+| 场内 ETF | `ak.fund_etf_hist_sina` | 510300 这类场内 ETF（有 OHLCV） |
+| 场外 OTC | `ak.fund_open_fund_info_em` | 023298 / 001917 这类场外基金（**只有单位净值**） |
+
+场外基金**没有 OHLCV**，数据层用单位净值补齐：`open=high=low=close=净值`、`volume=0`。
+回测基于 close，信号与收益不受影响。
+
+**实测（2026-10-18）**：
+
+```
+023298   ETF=0 行   OTC=366 行    尾部 2026-10-16 / 1.335
+006195   ETF=0 行   OTC=1919 行   尾部 2026-10-16 / 2.8544
+001917   ETF=0 行   OTC=2564 行   尾部 2026-10-16 / 3.2372
+001564   ETF=0 行   OTC=2689 行   尾部 2026-10-16 / 3.817
+```
+
+> 历史缺口：`get_fund_daily` 曾**只有 ETF 通道**，这 4 只场外基金全部 0 行 →
+> `data_source_error`。门禁 **G39** 现在锁定 OTC 通道可用。
+
+#### `auto` 为什么不能只看代码前缀
+
+场外基金代码段与深市股票代码段**重叠**，纯代码规则无法可靠区分。实测
+`ak.fund_name_em()` 名录（28104 条）里：
+
+```
+002270 在基金名录   ← 但它是股票（华明装备）
+002415 在基金名录   ← 但它是股票（海康威视）
+001917 在基金名录   ← 它是基金
+```
+
+所以 `auto` 改为**双向探测**：先按前缀猜一侧，取不到足量数据再试另一侧，
+两侧都失败则明确报错并提示用 `--type`，**绝不猜一个当成事实**。
+
+**建议：对 0/1 段的代码，显式传 `--type stock` 或 `--type fund`**，避免歧义。
+`5/15/16/18` 开头的场内基金可以安全依赖 `auto`。
 
 ### 跨通道数据一致性（**混源还能不能比**）
 

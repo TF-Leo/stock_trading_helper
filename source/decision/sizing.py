@@ -69,19 +69,39 @@ def derive_stops(last_close: float, atr: Optional[float] = None,
 
 def derive_entry_zone(last_close: float, atr: Optional[float] = None,
                       buy_price: Optional[float] = None) -> Optional[List[float]]:
-    """入场区 = [max(buy_price, last_close-0.5ATR), last_close+0.5ATR]。
+    """入场区 = [last-0.5ATR, last+0.5ATR]，并保证**始终是有效区间**。
 
-    无 ATR 时退化为 ±1%（但下限仍取 buy_price，保证不高于触发价太多）。
+    `buy_price` 是"策略的买入触发价"，可能**远高于现价**（趋势/突破类策略
+    要求先涨到某价位才买）。旧实现做 `lower = max(last-0.5ATR, buy_price)`
+    却不调整上沿，于是 buy_price > last+0.5ATR 时出现 **lower > upper 倒置区间**。
+
+    实测（2026-10-18，Hermes 报告 + 本仓库复现）：
+        600522 last=26.62 → entry_zone=[44.71, 27.39]   差 +17.32
+        002415 last=33.66 → entry_zone=[35.18, 33.98]   差 +1.20
+        300476 last=182.0 → entry_zone=[195.16, 188.49] 差 +6.67
+
+    修正规则：
+      1. 区间始终以 last_close ± 0.5ATR 为基准，保证 lower <= upper；
+      2. buy_price **只在落在区间内时**才用来抬高下限（此时它有"安全边际"含义）；
+      3. buy_price 高于上沿时**不塞进区间** —— 那属于"等涨到该价再考虑"的
+         触发条件，调用方从 `evidence.triggers[].buy_price` 读取，不应污染入场区。
     """
     entry = float(last_close)
     half = (ENTRY_ZONE_ATR_MULT * float(atr)) if (atr is not None and float(atr) > 0) else entry * 0.01
     lower = entry - half
+    upper = entry + half
     if buy_price is not None:
         try:
-            lower = max(lower, float(buy_price))
+            bp = float(buy_price)
         except (TypeError, ValueError):
-            pass
-    return [round(lower, 2), round(entry + half, 2)]
+            bp = None
+        # 仅当触发价落在区间内才抬高下限；高于上沿则忽略（见 docstring 规则 3）
+        if bp is not None and lower <= bp <= upper:
+            lower = bp
+    # 兜底：任何情况下都不得输出倒置区间
+    if lower > upper:
+        lower = upper
+    return [round(lower, 2), round(upper, 2)]
 
 
 def derive_horizon(avg_holding_days: Optional[float]) -> List[int]:
