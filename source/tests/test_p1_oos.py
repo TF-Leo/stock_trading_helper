@@ -17,6 +17,24 @@ def _toy_df(n=300, seed=7):
     }, index=idx)
 
 
+def _high_price_df(n=400, seed=11):
+    """合成高价股日线（约 1500 元/股，含明确趋势便于触发成交）。
+
+    A14 / 冷克隆契约：测试**不得**依赖 `stock_analysis/data/*.csv`
+    （该目录被 .gitignore 排除，冷克隆必然缺失 → FileNotFoundError）。
+    故用合成序列复现 600519 的关键特征：绝对股价远高于 10 万本金的 1 手成本。
+    """
+    rng = np.random.default_rng(seed)
+    trend = np.linspace(0, 0.6, n)              # 单边上行，保证有买入信号与成交
+    rets = rng.normal(0.0006, 0.012, n) + trend / n
+    close = 1500 * np.cumprod(1 + rets)
+    idx = pd.date_range("2020-01-01", periods=n, freq="D")
+    return pd.DataFrame({
+        "open": close * 0.999, "high": close * 1.01,
+        "low": close * 0.99, "close": close, "volume": 100000,
+    }, index=idx)
+
+
 def test_registry_single_source():
     from stock_analysis.backtest.analyzer import _build_strategy_grid
     import types
@@ -74,16 +92,38 @@ def test_overfit_penalty_demo():
 
 
 def test_adaptive_oos_high_price():
-    """高价股测试切片起点10万买不起1手时，OOS自适应资金应保证可评估。"""
+    """高价股切片起点 10 万买不起 1 手时，OOS 自适应资金仍应保证可评估、可成交。
+
+    A14 / 冷克隆（2026-10-18）：原实现直接 `pd.read_csv('stock_analysis/data/stock_600519_qfq.csv')`。
+    该目录被 `.gitignore` 排除，**冷克隆必然 FileNotFoundError**（实测：冷缓存下
+    `1 failed, 46 passed`）。GOAL_CONTRACT A14 早就要求改用合成 fixture，一直没做。
+    现改用 `_high_price_df()`：保留原意（绝对股价 1500 元/股，10 万本金买不起 1 手），
+    且不依赖任何本地文件，离线可跑。
+    """
     from stock_analysis.backtest.analyzer import adaptive_oos_config, split_train_test
     from stock_analysis.backtest.engine import BacktestEngine, BacktestConfig
-    import pandas as pd
-    df = pd.read_csv('stock_analysis/data/stock_600519_qfq.csv', index_col='date', parse_dates=True)
+
+    df = _high_price_df(400)
+    # 前提自检：确认这确实是"10 万买不起 1 手"的高价股场景，否则本测试失去意义
+    base = BacktestConfig(initial_capital=100000, max_position_pct=1.0)
+    cheapest = float(df["close"].min())
+    assert cheapest * 100 > base.initial_capital, (
+        f"fixture 不构成高价股场景：最低价 {cheapest:.2f} × 100 <= 10 万"
+    )
+
     tr, te = split_train_test(df, 0.7)
-    cfg = adaptive_oos_config(df, BacktestConfig(max_position_pct=1.0))
-    assert cfg.initial_capital >= 100000
+    cfg = adaptive_oos_config(df, base)
+    assert cfg.initial_capital >= base.initial_capital, "自适应资金不得低于原始本金"
+    # 自适应资金必须覆盖该序列最高价的 1 手成本
+    assert cfg.initial_capital >= float(df["close"].max()) * 100, (
+        f"自适应资金 {cfg.initial_capital:.0f} 仍买不起最高价 1 手"
+    )
+
     from stock_analysis.backtest.analyzer import _build_strategy_grid
     sigs = _build_strategy_grid()
     eng = BacktestEngine(cfg)
-    r = eng.run_backtest(te, sigs['StochRSI(14,25/75)'])
-    assert r.trade_count > 0, "自适应资金下高价股OOS应有交易"
+    r = eng.run_backtest(te, sigs["StochRSI(14,25/75)"])
+    assert r.trade_count > 0, "自适应资金下高价股 OOS 应有交易"
+    assert r.unaffordable_lot_events == 0, (
+        f"自适应资金下不应出现买不起 1 手的事件，实际 {r.unaffordable_lot_events} 次"
+    )

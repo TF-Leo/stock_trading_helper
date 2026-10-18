@@ -1,12 +1,32 @@
-# 数据拉取（版本 = 通过 `tools/check_gates.ps1 -Full` 的实测环境）
-# 实测环境：Python 3.12.10 / 2026-10-17
-# 这些 pin 必须与 `python -c "import akshare,numpy,pandas"` 的实际输出一致，
-# 否则 Hermes `pip install -r requirements.txt` 会装上一套从未跑过门禁的版本组合（D3(e)）。
+# 依赖清单 —— 两组环境都要能装上，且都要能跑通门禁。
+#
+# ⚠️ 关于 Python 版本（2026-10-18 修正）
+#   pandas 3.0.1 的元数据是条件依赖：
+#       numpy>=1.26.0 ; python_version <  "3.14"
+#       numpy>=2.3.3 ; python_version >= "3.14"
+#   因此对 numpy 用**单一硬 pin 必然在某一侧失败**：
+#     - numpy==2.2.6 在 Python 3.14 上 → ResolutionImpossible（实测报告）
+#     - numpy==2.3.5 在 3.12 上可装，但**不是我们跑过 35 项门禁的那套**
+#   故 numpy 改用 environment marker 分档：3.14+ 取 >=2.3.3，<3.14 取实测 pin。
+#
+# ✅ 已验证组合（本仓库唯一被门禁验证过的组合）
+#   Python 3.12.10 / akshare 1.18.29 / requests 2.32.5 / numpy 2.2.6 /
+#   pandas 3.0.1 / pytest 8.3.5
+#   验证方式：`pwsh -File tools/check_gates.ps1 -Full` → PASS 35 | 退出码 0
+#            `cd source; python -m pytest tests/ -q` → 47 passed（**冷克隆、无缓存也应为 47**）
+#
+# ⚠️ Python 3.14 组合 = 按元数据推导的**可安装**组合，但**尚未跑过门禁**（本机无 3.14）。
+#   若在 3.14 上失败，请把 `pip install` 与 `pytest` 的原始报错一并反馈，不要静默降级版本。
+#   强烈建议优先使用 Python 3.12 以获得已被验证的组合。
+
+# 数据拉取
 akshare==1.18.29
 requests==2.32.5
 
 # 数值计算
-numpy==2.2.6
+# numpy: 见上方说明，按 Python 版本分档
+numpy==2.2.6; python_version < "3.14"
+numpy>=2.3.3,<3; python_version >= "3.14"
 pandas==3.0.1
 
 # 测试

@@ -403,6 +403,75 @@ G35 observed: 600519 {ok_paths:134, err_paths:116, missing:0, bars:23}
 建议在 README 的契约章节**显式加一句**"错误路径下 `horizon_days`/`stop_loss`/`take_profit`/`stop_method` 均为 null，读取方须判空"，
 再推送 `ahead 24`。
 
+## 1.10 主回合第四轮：Hermes 侧实测反馈驱动的修复（2026-10-18 下午）
+
+**触发**：Hermes 在一台 **Python 3.14.7 / 洛杉矶出口 IP** 的机器上拉取后自查，报回两真两未验证。
+它的报告质量很高——**没有一条是猜测，全部带原始命令与输出**。以下按它的报告逐条处理。
+
+### ① 冷克隆测试失败（它报「1 failed / 46 passed」）—— **真缺陷，我这边一直测不到**
+
+复现：把 `source/stock_analysis/data/*.csv` 全部挪走后跑 pytest →
+`1 failed, 46 passed`，`FileNotFoundError: stock_analysis/data/stock_600519_qfq.csv`。
+
+根因：`tests/test_p1_oos.py::test_adaptive_oos_high_price` 直接
+`pd.read_csv('stock_analysis/data/stock_600519_qfq.csv')`，而该目录被 `.gitignore` 排除 →
+**冷克隆必然失败**。GOAL_CONTRACT **A14 早就点名要求改用合成 fixture，一直没做**。
+**我的盲区**：本机常年有缓存，所以 G01 永远是 47 passed，这条缺陷从未暴露。
+
+修复：新增 `_high_price_df()`（1500 元/股、400 根、单边上行），改写该测试并**加强**断言：
+①fixture 自检"最低价×100 > 10 万"确保仍是高价股场景；②自适应资金 ≥ 最高价×100；
+③成交数 > 0；④**`unaffordable_lot_events == 0`**（新增，直接锁住 A1 不变式）。
+
+实测：热缓存 **47 passed** / 冷克隆 **47 passed**（此前 46+1 failed）。
+
+### ② Python 3.14 装不上（它报 `ResolutionImpossible`）—— **真缺陷，我上轮引入的**
+
+它诊断：pandas 3.0.1 在 py≥3.14 时要求 numpy≥2.3.3，与 pin 的 `numpy==2.2.6` 冲突。
+**用 PyPI 元数据核实，完全正确**：
+```
+pandas 3.0.1  requires_python: >=3.11
+              numpy>=1.26.0 ; python_version <  "3.14"
+              numpy>=2.3.3 ; python_version >= "3.14"
+```
+我上轮把 pin 改成"实测值"时，只对了我这**一台** 3.12 机器，没考虑 Python 版本差异。
+
+修复：`numpy` 改用 **environment marker** 分档（`==2.2.6` for <3.14；`>=2.3.3,<3` for ≥3.14），
+并在文件头写明"3.12 是唯一被门禁验证的组合；3.14 是按元数据推导的可安装组合，**尚未跑过门禁**"。
+实测：G30 仍 PASS（正则按 `pkg==x.y.z` 提取，marker 后缀不影响）。
+**我无法验证 3.14 组合——本机只有 3.12，已如实标注，未声称已验证。**
+
+### ③ 预热命令对逐票失败零感知（它提的建议①）—— 采纳并实现
+
+`[get_stock_daily(c) for c in ...]` 会吞掉 `None`（取数失败只往 stderr 打一行、不抛异常），
+导致"命令成功退出但缓存是空的"，下一步才以 `FileNotFoundError`/`insufficient_data` 爆炸。
+
+新增 `tools/warm_cache.py`：逐票检查行数（阈值 100，与 cli 的 insufficient_data 一致）、
+汇总失败、失败时**退出码 1** 并逐条列出。实测：
+```
+成功: 600519:1643 688981:1509 002371:1643 300750:1643 510300:1643 → OK / exit 0
+失败: 000000: 0 根 → "ERROR 预热失败：- 000000: 0 根 < 100" / exit 1
+从任意目录执行均可（脚本自行定位 source/）
+```
+README 预热章节改为调用该脚本，并附实测输出。
+
+### ④ 它的其它发现（已记录，未改代码）
+- **东财股票 K 线 CDN 封锁该机器出口 IP**：`curl push2his.eastmoney.com` → http=000、0.05s 断开；
+  而 `api.fund.eastmoney.com` 200、百度 200 → **不是断网，是节点级封 IP 段**。旧缓存（9/28–10/16）证明链路以前通。
+  → 这是**环境侧问题，不是代码缺陷**。Hermes 可用腾讯通道 `stock_zh_a_hist_tx` 造缓存，
+  但它**正确地拒绝**了（异源 qfq 数据落缓存会污染后续复测）。**这个判断是对的，我同意。**
+- **新发现（我复核时撞到）**：`600519 --type fund` 会从基金通道把**股票 K 线**拉到
+  `fund_600519.csv`（6022 行 / close 最高 2601）。该文件只服务 G16 的 `--type` 断言，
+  不参与任何结论计算，已删除并在 README「行为约定」标注为可安全删除的已知坑。
+
+### 本轮实测收口
+```
+cd source; python -m pytest tests/ -q      → 47 passed（热缓存）
+                                    同上（缓存全部挪走） → 47 passed   ← 冷克隆
+pwsh -File tools/check_gates.ps1 -Full    → PASS 35 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0
+```
+**仍未验证**：Python 3.14 环境下 `pip install` + `pytest` + CLI 全流程（本机无 3.14）；
+Hermes 卡在缓存，第 1–4 节契约自查/正确性/同构/幂等**全部未测**。
+
 ## 2. 未完成（下一步按此顺序推进）
 
 > 本节为 **2026-10-17 的历史记录**；2026-10-18 的 21 条修复见 §1.5，当前**没有**未完成条目。

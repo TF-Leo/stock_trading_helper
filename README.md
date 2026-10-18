@@ -416,25 +416,98 @@ CLI 向后兼容所有旧参数（`probe.py::check_old_args` 与 `tools/check_ga
 
 ## 首次运行 / 离线预热（重要）
 
-`.gitignore` 排除了 `source/stock_analysis/data/` 与 `source/fund_analysis/data/`，
-因此**刚 clone 下来时缓存为空，首次运行必须联网**。预热命令：
+`.gitignore` 排除了 `source/stock_analysis/data/`，因此**刚 clone 下来时缓存为空，首次运行必须联网**。
+
+### 预热命令（**逐票断言**，失败会立刻报错而不是静默跳过）
 
 ```bash
-cd source
-python -c "from stock_analysis.data_loader import get_stock_daily, get_fund_daily; \
-[get_stock_daily(c) for c in ['600519','688981','002371','300750']]; get_fund_daily('510300')"
+# 在仓库根目录执行（也可用绝对路径从任意目录执行）
+python tools/warm_cache.py                    # 默认标的集
+python tools/warm_cache.py 600519 510300      # 只预热指定标的
 ```
 
-- 预热成功后会写 `stock_{code}_qfq.csv` / `fund_{code}.csv`，之后**可完全离线运行**（`pytest` 就是离线全绿的）。
+实测输出（成功）：
+
+```
+600519: 1643 根
+688981: 1509 根
+002371: 1643 根
+300750: 1643 根
+510300: 1643 根
+OK 预热完成，可离线运行
+```
+
+失败时**退出码 1** 并逐条列出原因（实测）：
+
+```
+000000: 0 根
+
+ERROR 预热失败：
+  - 000000: 0 根 < 100
+
+常见原因：出口 IP 被该行情源封锁 / 当前网络不可达 / 代码不存在。
+请把以上完整输出（含 stderr）反馈，不要继续后续步骤。
+```
+
+> **为什么必须逐票断言**：`get_stock_daily` 取数失败时**返回 `None` 且只往 stderr 打一行、不抛异常**。
+> 若写 `[get_stock_daily(c) for c in ...]`，失败会被静默吞掉 —— "命令成功退出但缓存是空的"，
+> 下一步才以 `FileNotFoundError` / `insufficient_data` 爆炸，误导排查方向。
+> `tools/warm_cache.py` 就是为这个场景写的：逐票检查行数、汇总失败、非零退出。
+
+### 冷克隆自检（**不需要网络**）
+
+```bash
+cd source && python -m pytest tests/ -q     # 无缓存也必须是 47 passed
+```
+
+测试**不依赖** `stock_analysis/data/*.csv`（只用合成序列）。若在空缓存下出现
+`FileNotFoundError: stock_analysis/data/stock_600519_qfq.csv`，说明回归了 —— 请报告。
+
+### 行为约定
+
+- 预热成功后会写 `stock_{code}_qfq.csv` / `fund_{code}.csv`，之后**可完全离线运行**。
 - **无缓存 + 无网络 → 退出码 30（data_source_error）**，不是 20。
 - 有缓存但不足 100 根 → 退出码 20（insufficient_data）。
 - 拉取失败**不会**再写出空壳缓存文件（0 行 CSV）；若历史上已存在空壳，读取时会自动识别并删除后重拉。
+- ⚠️ 已知坑：`600519 --type fund` 会从基金通道把**股票 K 线**拉到 `fund_600519.csv`。
+  该文件只用于验证 `--type` 是否生效（G16），不参与任何结论计算，但会占缓存空间，可安全删除。
 
 ## 依赖与 Python 版本（D3f）
 
-- Python **3.12.10**（实测通过全部门禁的环境）
-- `source/requirements.txt` 的 pin 与实测环境一致：`akshare==1.18.29 / numpy==2.2.6 / pandas==3.0.1 / pytest==8.3.5 / requests==2.32.5`
-- 门禁 G30 会对比 `requirements.txt` 与实际已安装版本，不一致直接 FAIL
+### 推荐：Python 3.12（唯一被门禁验证过的组合）
+
+| 组件 | 版本 |
+|---|---|
+| Python | **3.12.10** |
+| akshare | 1.18.29 |
+| requests | 2.32.5 |
+| numpy | 2.2.6 |
+| pandas | 3.0.1 |
+| pytest | 8.3.5 |
+
+验证：`pwsh -File tools/check_gates.ps1 -Full` → **PASS 35 / 退出码 0**；`pytest` → **47 passed**。
+
+### Python 3.14 的已知冲突（**已修正**）
+
+`pandas 3.0.1` 的元数据是条件依赖：
+
+```
+numpy>=1.26.0 ; python_version <  "3.14"
+numpy>=2.3.3 ; python_version >= "3.14"
+```
+
+因此对 numpy 用**单一硬 pin 必然在某一侧失败**：早期版本写死 `numpy==2.2.6`，在 3.14 上会
+`ResolutionImpossible`。现在 `requirements.txt` 用 **environment marker** 分档：
+
+```
+numpy==2.2.6; python_version < "3.14"
+numpy>=2.3.3,<3; python_version >= "3.14"
+```
+
+- Python 3.14 组合 = 按 PyPI 元数据推导的**可安装**组合，但**尚未跑过门禁**（本仓库无 3.14 环境）。
+  在 3.14 上请务必跑一遍 `pytest` 与 `python cli.py 600519 --json --fast` 并把结果反馈。
+- 门禁 G30 对比 `requirements.txt` 的 pin 与实际已安装版本；它按 `pkg==x.y.z` 提取，
+  marker 后缀不影响解析（已实测 PASS）。
 
 ## 实现要点（与结论可靠性直接相关）
 
