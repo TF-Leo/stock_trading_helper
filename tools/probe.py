@@ -472,24 +472,202 @@ def check_type_hint():
 
 
 def check_old_args():
-    """G29：D6 旧参数不得 usage error（复用 cli.build_parser，与 main() 同一份定义）。"""
+    """G29：D6 旧参数**端到端真跑**（subprocess，非进程内 parse_args）。
+
+    契约 D6 要求"真跑并断言 returncode ∈ {0,10,20,30,40}"。旧实现只做进程内
+    `build_parser().parse_args()` —— 只能证明 argparse **认识**该参数，不能证明参数
+    被接线到行为（argparse 收下却无人使用也照样 PASS），是判定强度的实质弱化。
+
+    现改为：每个旧参数组合都启动**真实子进程**。用 `--start <近端日期>` 把窗口压到
+    <100 根，使其在"数据不足"分支秒级返回（rc=20），从而以极低成本同时验证
+    「参数被接受」+「端到端跑通」+「退出码合法且落在契约集合内」。
+    另外两条行为断言，防止"参数被解析但未接线"：
+      * `--detail` 的 stdout 行数必须多于基准（真有效应）；
+      * `--json` 的 stdout 必须能被 json.loads 解析（纯 JSON，C1）。
+    """
     sys.path.insert(0, SRC)
-    os.chdir(SRC)
-    from cli import build_parser
-    parser = build_parser()
-    cases = [["600519"], ["600519", "--detail"], ["600519", "--no-regime"],
-             ["600519", "--opt-iters", "8"], ["600519", "--start", "20220101"],
-             ["600519", "--jobs", "2"], ["600519", "--opt", "grid"],
-             ["600519", "-t", "stock"], ["600519", "--json"], ["600519", "--fast"]]
-    problems = []
-    for c in cases:
+    py = sys.executable
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    base = ["600519", "--start", "20260701"]
+    cases = [["--detail"], ["--no-regime"], ["--opt-iters", "8"], ["--jobs", "2"],
+             ["--opt", "grid"], ["-t", "stock"], ["--json"], ["--fast"]]
+    allowed = {0, 10, 20, 30, 40}
+    problems, rc_map, stdout_map = [], {}, {}
+    for extra in cases:
+        key = " ".join(extra)
         try:
-            parser.parse_args(c)
-        except SystemExit as e:
-            problems.append(f"{' '.join(c)} -> SystemExit({e.code})")
+            p = subprocess.run([py, "cli.py"] + base + extra, cwd=SRC,
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", env=env, timeout=180)
+        except subprocess.TimeoutExpired:
+            problems.append(f"{key} 超时(>180s)")
+            continue
+        rc_map[key] = p.returncode
+        stdout_map[key] = p.stdout
+        if p.returncode == 2:
+            problems.append(f"{key} usage error(2): {(p.stderr or '').strip()[:120]}")
+        elif p.returncode not in allowed:
+            problems.append(f"{key} 退出码 {p.returncode} 不在 {sorted(allowed)}")
+        elif p.returncode != 20:
+            problems.append(f"{key} 退出码 {p.returncode}（72 根应判 20=insufficient_data）")
+
+    # --detail 必须真的有行为差异
+    base_lines = len((stdout_map.get("--fast") or "").splitlines())
+    detail_lines = len((stdout_map.get("--detail") or "").splitlines())
+    if base_lines and detail_lines <= base_lines:
+        problems.append(f"--detail 未增加输出（{detail_lines} 行 vs 基准 {base_lines} 行）")
+
+    # --json 必须是纯 JSON
+    try:
+        json.loads(stdout_map.get("--json") or "")
+    except Exception as e:
+        problems.append(f"--json stdout 非纯 JSON: {e}")
+
     return {"status": "PASS" if not problems else "FAIL",
             "reason": "; ".join(problems),
-            "observed": {"cases": len(cases)}}
+            "observed": {"returncodes": rc_map, "detail_lines": detail_lines,
+                         "base_lines": base_lines, "cases": len(cases)}}
+
+
+def check_start_window():
+    """G34：`--start` 必须真正生效，且不得把缓存文件截断。
+
+    本轮查出的两个真缺陷：
+      1. 缓存命中路径完全不看 start_date —— `--start 20260701` 与不带 start
+         返回逐字节相同的全量数据，参数形同虚设；
+      2. 拉取路径把 `df[df.index >= start]` 的结果写回缓存 —— 一次带 --start 的
+         调用就会把更早的历史永久削掉。
+    判据：短窗口行数必须 < 全量行数、窗口首日 >= start、缓存文件行数不得减少。
+    """
+    sys.path.insert(0, SRC)
+    os.chdir(SRC)
+    import pandas as pd
+    from stock_analysis.data_loader import get_stock_daily
+    cache = os.path.join(SRC, "stock_analysis", "data", "stock_600519_qfq.csv")
+
+    def cache_rows():
+        if not os.path.exists(cache):
+            return None
+        with open(cache, "r", encoding="utf-8", errors="replace") as f:
+            return max(sum(1 for _ in f) - 1, 0)
+
+    before = cache_rows()
+    full = get_stock_daily("600519", start_date="20200101", source="sina")
+    win = get_stock_daily("600519", start_date="20260701", source="sina")
+    after = cache_rows()
+
+    problems = []
+    obs = {"cache_rows_before": before, "cache_rows_after": after}
+    if full is None or win is None:
+        problems.append("取数为空")
+    else:
+        obs["full_bars"], obs["win_bars"] = len(full), len(win)
+        if len(win) >= len(full):
+            problems.append(f"--start 未生效：窗口 {len(win)} 根 >= 全量 {len(full)} 根")
+        if len(win) == 0:
+            problems.append("窗口内 0 根")
+        elif pd.Timestamp(win.index[0]) < pd.Timestamp("2026-07-01"):
+            problems.append(f"窗口首日 {win.index[0]} 早于 --start 2026-07-01")
+    if before is not None and after is not None and after < before:
+        problems.append(f"缓存被 --start 截断：{before} 行 → {after} 行")
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
+
+
+def check_degrade_visibility():
+    """G33：数据降级（触网失败→回退旧缓存）必须对调用方可见。
+
+    旧行为：`data.from_cache=True` 同时覆盖"新鲜命中"与"拉取失败兜底"两种情况，
+    Hermes 无法判断结论是否建立在陈旧数据上 —— 这是**输出撒谎**，不是风格问题。
+
+    两段验证：
+      1. data_loader 层：让期望交易日远在未来（使缓存"过期"）+ 让 akshare 抛错，
+         必然走降级回退，断言 degraded/cache_last_date/lag_days/degraded_reason 齐备；
+      2. cli 层：把上述降级状态注入后跑一次 advise_internal（用 3 个策略把网格
+         压到秒级），断言 data.stale=True 且 diagnostics.warnings 里出现降级说明。
+    """
+    sys.path.insert(0, SRC)
+    os.chdir(SRC)
+    import datetime
+    import akshare as ak
+    from stock_analysis.data_loader import meta
+
+    orig_expected = meta._expected_latest_trade_date
+    orig_hist = getattr(ak, "stock_zh_a_hist", None)
+    problems, obs = [], {}
+    try:
+        # --- 1) 真实走一遍降级路径（不改任何文件：只让缓存"看起来过期"）
+        meta._expected_latest_trade_date = lambda: datetime.date(2030, 1, 1)
+
+        def _boom(**k):
+            raise RuntimeError("probe: simulated network down")
+
+        ak.stock_zh_a_hist = _boom
+        df = meta.get_stock_daily("600519", source="sina")
+        info = meta.last_fetch_info()
+    finally:
+        meta._expected_latest_trade_date = orig_expected
+        if orig_hist is not None:
+            ak.stock_zh_a_hist = orig_hist
+
+    obs["loader"] = {k: info.get(k) for k in
+                     ("source", "from_cache", "degraded", "cache_last_date",
+                      "lag_days", "expected_date")}
+    if df is None or len(df) < 100:
+        problems.append("降级回退未返回可用数据")
+    if not info.get("degraded"):
+        problems.append("degraded 未置 True（降级对调用方不可见）")
+    if info.get("source") != "cache":
+        problems.append(f"source={info.get('source')}（期望 cache）")
+    if not info.get("cache_last_date"):
+        problems.append("cache_last_date 为空")
+    if not info.get("lag_days") or info.get("lag_days") <= 0:
+        problems.append(f"lag_days={info.get('lag_days')}（期望 >0）")
+    if not info.get("degraded_reason"):
+        problems.append("degraded_reason 为空")
+
+    # --- 2) cli 必须把降级写进 warnings 与 data.stale
+    try:
+        import cli
+        from stock_analysis.strategy.registry import build_strategy_signals
+        full = build_strategy_signals()
+        # 每个族取 1 个，把 581 组压到 3 组（约 1s），只为验证接线，不影响 G22/G26
+        fams, picks = {}, []
+        for name in full:
+            fam = name.split("(")[0]
+            if fam not in fams:
+                fams[fam] = name
+                picks.append(name)
+            if len(picks) >= 3:
+                break
+        orig_build = cli.build_strategy_signals
+        orig_get = cli.get_stock_daily
+        try:
+            cli.build_strategy_signals = lambda: {k: full[k] for k in picks}
+            cli.get_stock_daily = lambda *a, **k: df
+            meta._record_fetch("cache", True, degraded=True,
+                               degraded_reason="probe:simulated stale cache",
+                               cache_last_date=info.get("cache_last_date"),
+                               lag_days=info.get("lag_days"),
+                               expected_date=info.get("expected_date"))
+            resp = cli.advise_internal("600519", fast=True)
+        finally:
+            cli.build_strategy_signals = orig_build
+            cli.get_stock_daily = orig_get
+        data = resp.get("data") or {}
+        warns = (resp.get("diagnostics") or {}).get("warnings") or []
+        obs["cli"] = {"stale": data.get("stale"),
+                      "lag_days": data.get("lag_days"),
+                      "warn_hit": any("降级" in str(w) for w in warns)}
+        if data.get("stale") is not True:
+            problems.append(f"data.stale={data.get('stale')}（期望 True）")
+        if not any("降级" in str(w) for w in warns):
+            problems.append("diagnostics.warnings 未包含降级说明（Hermes 无从知晓数据陈旧）")
+    except Exception as e:
+        problems.append(f"cli 接线验证异常: {type(e).__name__}: {e}")
+
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +991,9 @@ def main():
     run("requirements", check_requirements)
     run("a1", check_a1_invariant)
     run("advise", check_advise_keys)
+    # 本轮新增：G33 降级可见性 / G34 --start 生效且不截断缓存
+    run("degrade", check_degrade_visibility)
+    run("start_window", check_start_window)
 
     heavy = {
         "idempotent": check_idempotent,

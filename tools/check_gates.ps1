@@ -142,7 +142,8 @@ if ($null -eq $probe) {
     Add-Gate 'G02' 'CLI --json 契约（C1 纯 JSON + C3 字段齐备 + 真数据）' 'FAIL' "探针未产出可解析 JSON（probe 退出码 $probeExit）。stdout 前 400 字: $($probeOut.Substring(0,[Math]::Min(400,$probeOut.Length)))；stderr 前 400 字: $($probeErr.Substring(0,[Math]::Min(400,$probeErr.Length)))" ($probeOut + "`n--- probe stderr ---`n" + $probeErr)
     foreach ($g in 'G03', 'G04', 'G05', 'G06', 'G07', 'G08', 'G12',
         'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23',
-        'G24', 'G25', 'G26', 'G27', 'G28', 'G29', 'G30', 'G31', 'G32') {
+        'G24', 'G25', 'G26', 'G27', 'G28', 'G29', 'G30', 'G31', 'G32',
+        'G33', 'G34') {
         Add-Gate $g '（探针缺失，无法判定）' 'BLOCKED' 'probe.py 未产出结果'
     }
 }
@@ -170,10 +171,12 @@ else {
         @('win_rate_share', 'G26', '胜率项贡献 ≤ 40%（F07/B1）'),
         @('atr_stop', 'G27', 'ATR 自适应止损生效（F08/B2）'),
         @('walk_forward', 'G28', 'walk-forward 逐折重新寻优（F09/B3）'),
-        @('old_args', 'G29', 'D6 旧参数不报 usage error（F16）'),
+        @('old_args', 'G29', 'D6 旧参数端到端真跑（subprocess，F16）'),
         @('requirements', 'G30', 'requirements 与实测环境一致（F17/D3e）'),
         @('fund_grid_consistency', 'G31', '基金网格单一真源自洽（F15）'),
-        @('fund_cache', 'G32', '失败拉取不写空壳缓存（F20）')
+        @('fund_cache', 'G32', '失败拉取不写空壳缓存（F20）'),
+        @('degrade', 'G33', '数据降级（回退旧缓存）必须对调用方可见（F06f/F20）'),
+        @('start_window', 'G34', '--start 生效且不截断缓存（F20）')
     )
     $quickSkip = @('fund', 'idempotent', 'windows', 'exit_codes', 'type_hint', 'fund_cache')
     foreach ($row in $m) {

@@ -210,7 +210,7 @@ def main():
     L.append("python cli.py 600519 --json --fast      # 股票\n")
     L.append("python cli.py 510300 --json --fast      # 基金\n")
     L.append("python -m pytest tests/ -q              # 测试网（离线）\n")
-    L.append("cd .. && python tools/check_gates.py     # 32 项门禁（ps1 版的等价转写）\n")
+    L.append("cd .. && pwsh -File tools/check_gates.ps1 -Full   # 34 项门禁（唯一权威裁定器）\n")
     L.append("```\n")
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
