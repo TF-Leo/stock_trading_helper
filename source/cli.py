@@ -251,7 +251,8 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
         return create_error_response(
             'data_source_error', "行情拉取失败（渠道池全失败且无可用缓存）",
             code, data_type, type_hint,
-            fetch_info=last_fetch_info(), elapsed=time.time() - start_time)
+            fetch_info=last_fetch_info(), elapsed=time.time() - start_time,
+            requested_start=start)
     if len(df) < 100:
         # C3: 数据太短时 bars/start/end/last_close 都是已知真实值，必须如实填
         return create_error_response(
@@ -259,7 +260,8 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             code, data_type, type_hint,
             bars=len(df), start=df.index[0], end=df.index[-1],
             last_close=float(df['close'].iloc[-1]),
-            fetch_info=last_fetch_info(), elapsed=time.time() - start_time)
+            fetch_info=last_fetch_info(), elapsed=time.time() - start_time,
+            requested_start=start)
 
     fetch_info = last_fetch_info()
     last_close = float(df['close'].iloc[-1])
@@ -312,7 +314,7 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'data_source_error', f"回测失败：{e}", code, data_type, type_hint,
             bars=len(df), start=df.index[0], end=df.index[-1],
             last_close=last_close, fetch_info=fetch_info,
-            elapsed=time.time() - start_time)
+            elapsed=time.time() - start_time, requested_start=start)
 
     # 计算共识 - Fast mode: reduce top_k
     n_bars = len(df)

@@ -1149,6 +1149,75 @@ def check_source_failover():
             "reason": "; ".join(problems), "observed": obs}
 
 
+def check_window_note():
+    """G37：`data.window_note` 必须如实反映 `--start` 截取，且两条路径都不能恒为 null。
+
+    背景（2026-10-18）：`window_note` 这条键在成功与错误路径都存在，
+    但 `create_error_response` 里被**硬编码成 None** —— 即使带 `--start` 也不说明窗口。
+    G35 只比对"键是否存在"，值被写死时它查不出来，于是这个洞一直没人发现。
+
+    判据（三档）：
+      1. 不带 --start        → window_note is None（没有截取，不该编造说明）
+      2. 带 --start 且成功   → window_note 是字符串，含 --start 的日期与真实根数
+      3. 带 --start 且数据太短 → 同样必须是字符串，且根数与 data.bars 一致
+    """
+    import re
+
+    problems, obs = [], {}
+
+    # 1) 不带 --start
+    rec0 = run_cli_json(["600519", "--json", "--fast"])
+    d0 = rec0.get("data")
+    if not d0:
+        return {"status": "BLOCKED", "reason": "无 JSON 输出"}
+    obs["no_start"] = d0["data"].get("window_note")
+    if d0["data"].get("window_note") is not None:
+        problems.append(f"未带 --start 却给了 window_note={d0['data'].get('window_note')!r}")
+
+    # 2) 带 --start 且成功（2025-06-01 起约 334 根，足够回测）
+    rec1 = run_cli_json(["600519", "--json", "--fast", "--start", "20250601"], cache=False)
+    d1 = rec1.get("data")
+    if not d1:
+        problems.append("--start 成功路径无 JSON")
+    else:
+        note = d1["data"].get("window_note")
+        obs["ok_path"] = {"status": d1["recommendation"]["status"],
+                          "bars": d1["data"]["bars"], "note": note}
+        if not isinstance(note, str) or not note:
+            problems.append(f"--start 成功路径 window_note={note!r}（应为带截取说明的字符串）")
+        else:
+            if "20250601" not in note:
+                problems.append(f"window_note 未包含请求日期：{note!r}")
+            m = re.search(r"(\d+)\s*根", note)
+            if not m or int(m.group(1)) != int(d1["data"]["bars"]):
+                problems.append(
+                    f"window_note 根数与 data.bars 不一致：{note!r} vs bars={d1['data']['bars']}")
+
+    # 3) 带 --start 且数据太短（近 40 天 → insufficient_data）
+    from datetime import date, timedelta
+    near = (date.today() - timedelta(days=40)).strftime("%Y%m%d")
+    rec2 = run_cli_json(["600519", "--json", "--fast", "--start", near], cache=False)
+    d2 = rec2.get("data")
+    if not d2:
+        problems.append("--start 错误路径无 JSON")
+    else:
+        note2 = d2["data"].get("window_note")
+        st2 = d2["recommendation"]["status"]
+        obs["err_path"] = {"status": st2, "bars": d2["data"]["bars"], "note": note2}
+        if st2 != "insufficient_data":
+            problems.append(f"近端 --start 未触发 insufficient_data（实际 {st2}），用例前提不成立")
+        elif not isinstance(note2, str) or not note2:
+            problems.append(
+                f"错误路径 window_note={note2!r}（硬编码 None 会让调用方无从知道截了窗口）")
+        else:
+            m2 = re.search(r"(\d+)\s*根", note2)
+            if not m2 or int(m2.group(1)) != int(d2["data"]["bars"]):
+                problems.append(
+                    f"错误路径 window_note 根数与 bars 不一致：{note2!r} vs bars={d2['data']['bars']}")
+
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     out = {}
@@ -1202,6 +1271,7 @@ def main():
     run("start_window", check_start_window)
     run("error_shape", check_error_shape)
     run("source_failover", check_source_failover)
+    run("window_note", check_window_note)
 
     heavy = {
         "idempotent": check_idempotent,

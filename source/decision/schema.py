@@ -222,7 +222,8 @@ def empty_metrics():
 
 def create_error_response(status, message, code, data_type, type_hint='auto',
                           bars=0, start=None, end=None, last_close=None,
-                          fetch_info=None, elapsed=0.0, warnings=None):
+                          fetch_info=None, elapsed=0.0, warnings=None,
+                          requested_start=None):
     """创建错误响应。
 
     C3: 键集合必须与正常响应**同构**；不适用处显式 null，并在
@@ -263,7 +264,10 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'lag_days': fi.get('lag_days'),
             'expected_date': fi.get('expected_date'),
             'requested_source': fi.get('requested_source'),
-            'window_note': None,
+            # 与成功路径同语义：带 --start 时必须如实说明窗口，不能恒为 None。
+            # （G35 只比对"键是否存在"，值被硬编码成 None 时它查不出来 —— 这里补齐值。）
+            'window_note': (f"--start {requested_start} 截取后 {int(bars or 0)} 根"
+                            if requested_start else None),
         },
         'market_regime': {'label': 'Unknown', 'confidence': 0.0,
                           'as_of': None, 'definition': None},

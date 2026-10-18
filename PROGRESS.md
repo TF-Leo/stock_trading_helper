@@ -659,6 +659,59 @@ pwsh check_gates.ps1 -Full   → PASS 36 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退�
 python tools/check_source_parity.py 600519 → 一致，exit 0
 ```
 
+## 1.14 补 `window_note` 的真值 + G37（2026-10-18，为 Hermes 下一轮自查准备）
+
+**起因**：准备给 Hermes 的第三轮自查提示词时，我要求它验证 `data.window_note`。
+写之前先自己验了一遍，发现它在我这边**从来没不是 null**：
+
+```
+cli.py:519  'window_note': (f"--start {start} 截取后 {len(df)} 根" if start else None)   ← 成功路径有值
+schema.py   'window_note': None                                                          ← 错误路径硬编码
+实测 600519 --json --start 20260601 → bars=93 < 100 → 走错误路径 → window_note=None
+```
+
+**这个洞我上一轮刚亲手放进去**：G35 同构改造时我给错误响应补齐了所有**键**，
+但 `window_note` 的**值**被写死成 `None`。而 G35 只比对"键是否存在"，查不出值的问题。
+如果我不验就把它写进 Hermes 的必查清单，等于让它在错误路径上查一个恒为 null 的字段 —— 徒劳。
+
+### 修复
+1. `schema.create_error_response` 增参 `requested_start`，`window_note` 改成与成功路径同语义：
+   `--start 20260601 截取后 93 根`。
+2. `cli.py` 三处调用（数据源失败 / 数据太短 / 回测失败）全部传 `requested_start=start`。
+3. 新增门禁 **G37**，三档断言：
+   - 不带 `--start` → `window_note is None`
+   - `--start` + 成功 → 非空字符串、含请求日期、**根数与 `data.bars` 数值一致**
+   - `--start` + 数据太短 → 同样非空字符串且根数一致
+
+### 实测
+```
+no_start : None
+ok_path  : status=ok                bars=334  note="--start 20250601 截取后 334 根"
+err_path : status=insufficient_data bars=23   note="--start 20260908 截取后 23 根"
+G37 = PASS
+```
+**变异测试**（直接改源码把 `window_note` 改回硬编码 `None`，跑完还原）：
+```
+mutated status = FAIL
+reason = 错误路径 window_note=None（硬编码 None 会让调用方无从知道截了窗口）
+源码 sha256 还原一致 = True        MUTATION_TEST_OK
+```
+> 注：第一次变异测试用了进程内打桩，`PASS` 没变——因为 probe 是通过 **subprocess** 跑 CLI 的，
+> 进程内替换函数无效。改为"改源码 + sha256 校验还原"才是真的，记一笔避免下轮再犯。
+
+### 顺带修掉一个我自己造成的结构损坏
+用 Edit 插入 `check_window_note` 时误插进了 `check_a1_invariant` 体内，
+把它读 CSV 之后的计算逻辑整段带进了新函数 → `check_a1_invariant` 返回 `None`
+→ `probe.py` 在 `for v in out.values(): v.pop(...)` 处 `AttributeError` → **37 项全 BLOCKED**。
+已把逻辑搬回原位，并加了一条自检：**逐个调用所有无参 `check_*`，断言都返回 dict**（当前"异常/非dict: 无"）。
+
+### 收口
+```
+pytest                       → 47 passed
+pwsh check_gates.ps1 -Full   → PASS 37 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0
+```
+
+
 ## 2. 未完成（下一步按此顺序推进）
 
 > 本节为 **2026-10-17 的历史记录**；2026-10-18 的 21 条修复见 §1.5，当前**没有**未完成条目。
