@@ -1,15 +1,16 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
-- **最后更新**：2026-10-18 09:4x（主回合复核的 4 条遗留 + 1 条风险全部处理；门禁 32 → 34 项）
-- **➡️ 本轮结论**：`GOAL_FIXLIST.md` 的 21 条（F01–F21）已完成；主回合复核提出的 4 条遗留 + 1 条风险
-  **本轮全部处理**（详见 §1.7）。门禁从 32 项扩到 **34 项**（新增 G33 降级可见性 / G34 `--start` 生效），
-  `pytest` **45 passed**；`--fast` 墙钟 **58.3s → 9.8s**（218 个输出字段逐字节 0 差异）。
+- **最后更新**：2026-10-18 10:4x（R1/R2/R3 全部处理；门禁 34 → **35 项**，新增 G35 错误路径同构）
+- **➡️ 本轮结论**：主回合第二轮复核提出的 3 条文档/规格缺口（R1 错误路径不同构 / R2 契约未同步 / R3 快照缺列）
+  **本轮全部处理**（详见 §1.9）。门禁 34 → **35 项**（新增 **G35** 错误响应同构，含变异测试），`pytest` **45 → 47 passed**。
 - **⚠️ 权威裁定器仍未由我执行（必须知道）**：宿主 PowerShell 沙箱创建失败
   （`LsSDK_CreateSandbox(ConPTY) 失败(6): LsInject_CrossArch(...)`），我**无法执行 `pwsh -File tools/check_gates.ps1`**。
-  上一轮为此新增的 `tools/check_gates.py`（等价转写）**本轮已删除** —— 它曾在 ps1 判 26 的同一份代码上判 32/0，
-  属分叉的第二裁定器，是假绿风险源。**本轮没有 ps1 原始输出**，只有 `probe.py` 的 27 个 key 全 PASS；
-  **需用户跑一次 `-Full` 确认 34/34 与退出码 0**。
-- **交付判定**：**可以推送给 Hermes**（最小可推送集 F01/F03/F05/F06/F17 均已修完并进门禁）。
+  上一轮为此新增的 `tools/check_gates.py`（等价转写）**已删除** —— 它曾在 ps1 判 26 的同一份代码上判 32/0，
+  属分叉的第二裁定器，是假绿风险源。**本轮同样没有 ps1 原始输出**，只有 `probe.py` 的 **28 个 key 全 PASS**
+  与 ps1 映射表的静态一致性核对（28 行映射 key 与 probe 输出**零差异**，G01–G35 无缺号）；
+  **需用户跑一次 `-Full` 确认 35/35 与退出码 0**。
+- **交付判定**：**可以推送给 Hermes**（最小可推送集 F01/F03/F05/F06/F17 均已修完并进门禁；
+  错误路径已与成功路径同构，Hermes 不必按 status 分支解析）。
 - 报告文件：`gates-report.json`（`runner` 字段标注由哪个裁定器生成）
 - **定时任务**：2026-10-17 19:45 由用户指示全部停用（`ScheduledTaskList` 为空）。
 - **当前状态**：**门禁 14/14 全绿，退出码 0**（用户亲自复核 `-Full`，2026-10-17 19:42），pytest 28 passed，
@@ -285,6 +286,72 @@ tools/check_gates.py                    → 已删除（原遗留 ①）
 并补一条：R1 的同构性问题最好在推送前定调——因为一旦 Hermes 按现状写了防御性解析，之后再补齐错误路径字段反而可能打破它的假设。
 当前 `main` 领先 `origin/main` **19 个提交**（加上我本轮的修复提交后为 20）。
 
+## 1.9 本轮（2026-10-18 10:2x–10:4x）：R1/R2/R3 处理完毕，门禁 34 → 35
+
+### R1 错误响应与成功响应同构（契约 C3）
+**修复前实测**（我亲自跑，不是引用报告）：
+```
+600519 --json --fast                       → 成功路径 134 条键路径 / exit 0
+600519 --json --fast --start 20260701      → insufficient_data 46 条键路径 / exit 20
+只在成功路径存在：88 条（evidence.metrics 全部、n_trials、significant、triggers、
+                        excess_vs_buy_hold、buy_hold_baseline、regime_win_rates、
+                        data 8 字段、instrument 2 字段、market_regime 2 字段、
+                        diagnostics 4 项、recommendation.stop_method）
+只在错误路径存在：0 条
+data.bars = 0，而 invalidation = "数据不足（仅 72 根 < 100）"   ← 同文档自相矛盾
+```
+**改法**（`cli.py`）：
+- 新增 `METRIC_KEYS` / `_empty_metrics()`，错误路径的 `evidence.metrics` 输出 9 项 `{point:null, ci_95:null}`；
+- `create_error_response` 补齐全部区块，不适用处显式 `null`（`horizon_days=[null,null]`、`stop_method=null`、
+  `regime_win_rates={Bull:null,Bear:null,Shock:null}`、`excess_vs_buy_hold` 5 键、`buy_hold_baseline` 2 键…）；
+- `bars/start/end/last_close` 改为**如实传真实值**（数据太短时根数是已知的），拉取彻底失败才为 `0/""/null`；
+- `instrument` 复用 `classify_board()`（不再恒 `unknown`）；
+- `_build_metrics` 末尾加键集合自检，与 `_empty_metrics()` 不一致即 `RuntimeError`（防两侧再次漂移）。
+
+**修复后实测**：
+```
+成功 134 路径 / 错误 116 路径 / 缺失 0 条（排除 candidates[] 与 triggers[] 的元素路径——
+"没有候选/没有触发器"时列表为空才是正确语义）
+data.bars = 23，invalidation = "数据不足（仅 23 根 < 100）"   ← 一致
+horizon_days = [null,null]，stop_method = null，metrics 9 项 point 全 null
+```
+
+### G35（新增门禁）+ 变异测试
+`tools/probe.py::check_error_shape`：真跑两条 CLI，逐路径比对结构，并校验
+`bars` 与 `invalidation` 文本一致、`horizon_days/stop_method/metrics` 为显式 null、`n_trials=0`。
+
+**变异测试（证明断言会咬人，文件已按 sha256 还原）**：
+```
+注入 1: 'bars': int(bars or 0) → 'bars': 0
+注入 2: 删除 'stop_method': None,
+结果: status = FAIL
+      reason = 错误路径缺 1 条路径（前 6 条）: ['/recommendation/stop_method']；
+               data.bars 为 0（数据太短时根数是已知真实值，不得填 0）
+restored_identical = True
+```
+
+### R2 `GOAL_CONTRACT.md` 同步
+- `data` 字段行补 `stale, cache_last_date, lag_days, expected_date, requested_source`，
+  并注明 `source`=实际渠道 / `requested_source`=请求渠道 / `stale=true` 时 warnings 必有说明；
+- `recommendation` 行补 `stop_method|null`；
+- **C3 验收条目补"错误路径同构要求"**（显式 null、`bars` 不得填 0、G35 逐路径比对）。
+
+### R3 `source/docs/validation_600519.md` 补齐（由 `tools/validation_snapshot.py` 生成）
+- `summarize()` 增 `stale / cache_last_date / lag_days / expected_date / requested_source / elapsed_seconds`；
+- 新增 **§6 性能 before/after 三列**：`--fast` 58.3s → **10.91s**；全量 jobs=1 未实测（旧 README 为估算）→ **11.88s**；
+  数据加载 57.0s → 0.01s；并附"全量 vs --fast 的 status/action 相同 = True"；
+- 新增 **§7 C3 同构实测**表（134/116 路径、缺失 0、bars 1643 vs 23、horizon `[9,29]` vs `[None,None]`）；
+- 复现命令里的门禁项数 34 → **35**。
+
+### 本轮实测汇总
+```
+cd source; python -m pytest tests/ -q                → 47 passed in 10.98s（45 → 47，新增 2 条 C3 用例）
+python tools/probe.py all                            → 28 keys，non-pass = 0（100s 级）
+python tools/validation_snapshot.py                  → 快照已重生成，missing=0
+ps1 静态一致性（Python 解析映射表）                    → 28 行映射 key 与 probe 输出零差异；G01–G35 无缺号
+pwsh -File tools/check_gates.ps1 -Full               → ✗ 本会话仍无法执行（沙箱故障，第三次确认）
+```
+
 ## 2. 未完成（下一步按此顺序推进）
 
 > 本节为 **2026-10-17 的历史记录**；2026-10-18 的 21 条修复见 §1.5，当前**没有**未完成条目。
@@ -326,10 +393,20 @@ tools/check_gates.py                    → 已删除（原遗留 ①）
 - [x] **T4 —— B5 consensus 过滤 ✅ 复核确认已实现并接线（2026-10-17 23:1x）**：`decision/consensus.py:44` 已按 `score > -100` 过滤并返回 `valid_count`/`all_invalid`；`cli.py:247` 调用、`cli.py:269` 用 `all_invalid` 参与 `top_valid` 判定。**本台账此前记为"唯一剩余项"属漂移**。但 B5 的"任一族 ≤50%"硬约束仍未作用于对外 `candidates` 字段（见 §3.5 X5），故 **B5 整体不算完成**。
 
 ## 3. 未验证 / 不得声称已过
-- G14 全量模式 ≤300s：**✅ 已验证**（2026-10-17 18:46 `-Full` → G14 PASS）
-- **⚠️ 门禁绿 ≠ 台账全清（防假绿）**：T3-T7 为已知**占位/深化项**（`deflated_sharpe` 输入近常数、`excess_vs_buy_hold` 硬编码 `0.05/[0.02,0.08]`、`market_regime` 恒 `Bull/0.7`、consensus 未过滤无效候选），门禁 G01-G14 **不直接校验**这些实现深度；本轮未动它们（墙钟超限 + 门禁已绿），是否推进留待下轮或人工决策
+- G14 全量模式 ≤300s：**✅ 已验证**（2026-10-17 18:46 `-Full` → G14 PASS；2026-10-18 实测全量 jobs=1 **11.88s**）
+- **⚠️ 本轮（2026-10-18 10:2x–10:4x）没有 ps1 原始输出**：宿主沙箱故障第三次确认，`pwsh -File tools/check_gates.ps1`
+  仍无法执行。本轮门禁证据 = `probe.py all` **28 keys 全 PASS** + ps1 映射表静态一致性核对
+  （28 行映射 key 与 probe 输出零差异、G01–G35 无缺号）。**35/35 需用户跑一次 `-Full` 确认。**
+- **⚠️ 门禁绿 ≠ 台账全清（防假绿）**：T3-T7 的占位实现（`deflated_sharpe` 近常数、`excess_vs_buy_hold` 硬编码、
+  `market_regime` 恒 Bull、consensus 未过滤无效候选）**已由 F03/F04/F06 修复并纳入 G17/G18/G20**；
+  但门禁只校验**输出与行为的自洽**，不校验金融结论是否赚钱 —— 这一点永远不能从"门禁绿"推出。
 - A2/A3/A5…A11 的契约细节：`pytest` 覆盖到的部分已过；未在真实 600519 数据上逐条取证的，一律记为**未验证**
-- 退出码 40（untradeable）路径：未验证
+- 退出码 40（untradeable）路径：**只有单测覆盖，真实数据不可达**（`adaptive_oos_config` 会放大资金，
+  `unaffordable_lot_events` 实测恒 0）→ 不得声称"已验证"
+- 错误路径的**基金侧**（510300 + 近端 `--start`）：**已实测**（2026-10-18 10:4x）
+  → `exit 20 / status insufficient_data / bars=28 / invalidation="仅 28 根 < 100" / horizon=[null,null] /
+  stop_method=null / metrics 9 项 / n_trials=0 / board=fund`，与股票侧同构。
+  但 G35 本身只跑股票侧用例（基金侧走同一 `create_error_response`，属结构性保证）。
 
 ### 3.5 2026-10-17 23:1x 独立复核（用户提问触发；主回合亲自跑门禁 + 逐条核契约）
 

@@ -76,9 +76,9 @@ recommendation{}, evidence{}, candidates[], diagnostics{}, disclaimer
 逐字段：
 - `request`: `code, type, start, opt, jobs, fast`（回显入参，便于 Agent 自证）
 - `instrument`: `code, name, board, price_limit_pct, is_st`；`board` ∈ `sh_main/sh_star/sz_main/sz_gem/bj/fund/unknown`
-- `data`: `bars, start, end, last_close, source, from_cache, window_note`（`window_note` 用于 A7 声明实际窗口）
+- `data`: `bars, start, end, last_close, source, from_cache, stale, cache_last_date, lag_days, expected_date, requested_source, window_note`（`window_note` 用于 A7 声明实际窗口；`source` 为**实际生效渠道**，`requested_source` 为调用方请求的渠道；`stale=true` 表示触网失败后回退了旧缓存，此时 `diagnostics.warnings` 必有说明，`lag_days` 为缓存末日落后期望交易日的自然日数）
 - `market_regime`: `label, confidence, as_of, definition`（`definition` 为字符串标识所用规则版本，满足 A8 单一来源）
-- `recommendation`: `status, action, action_reason[], confidence, position_fraction, horizon_days[2], entry_zone[2]|null, stop_loss|null, take_profit|null, distance_to_trigger{buy_pct,sell_pct}, invalidation, no_edge`
+- `recommendation`: `status, action, action_reason[], confidence, position_fraction, horizon_days[2], entry_zone[2]|null, stop_loss|null, take_profit|null, stop_method|null, distance_to_trigger{buy_pct,sell_pct}, invalidation, no_edge`（`stop_method` 标明止损价来源：`atr` / `fixed`；无回测时为 `null`）
 - `evidence`: `consensus{family, agreement, members[]}`, `dispersion`, `stability{windows_tested, action_stable, family_stable, top_k_overlap_min}`, `n_trials`, `n_survivors`, `deflated_sharpe`, `significant`, `metrics{}`, `excess_vs_buy_hold{point, ci_95[2], significant}`, `buy_hold_baseline{total_return, annual_return}`, `regime_win_rates{}`, `triggers[]`
 - `evidence.metrics` 每项形如 `{"point": float, "ci_95": [float,float]|null}`，必须覆盖：`annual_return, max_drawdown, win_rate, sharpe, calmar, profit_factor`；另有标量 `trade_count, avg_holding_days, time_in_market, max_consecutive_losses`
 - `evidence.triggers[]` 每项：`{"indicator", "current", "buy_trigger", "sell_trigger", "state", "buy_price|null", "sell_price|null"}`
@@ -160,6 +160,7 @@ recommendation{}, evidence{}, candidates[], diagnostics{}, disclaimer
 - [ ] **C2 schema 入文档**。README 必须新增"给 Agent 的接口契约"章节，含：调用示例、完整字段表（名称/类型/含义/可否为 null）、枚举取值、退出码表、一份**真实运行产出**的示例 JSON。
   **验证**：README 中可检索到 `schema_version`、全部 6 个退出码、5 个 `action` 枚举值、5 个 `status` 枚举值；示例 JSON 能被 `json.loads` 成功解析（新增一个测试读取 README 中的 JSON 代码块并解析）。
 - [ ] **C3 字段齐备**。对 600519（股票）与 510300（基金）各运行一次，`recommendation` 与 `evidence` 中"输出契约规格"列出的字段全部存在；不适用时为显式 `null` 并在 `recommendation.action_reason` 或 `diagnostics.warnings` 说明原因。`position_fraction ∈ [0, 0.30]`。
+  **错误路径同样适用（同构要求）**：`insufficient_data` / `data_source_error` 响应的**键集合必须与成功响应一致**，不得整块缺失（`evidence.metrics` 9 项 point 全 `null`、`horizon_days=[null,null]`、`stop_method=null`、`candidates=[]`、`triggers=[]`）；且 `data.bars` 必须是真实根数，不得填 0 而与 `invalidation` 文本自相矛盾。门禁 **G35** 逐路径比对。
   **验证**：新增 `source/tests/test_c_schema.py`，用合成数据分别驱动 `advise_stock` 与 `advise_fund`，对产出的 dict 做**递归键集合校验**（期望键集合以常量形式写在测试里），并断言无 `NaN`/`Infinity`（`json.dumps(..., allow_nan=False)` 不抛异常）。
 - [ ] **C4 无自相矛盾**。属性测试：对任意合成数据，若 `triggers[].state == "sell_triggered"` 则 `action ∈ {sell, hold, avoid}`；若 `== "buy_triggered"` 则 `action ∈ {buy, hold, avoid}`。且 `distance_to_trigger` 的符号必须与 `state` 自洽。
   **验证**：新增 `hypothesis`-free 的参数化测试（枚举 ≥ 20 组合成行情形态：暴涨、暴跌、横盘、单边趋势、极端超买、极端超卖、数据极短、全零成交量等），全部断言通过。特别地，构造 StochRSI=100 的极度超买形态，断言 `action != "buy"`。

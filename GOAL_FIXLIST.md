@@ -1007,3 +1007,37 @@ cProfile（581 组网格）显示 pandas `__getitem__` 被调用 **100 万次、
 - **权威裁定脚本仍未由我执行**：宿主沙箱故障未恢复。
   本轮只跑了 `probe.py`（27 keys 全 PASS）与 `pytest`（45 passed）。
   **G33/G34 已写进 ps1 的映射表（第 145 行与第 176-177 行），但未经实跑确认。**
+
+---
+
+# 0.6 第二轮复核后追加修复（2026-10-18 10:2x–10:4x，门禁 34 → 35）
+
+主回合第二轮复核提出 R1/R2/R3。**全部处理；未放宽任何阈值、未删除任何断言，新增 G35 一条门禁。**
+
+| # | 问题 | 处理 | 门禁 | 实测 |
+|---|---|---|---|---|
+| R1 | 错误响应与成功响应不同构：成功 134 条键路径 / `insufficient_data` 46 条，**88 条只在成功路径**；且 `data.bars=0` 与 `invalidation="仅 72 根 < 100"` 自相矛盾 | `create_error_response` 补齐全部区块，不适用处显式 `null`；`bars/start/end/last_close` 如实传真实值；`instrument` 复用 `classify_board()`；`_build_metrics` 加键集合自检 | **G35**（新增） | 缺失 **0 条**；`bars=23` 与 `invalidation` 一致；`horizon_days=[null,null]`；metrics 9 项 point 全 null |
+| R2 | `GOAL_CONTRACT.md` 未同步 5 个 `data` 字段与 `stop_method` | 契约 `data`/`recommendation` 字段行补齐，并注明 `source`=实际渠道、`requested_source`=请求渠道 | — | 契约与实现逐字一致 |
+| R3 | `validation_600519.md` 缺 `stale/lag_days`、性能缺 before 对照 | 生成器补 6 个字段 + **§6 性能三列** + **§7 C3 同构实测** | — | `--fast` 58.3s → 10.91s；全量 11.88s；缺失 0 |
+
+## G35 判定强度（含变异测试）
+
+`check_error_shape` 真跑两条 CLI（成功 + 近端 `--start` 造 `insufficient_data`），逐路径比对结构，并校验：
+`bars` 与 `invalidation` 文本一致、`horizon_days=[null,null]`、`stop_method=null`、`metrics` 9 项 point 全 null、`n_trials=0`。
+
+变异测试（改文件 → 跑门禁 → 按 sha256 还原）：
+```
+注入 1: 'bars': int(bars or 0) → 'bars': 0
+注入 2: 删除 'stop_method': None,
+→ status = FAIL
+  reason = 错误路径缺 1 条路径（前 6 条）: ['/recommendation/stop_method']；
+           data.bars 为 0（数据太短时根数是已知真实值，不得填 0）
+restored_identical = True
+```
+
+## 本轮未验证项（如实记录）
+
+- **权威裁定脚本仍未由我执行**：宿主沙箱故障（第三次确认）。本轮证据 = `probe.py all` 28 keys 全 PASS
+  + ps1 映射表**静态**一致性核对（28 行映射 key 与 probe 输出零差异、G01–G35 无缺号、BLOCKED 兜底覆盖 G01/G03–G35）。
+  **G35 已写进 ps1 映射表，但未经 ps1 实跑确认。**
+- **G35 只覆盖股票侧**：基金侧走同一 `create_error_response`，但未单独实测。

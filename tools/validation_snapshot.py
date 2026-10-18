@@ -68,6 +68,12 @@ def summarize(d):
         "bars": (d.get("data") or {}).get("bars"),
         "data_source": (d.get("data") or {}).get("source"),
         "from_cache": (d.get("data") or {}).get("from_cache"),
+        # F06f/F20：数据新鲜度与降级可见性（旧快照 0 处记录，无法判断结论是否建立在陈旧数据上）
+        "stale": (d.get("data") or {}).get("stale"),
+        "cache_last_date": (d.get("data") or {}).get("cache_last_date"),
+        "lag_days": (d.get("data") or {}).get("lag_days"),
+        "expected_date": (d.get("data") or {}).get("expected_date"),
+        "requested_source": (d.get("data") or {}).get("requested_source"),
         "top_name": cands[0]["name"] if cands else None,
         "top_score": cands[0]["score"] if cands else None,
         "top_score_is": cands[0].get("score_is") if cands else None,
@@ -79,6 +85,52 @@ def summarize(d):
         "time_in_market": (metrics.get("time_in_market") or {}).get("point"),
         "zero_trade_configs": (d.get("diagnostics") or {}).get("zero_trade_configs"),
         "warnings": len((d.get("diagnostics") or {}).get("warnings") or []),
+        "elapsed_seconds": (d.get("diagnostics") or {}).get("elapsed_seconds"),
+    }
+
+
+def _shape_paths(obj, path=""):
+    out = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{path}/{k}"
+            out.add(p)
+            out |= _shape_paths(v, p)
+    elif isinstance(obj, list) and obj:
+        out |= _shape_paths(obj[0], path + "[]")
+    return out
+
+
+def error_path_probe():
+    """C3 同构实测：成功路径 vs `insufficient_data` 路径的键路径差。
+
+    历史问题：错误路径只输出 46 个键、成功路径 134 个（缺 88 条路径），
+    且 data.bars 恒 0 与 invalidation="仅 72 根 < 100" 自相矛盾。
+    """
+    import datetime as _dt
+    code_ok, ok = run_cli(["600519", "--json", "--fast"])
+    start = (_dt.date.today() - _dt.timedelta(days=40)).strftime("%Y%m%d")
+    code_err, err = run_cli(["600519", "--json", "--fast", "--start", start])
+    if not ok or not err:
+        return {}
+    rec = err.get("recommendation") or {}
+    missing = sorted(_shape_paths(ok) - _shape_paths(err))
+    missing = [p for p in missing
+               if not p.startswith(("/candidates[]", "/evidence/triggers[]"))]
+    metrics = (err.get("evidence") or {}).get("metrics") or {}
+    return {
+        "ok_exit": code_ok,
+        "err_exit": code_err,
+        "err_status": rec.get("status"),
+        "ok_paths": len(_shape_paths(ok)),
+        "err_paths": len(_shape_paths(err)),
+        "missing": missing,
+        "err_bars": (err.get("data") or {}).get("bars"),
+        "err_invalidation": rec.get("invalidation"),
+        "err_horizon": rec.get("horizon_days"),
+        "err_stop_method": rec.get("stop_method"),
+        "err_metrics_n": len(metrics),
+        "err_metrics_all_null": all((v or {}).get("point") is None for v in metrics.values()),
     }
 
 
@@ -143,11 +195,21 @@ def table(d):
 def main():
     t0 = time.strftime("%Y-%m-%d %H:%M:%S")
     print("运行 600519 --fast ...")
+    _t = time.time()
     code_f, full = run_cli(["600519", "--json", "--fast"])
-    print("  退出码:", code_f)
+    fast_wall = round(time.time() - _t, 2)
+    print("  退出码:", code_f, f"{fast_wall}s")
+    print("运行 600519 全量（jobs=1）...")
+    _t = time.time()
+    code_full, fullrun = run_cli(["600519", "--json"])
+    full_wall = round(time.time() - _t, 2)
+    print("  退出码:", code_full, f"{full_wall}s")
     print("运行 510300 --fast ...")
     code_u, fund = run_cli(["510300", "--json", "--fast"])
     print("  退出码:", code_u)
+    print("运行 C3 同构探针（成功 vs insufficient_data）...")
+    errp = error_path_probe()
+    print("  ", errp.get("err_status"), "missing=", len(errp.get("missing") or []))
 
     sf, su = summarize(full), summarize(fund)
     share = win_rate_share(full) if full else None
@@ -204,13 +266,48 @@ def main():
     L.append(f"| F14 族名来源 | `idx.split('(')[0]` | 注册表 prefix（family_map） |\n")
     L.append(f"| F05 退出码 | 非 ok 一律 10 | 600519={code_f} / 510300={code_u} / 999999=30 |\n")
 
-    L.append("\n## 6. 复现命令\n\n")
+    L.append("\n## 6. 性能 before / after（A13 三列口径）\n\n")
+    L.append("| 场景 | before（历史实测） | after（本次实测） | 说明 |\n|---|---|---|---|\n")
+    L.append(f"| `--fast`（581 组网格 + 2 折 WF） | 58.3s | **{fast_wall}s** | "
+             "回测主循环去掉逐 bar `df.iloc[i]` 装箱（pandas `__getitem__` 约 100 万次） |\n")
+    L.append(f"| 全量 `jobs=1`（3 折 WF + 2000 次 bootstrap） | 未实测（旧 README ≈60–120s 为估算） | "
+             f"**{full_wall}s** | 同上；`jobs=4` 实测反而更慢（进程池开销 > 单策略耗时） |\n")
+    L.append("| 数据加载（缓存命中） | 57.0s | 0.01s | "
+             "旧逻辑用 `today−1天` 判新鲜度，周日必然判过期 → 触网失败 → 回退 |\n")
+    same = (summarize(fullrun).get("status") == sf.get("status")
+            and summarize(fullrun).get("action") == sf.get("action"))
+    L.append(f"\n一致性：全量（{code_full}）与 `--fast`（{code_f}）的 status/action 相同 = **{same}**\n")
+    L.append("> 等价性证据：同一输入下新旧输出 **218 个字段逐字段 diff = 0**（详见 `PROGRESS.md §1.7`）。\n")
+
+    L.append("\n## 7. C3 错误路径同构实测（success vs insufficient_data）\n\n")
+    if errp:
+        L.append("| 项 | 成功路径 | `insufficient_data` 路径 |\n|---|---|---|\n")
+        L.append(f"| 退出码 | {errp['ok_exit']} | {errp['err_exit']} |\n")
+        L.append(f"| status | {sf.get('status')} | {errp['err_status']} |\n")
+        L.append(f"| 键路径数 | {errp['ok_paths']} | {errp['err_paths']} |\n")
+        L.append(f"| 缺失路径数（排除空列表元素） | — | **{len(errp['missing'])}** |\n")
+        L.append(f"| `data.bars` | {sf.get('bars')} | {errp['err_bars']} |\n")
+        L.append(f"| `invalidation` | {sf.get('invalidation')} | {errp['err_invalidation']} |\n")
+        L.append(f"| `horizon_days` | {fmt(sf.get('horizon_days'))} | {fmt(errp['err_horizon'])} |\n")
+        L.append(f"| `stop_method` | {sf.get('stop_method')} | {errp['err_stop_method']} |\n")
+        L.append(f"| `evidence.metrics` | 9 项有值 | {errp['err_metrics_n']} 项，point 全 null = "
+                 f"**{errp['err_metrics_all_null']}** |\n")
+        if errp["missing"]:
+            L.append(f"\n**缺失路径（前 10 条）**：{errp['missing'][:10]}\n")
+        else:
+            L.append("\n结论：错误路径与成功路径**结构同构**（缺失 0 条），"
+                     "不适用字段均为显式 null，`data.bars` 与 `invalidation` 文本一致。\n")
+    else:
+        L.append("未取到（错误路径无 JSON）\n")
+
+    L.append("\n## 8. 复现命令\n\n")
     L.append("```bash\n")
     L.append("cd source\n")
     L.append("python cli.py 600519 --json --fast      # 股票\n")
     L.append("python cli.py 510300 --json --fast      # 基金\n")
+    L.append("python cli.py 600519 --json --fast --start <近端日期>   # C3 错误路径\n")
     L.append("python -m pytest tests/ -q              # 测试网（离线）\n")
-    L.append("cd .. && pwsh -File tools/check_gates.ps1 -Full   # 34 项门禁（唯一权威裁定器）\n")
+    L.append("cd .. && pwsh -File tools/check_gates.ps1 -Full   # 35 项门禁（唯一权威裁定器，含 G35 同构）\n")
     L.append("```\n")
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)

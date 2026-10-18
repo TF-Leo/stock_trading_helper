@@ -231,14 +231,28 @@ python cli.py 600519 --start 20200101 --json
 - **action_reason**: 行动理由列表（字符串数组）
 - **confidence**: 置信度（0-1 浮点数）= `0.4×DSR + 0.3×consensus.agreement + 0.2×stability + 0.1×min(trade_count/60,1)`
 - **position_fraction**: 仓位比例（0-0.30 浮点数），`action ∈ {avoid, insufficient_data}` 时为 0
-- **horizon_days**: 时间窗口 `[max(2,⌊0.5×平均持仓⌋), min(60,⌈1.5×平均持仓⌉)]`
+- **horizon_days**: 时间窗口 `[max(2,⌊0.5×平均持仓⌋), min(60,⌈1.5×平均持仓⌉)]`；无回测（错误路径）时为 `[null, null]`
 - **entry_zone**: 入场区间 `[last−0.5ATR, last+0.5ATR]`（不低于最近买入触发价）；`action=sell` 时为 null
 - **stop_loss**: 止损价 = `last − 2.5×ATR(14)`，`stop_distance` 被 clamp 到 `[0.03, 0.20]`；无 ATR 时用 `BacktestConfig.stop_loss_pct`（0.08）
 - **take_profit**: 止盈价 = `last + 4.0×ATR(14)`；无 ATR 时用 `take_profit_pct`（0.15）
-- **stop_method**: `"atr"` 或 `"fixed"` —— 明确告诉调用方止损是用哪种口径算的（**与回测引擎同一口径**）
+- **stop_method**: `"atr"` 或 `"fixed"` —— 明确告诉调用方止损是用哪种口径算的（**与回测引擎同一口径**）；无回测（错误路径）时为 null
 - **distance_to_trigger**: `{buy_pct, sell_pct}`，由"最近一次该向信号所在 bar 的收盘价"与 `last_close` 实算；无该向信号时为 null
 - **invalidation**: 失效条件，模板 `收盘跌破 {stop_loss}，或 {family} 族共识转为看空，或 {n} 个交易日内未触发入场`
 - **no_edge**: 是否无优势（布尔值），恒等于 `status == "no_edge"`
+
+### 错误响应与成功响应同构（C3）
+
+`status ∈ {insufficient_data, data_source_error}` 时，响应的**键集合与成功响应一致**，
+只是不适用的字段为显式 `null` —— 调用方**不需要按 status 分支写防御性解析**：
+
+- `evidence.metrics` 仍有 9 项，每项 `{"point": null, "ci_95": null}`
+- `evidence.n_trials = 0`、`significant = false`、`consensus.family = null`、`triggers = []`
+- `recommendation.horizon_days = [null, null]`、`stop_loss/take_profit/stop_method = null`、`position_fraction = 0.0`
+- `data.bars/start/end/last_close` 在"数据太短"时是**已知真实值**（如 `bars=23`），与 `invalidation` 文本一致；拉取彻底失败时才为 `0 / "" / null`
+- `candidates = []`（没有候选才是正确语义，不是缺字段）
+
+> 门禁 **G35** 逐路径比对成功响应与 `insufficient_data` 响应的结构（排除空列表的元素路径），
+> 任一字段整块缺失即翻红。这条门禁是为了防止"契约写着显式 null、实现整块缺失"再次发生。
 
 ### evidence.metrics
 每个指标包含：
@@ -265,7 +279,7 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
 ```json
 {
   "schema_version": "1.0",
-  "generated_at": "2026-10-18T09:28:02.952492",
+  "generated_at": "2026-10-18T10:34:33.471955",
   "request": { "code": "600519", "type": "stock", "type_hint": "auto", "start": null, "opt": "grid", "jobs": 1, "fast": true },
   "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false },
   "data": { "bars": 1643, "start": "2020-01-02 00:00:00", "end": "2026-10-16 00:00:00", "last_close": 1329.0, "source": "cache", "from_cache": true, "stale": false, "cache_last_date": "2026-10-16", "lag_days": 0, "expected_date": "2026-10-16", "requested_source": "sina", "window_note": null },
@@ -326,13 +340,13 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
     "zero_trade_configs": 19,
     "survivor_configs": 484,
     "warnings": [],
-    "elapsed_seconds": 9.79
+    "elapsed_seconds": 9.3
   },
   "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
 }
 ```
 
-> 上表数值取自 2026-10-18 09:28 对 600519 的真实运行（`--fast`，1643 根），
+> 上表数值取自 2026-10-18 10:34 对 600519 的真实运行（`--fast`，1643 根），
 > 为便于阅读删减了 `candidates` 其余 9 条；**完整未删减样例**见
 > `source/docs/example_output_600519.json`（同样由命令现跑生成）。
 

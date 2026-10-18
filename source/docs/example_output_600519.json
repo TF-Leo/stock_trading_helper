@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "generated_at": "2026-10-18T09:28:02.952492",
+  "generated_at": "2026-10-18T10:34:33.471955",
   "request": {
     "code": "600519",
     "type": "stock",
@@ -319,7 +319,7 @@
     "zero_trade_configs": 19,
     "survivor_configs": 484,
     "warnings": [],
-    "elapsed_seconds": 9.79
+    "elapsed_seconds": 9.3
   },
   "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
 }
