@@ -4,6 +4,13 @@
 
 本项目提供 `python cli.py <code> --json` 命令行接口，输出单一 JSON 文档。底层由可导入函数 `advise()` 产出同一 schema。
 
+> **⚠️ 先说最重要的一条（读取方必读）**：`recommendation.status != "ok"` 时，
+> `horizon_days` 可能是 `[null, null]`，`entry_zone` / `stop_loss` / `take_profit` / `stop_method` 可能是 `null`。
+> **这些字段必须先判空再运算**（详见 [错误响应与成功响应同构（C3）](#错误响应与成功响应同构c3) 的实测清单）：
+> 直接 `horizon_days[0] * 2`、`stop_loss * 0.95`、`entry_zone[0]` 都会抛 `TypeError`；
+> 而 `position_fraction * 资金` 会**静默**得到 `0`、`f"{horizon_days[1]} 天内"` 会**静默**得到 `"None 天内"` ——
+> 这两个不报错但结论是错的，更危险。
+
 ## 调用方式
 
 ```bash
@@ -253,6 +260,36 @@ python cli.py 600519 --start 20200101 --json
 
 > 门禁 **G35** 逐路径比对成功响应与 `insufficient_data` 响应的结构（排除空列表的元素路径），
 > 任一字段整块缺失即翻红。这条门禁是为了防止"契约写着显式 null、实现整块缺失"再次发生。
+
+#### 判空清单（实测，2026-10-18）
+
+下表是**真实运行**（`--start` 造成 `insufficient_data`）得到的字段值，以及**朴素写法会怎样**：
+
+| 字段（错误路径取值） | 朴素写法 | 实测结果 |
+|---|---|---|
+| `horizon_days = [null, null]` | `horizon_days[0] * 2` | ❌ `TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'` |
+| `horizon_days = [null, null]` | `f"{horizon_days[1]} 天内"` | ⚠️ **不报错**，得到 `"None 天内"` —— 静默产出畸形结论 |
+| `stop_loss = null` | `stop_loss * 0.95` | ❌ `TypeError: unsupported operand type(s) for *: 'NoneType' and 'float'` |
+| `entry_zone = null` | `entry_zone[0]` | ❌ `TypeError: 'NoneType' object is not subscriptable` |
+| `position_fraction = 0.0` | `position_fraction * 100000` | ⚠️ **不报错**，得到 `0.0` —— 静默得到"0 股/0 仓"，容易被当成真实结论 |
+| `distance_to_trigger = {buy_pct: null, sell_pct: null}` | `distance_to_trigger["buy_pct"] < 0` | ❌ `TypeError: '<' not supported between instances of 'NoneType' and 'int'` |
+
+**推荐的读取顺序**：
+
+```python
+r = doc["recommendation"]
+if r["status"] != "ok":
+    # 不要继续算价位与仓位；只向用户转述 r["invalidation"] 与 diagnostics["warnings"]
+    return {"usable": False, "reason": r["invalidation"]}
+
+# status == "ok" 之后，这些字段仍有可能是 null（例如无该向信号时的 distance_to_trigger）
+stop = r["stop_loss"]
+if stop is not None:
+    ...
+```
+
+> 为什么保留"静默"而不是抛错：`position_fraction` 用 `0.0` 表达"不该建仓"是语义正确的，
+> 但读取方**必须区分"0 表示不建仓"与"0 因为没算出来"**——判据是 `recommendation.status`。
 
 ### evidence.metrics
 每个指标包含：
