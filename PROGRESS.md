@@ -349,8 +349,59 @@ cd source; python -m pytest tests/ -q                → 47 passed in 10.98s（4
 python tools/probe.py all                            → 28 keys，non-pass = 0（100s 级）
 python tools/validation_snapshot.py                  → 快照已重生成，missing=0
 ps1 静态一致性（Python 解析映射表）                    → 28 行映射 key 与 probe 输出零差异；G01–G35 无缺号
-pwsh -File tools/check_gates.ps1 -Full               → ✗ 本会话仍无法执行（沙箱故障，第三次确认）
+pwsh -File tools/check_gates.ps1 -Full               → ✗ 子 Agent 会话无法执行（沙箱故障，第三次确认）；**主回合已代为执行，见 §1.9**
 ```
+
+## 1.9 主回合第三轮独立复核（2026-10-18 11:0x–11:3x）
+
+**结论：R1/R2/R3 全部真实交付，我逐一实测确认。但子 Agent 预测的"PASS 35 退出码 0"在它提交时是**错的**——实测 `FAIL 1`。根因是它自己把 `cli.py` 撑到 765 行、踩了契约 D4 的 700 行硬上限。已由我修复至 672 行并加强 G35。**
+
+### 一、权威裁定器：子 Agent 的三次"预测"与实测
+
+| | 它说 | 我实测 |
+|---|---|---|
+| 第一轮 | 34/34 退出码 0 | **FAIL：26**（ps1 的 `2>&1` 把 stderr 混进 JSON） |
+| 第二轮 | 34/34 退出码 0 | **PASS 34 / 0** ✅ |
+| 第三轮 | 35/35 退出码 0 | **`PASS 34 \| FAIL 1 → 退出码 1`**；唯一红项 G10：`cli.py 765 行 > 700` |
+
+**这是同一类事故的第三次**：它每次都做了"静态一致性检查"（映射 key 零差异、G01–G35 无缺号），但这只覆盖 probe 驱动的门禁，**覆盖不到 `check_gates.ps1` 里独立实现的静态门禁**（G09/G10/G11/G13）。它自己写的"这只防得住 key 名对不上，不能替代 ps1 实跑"是对的——但结论仍下早了。
+
+> 值得记一笔：本轮它**主动反驳**了我上轮"R1 是契约层决策、怕打破 Hermes 假设"的说法，理由站得住——契约 C3 原文就是"不适用时为显式 null"，实现整块缺失属**违约**而非"另一种设计选择"；且给错误路径**增加**键对 `.get(k, default)` 的读取方零影响。**这个反驳我接受**，判断比我上轮更准。
+
+### 二、R1/R2/R3 实测确认（我亲自跑）
+
+- **R1 错误路径同构**：成功路径 **134** 条键路径、错误路径 **116** 条，缺 **18** 条且**全部是 `candidates[]` / `evidence.triggers[]` 的元素路径**——"没有候选时列表为空"是正确语义，故实际缺失 **0**。
+  `data.bars=72` 与 `invalidation="数据不足（仅 72 根 < 100）"` **一致**（此前恒 0，同文档互相打脸）；
+  `horizon_days=[null,null]`、`stop_method=null`、`metrics` 9 项 `point` 全 null。**基金侧 510300 同样同构**。
+- **R2 契约同步**：`GOAL_CONTRACT.md` 中 `stale`/`cache_last_date`/`lag_days`/`expected_date`/`requested_source`/`stop_method`/`同构`/`G35` **均已命中**（上轮 0 处）。
+- **R3 快照三列**：`validation_600519.md` 中 `stale`/`lag_days`/`58.3`/`10.91`/`57.0`/`同构`/`G35` **均已命中**。
+- **G35 判据是实的**（非空转）：①逐路径比对（排除列表元素）②`data.bars` 必须非 0 且等于 `invalidation` 文本里的根数 ③不适用字段必须显式 null。
+
+### 三、我本轮动手的 3 处
+
+1. **修 G10 违规（解除唯一红项）**：把 `create_error_response` / `METRIC_KEYS` / `_empty_metrics`
+   从 `cli.py` 迁到 `decision/schema.py`（契约模块布局本来就把"结构定义"归该文件），`cli.py` 保留同名 re-export 以免动调用点。
+   **`cli.py` 765 → 672 行（≤700）**；`schema.py` 203 → 313 行。**没有放宽 G10 阈值**（AGENTS.md §4）。
+   迁移动因不只是行数：错误响应与成功响应"同构"本就是 schema 职责，散在 CLI 里才是它反复漂移的原因。
+2. **G35 从单标的扩到双标的**：原实现只跑 `600519`，基金侧仅是"走同一函数"的结构性保证。
+   现改为 `600519` + `510300` 双循环，并加基金特有断言（`instrument.board=='fund'`、`price_limit_pct` 非 null）。这是**加强**。
+3. **变异测试证明扩展后的 G35 会咬人**：在进程内篡改基金错误路径（`board→unknown`、`bars→0`、`horizon_days→[1,5]`），
+   三条全部被抓 → `FAIL`（`MUTATION_TEST_OK`）。不是"我写了断言所以它会生效"。
+
+### 四、最终实测
+```
+pwsh -File tools/check_gates.ps1 -Full  → PASS 35 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0
+cd source; python -m pytest tests/ -q   → 47 passed in 9.42s
+cli.py 672 行（上限 700）| probe.py 1178 | schema.py 313
+G35 observed: 600519 {ok_paths:134, err_paths:116, missing:0, bars:23}
+              510300 {ok_paths:134, err_paths:116, missing:0, bars:23}
+```
+
+### 五、推送前仍建议确认的一件事
+本轮**改变了错误响应的输出形状**（新增 88 条键路径；`horizon_days` 可能是 `[null,null]`）。
+契约要求如此，但对下游是破坏性变更：若 Hermes 侧对 `horizon_days[0]` 直接做算术，会拿到 `None`。
+建议在 README 的契约章节**显式加一句**"错误路径下 `horizon_days`/`stop_loss`/`take_profit`/`stop_method` 均为 null，读取方须判空"，
+再推送 `ahead 24`。
 
 ## 2. 未完成（下一步按此顺序推进）
 

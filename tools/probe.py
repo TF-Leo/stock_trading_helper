@@ -626,55 +626,82 @@ def check_error_shape():
     import re
     from datetime import date, timedelta
 
-    ok_rec = run_cli_json(["600519", "--json", "--fast"])
-    ok = ok_rec.get("data")
-    if not ok:
-        return {"status": "BLOCKED", "reason": "成功路径无 JSON，无法比对结构"}
+    import re
+    from datetime import date, timedelta
+
+    problems = []
+    observed = {}
     # 用近端 --start 造"数据太短"场景：约 28 个交易日 → insufficient_data(20)
     start = (date.today() - timedelta(days=40)).strftime("%Y%m%d")
-    err_rec = run_cli_json(["600519", "--json", "--fast", "--start", start], cache=False)
-    err = err_rec.get("data")
-    if not err:
-        return {"status": "FAIL",
-                "reason": f"错误路径无 JSON（exit={err_rec.get('exit')}）"}
-    rec = err.get("recommendation") or {}
-    status = rec.get("status")
-    if status != "insufficient_data":
-        return {"status": "FAIL",
-                "reason": f"--start {start} 未触发 insufficient_data（实际 {status}），用例前提不成立"}
+    # 2026-10-18 加强：原先只跑股票侧，基金侧"走同一函数"仅是结构性保证。
+    # 基金的数据源/board/price_limit 与股票不同，必须独立覆盖，否则同构回归查不到。
+    for code, want_board in (("600519", None), ("510300", "fund")):
+        ok_rec = run_cli_json([code, "--json", "--fast"])
+        ok = ok_rec.get("data")
+        if not ok:
+            return {"status": "BLOCKED",
+                    "reason": f"{code} 成功路径无 JSON，无法比对结构"}
+        err_rec = run_cli_json([code, "--json", "--fast", "--start", start],
+                               cache=False)
+        err = err_rec.get("data")
+        if not err:
+            problems.append(f"{code} 错误路径无 JSON（exit={err_rec.get('exit')}）")
+            continue
+        rec = err.get("recommendation") or {}
+        status = rec.get("status")
+        observed[code] = {"err_exit": err_rec.get("exit"), "err_status": status,
+                          "ok_paths": len(_shape_paths(ok)),
+                          "err_paths": len(_shape_paths(err))}
+        if status != "insufficient_data":
+            problems.append(
+                f"{code} --start {start} 未触发 insufficient_data（实际 {status}），用例前提不成立")
+            continue
 
-    missing = sorted(_shape_paths(ok) - _shape_paths(err))
-    missing = [p for p in missing
-               if not p.startswith(("/candidates[]", "/evidence/triggers[]"))]
-    problems = []
-    if missing:
-        problems.append(f"错误路径缺 {len(missing)} 条路径（前 6 条）: {missing[:6]}")
+        missing = sorted(_shape_paths(ok) - _shape_paths(err))
+        missing = [p for p in missing
+                   if not p.startswith(("/candidates[]", "/evidence/triggers[]"))]
+        if missing:
+            problems.append(f"{code} 错误路径缺 {len(missing)} 条路径（前 6 条）: {missing[:6]}")
+        observed[code]["missing_paths"] = len(missing)
 
-    bars = (err.get("data") or {}).get("bars")
-    m = re.search(r"(\d+)\s*根", str(rec.get("invalidation", "")))
-    if not bars:
-        problems.append("data.bars 为 0（数据太短时根数是已知真实值，不得填 0）")
-    elif m and int(m.group(1)) != int(bars):
-        problems.append(f"data.bars={bars} 与 invalidation 文本的 {m.group(1)} 根不一致")
+        bars = (err.get("data") or {}).get("bars")
+        observed[code]["bars"] = bars
+        m = re.search(r"(\d+)\s*根", str(rec.get("invalidation", "")))
+        if not bars:
+            problems.append(
+                f"{code} data.bars 为 0（数据太短时根数是已知真实值，不得填 0）")
+        elif m and int(m.group(1)) != int(bars):
+            problems.append(
+                f"{code} data.bars={bars} 与 invalidation 文本的 {m.group(1)} 根不一致")
 
-    if rec.get("horizon_days") != [None, None]:
-        problems.append(f"horizon_days={rec.get('horizon_days')}（无回测时应为显式 [null,null]）")
-    if rec.get("stop_method") is not None:
-        problems.append(f"stop_method={rec.get('stop_method')}（无回测时应为 null）")
-    metrics = (err.get("evidence") or {}).get("metrics") or {}
-    if len(metrics) != 9:
-        problems.append(f"evidence.metrics 应为 9 项，实际 {len(metrics)} 项")
-    elif any((v or {}).get("point") is not None for v in metrics.values()):
-        problems.append("evidence.metrics 存在非 null 的 point（无回测时不得有数值）")
-    if (err.get("evidence") or {}).get("n_trials") != 0:
-        problems.append("evidence.n_trials 应为 0（未评估任何配置）")
+        if rec.get("horizon_days") != [None, None]:
+            problems.append(
+                f"{code} horizon_days={rec.get('horizon_days')}（无回测时应为显式 [null,null]）")
+        if rec.get("stop_method") is not None:
+            problems.append(
+                f"{code} stop_method={rec.get('stop_method')}（无回测时应为 null）")
+        metrics = (err.get("evidence") or {}).get("metrics") or {}
+        if len(metrics) != 9:
+            problems.append(f"{code} evidence.metrics 应为 9 项，实际 {len(metrics)} 项")
+        elif any((v or {}).get("point") is not None for v in metrics.values()):
+            problems.append(
+                f"{code} evidence.metrics 存在非 null 的 point（无回测时不得有数值）")
+        if (err.get("evidence") or {}).get("n_trials") != 0:
+            problems.append(f"{code} evidence.n_trials 应为 0（未评估任何配置）")
+
+        # 基金侧额外断言：错误响应里的板块分类也必须走 classify_board()
+        if want_board is not None:
+            got_board = (err.get("instrument") or {}).get("board")
+            if got_board != want_board:
+                problems.append(
+                    f"{code} 错误路径 instrument.board={got_board}（期望 {want_board}）")
+            got_limit = (err.get("instrument") or {}).get("price_limit_pct")
+            if got_limit is None:
+                problems.append(f"{code} 错误路径 instrument.price_limit_pct 为 null")
 
     return {"status": "PASS" if not problems else "FAIL",
             "reason": "; ".join(problems),
-            "observed": {"err_exit": err_rec.get("exit"), "err_status": status,
-                         "bars": bars, "missing_paths": len(missing),
-                         "ok_paths": len(_shape_paths(ok)),
-                         "err_paths": len(_shape_paths(err))}}
+            "observed": observed}
 
 
 def check_degrade_visibility():

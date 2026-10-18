@@ -201,3 +201,113 @@ class JSONOutput:
     candidates: List[Candidate]
     diagnostics: Diagnostics
     disclaimer: str
+
+
+# ---------------------------------------------------------------------------
+# C3：响应构造（2026-10-18 从 cli.py 迁入）
+# 契约 D4 要求 cli.py ≤ 700 行，且模块布局把"结构定义"归到本文件。
+# 迁入的动因：错误响应与成功响应必须**同构**（不适用处显式 null），
+# 这属于 schema 职责，不该散落在 CLI 里。
+# ---------------------------------------------------------------------------
+METRIC_KEYS = (
+    'annual_return', 'max_drawdown', 'win_rate', 'sharpe', 'calmar',
+    'profit_factor', 'trade_count', 'avg_holding_days', 'time_in_market',
+)
+
+
+def empty_metrics():
+    """C3: 指标块不适用时逐项显式 null（键集合必须与 cli._build_metrics 完全一致）。"""
+    return {k: {'point': None, 'ci_95': None} for k in METRIC_KEYS}
+
+
+def create_error_response(status, message, code, data_type, type_hint='auto',
+                          bars=0, start=None, end=None, last_close=None,
+                          fetch_info=None, elapsed=0.0, warnings=None):
+    """创建错误响应。
+
+    C3: 键集合必须与正常响应**同构**；不适用处显式 null，并在
+    action_reason / diagnostics.warnings 说明原因。
+
+    历史问题：错误响应只输出 46 个键、成功路径 134 个 —— 缺 88 条路径
+    （evidence.metrics / n_trials / significant / triggers / data 8 字段 / stop_method …），
+    且 data.bars 恒 0 与同文档 invalidation="仅 72 根 < 100" 自相矛盾。
+    """
+    from .instrument import classify_board
+
+    fi = dict(fetch_info or {})
+    try:
+        board, price_limit_pct, is_st = classify_board(code)
+    except Exception:
+        board, price_limit_pct, is_st = 'unknown', None, None
+    notes = list(warnings or [])
+    if message not in notes:
+        notes.insert(0, message)
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'generated_at': datetime.datetime.now().isoformat(),
+        'request': {'code': code, 'type': data_type, 'type_hint': type_hint,
+                    'start': None, 'opt': 'grid', 'jobs': 1, 'fast': False},
+        'instrument': {'code': code, 'name': '', 'board': board,
+                       'price_limit_pct': price_limit_pct, 'is_st': is_st},
+        'data': {
+            # bars/start/end/last_close 在"数据太短"时是**已知的真实值**，
+            # 必须如实填（此前恒 0/''/0，与 invalidation 文本互相打脸）
+            'bars': int(bars or 0),
+            'start': '' if start is None else str(start),
+            'end': '' if end is None else str(end),
+            'last_close': None if last_close is None else round(float(last_close), 4),
+            'source': fi.get('source'),
+            'from_cache': fi.get('from_cache'),
+            'stale': (None if 'degraded' not in fi else bool(fi.get('degraded'))),
+            'cache_last_date': fi.get('cache_last_date'),
+            'lag_days': fi.get('lag_days'),
+            'expected_date': fi.get('expected_date'),
+            'requested_source': fi.get('requested_source'),
+            'window_note': None,
+        },
+        'market_regime': {'label': 'Unknown', 'confidence': 0.0,
+                          'as_of': None, 'definition': None},
+        'recommendation': {
+            'status': status,
+            'action': 'insufficient_data' if status in ('insufficient_data', 'data_source_error') else 'avoid',
+            'action_reason': [message],
+            'confidence': 0.0,
+            'position_fraction': 0.0,
+            # 未知持仓时长时给 [null, null] 而不是编造 [1, 5]
+            'horizon_days': [None, None],
+            'entry_zone': None,
+            'stop_loss': None,
+            'take_profit': None,
+            'stop_method': None,
+            'distance_to_trigger': {'buy_pct': None, 'sell_pct': None},
+            'invalidation': message,
+            'no_edge': True,
+        },
+        'evidence': {
+            'consensus': {'family': None, 'agreement': None, 'members': []},
+            'dispersion': None,
+            'stability': {'action_stable': None, 'family_stable': None,
+                          'windows_tested': 0, 'top_k_overlap_min': None},
+            'n_trials': 0,
+            'n_survivors': 0,
+            'deflated_sharpe': None,
+            'significant': False,
+            'metrics': empty_metrics(),
+            'excess_vs_buy_hold': {'point': None, 'ci_95': None,
+                                   'p_positive': None, 'n_obs': 0,
+                                   'benchmark': 'buy_and_hold_close'},
+            'buy_hold_baseline': {'total_return': None, 'annual_return': None},
+            'regime_win_rates': {'Bull': None, 'Bear': None, 'Shock': None},
+            'triggers': [],
+        },
+        'candidates': [],
+        'diagnostics': {
+            'unaffordable_lot_events': 0,
+            'blocked_by_limit_events': 0,
+            'zero_trade_configs': 0,
+            'survivor_configs': 0,
+            'warnings': notes,
+            'elapsed_seconds': round(float(elapsed or 0.0), 2),
+        },
+        'disclaimer': '本结果不构成投资建议，市场有风险，投资需谨慎。',
+    }
