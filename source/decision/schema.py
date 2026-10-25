@@ -235,6 +235,7 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
     """
     from .instrument import classify_board
     from .signals import null_signal as _null_signal
+    from .evaluate import null_stats
 
     fi = dict(fetch_info or {})
     try:
@@ -299,6 +300,11 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'n_survivors': 0,
             'deflated_sharpe': None,
             'significant': False,
+            # F27: 证据等级三档；无数据时全部显式 null（G35 同构）
+            'edge': {'verdict': None, 'point': None, 'ci_95': None,
+                     'p_positive': None, 'n_obs': 0, 'dsr': None, 'dsr_ok': None},
+            # F28: 信号级统计；无信号时保留键、值为 null
+            'signal_stats': null_stats('无可用信号，无法统计'),
             'metrics': empty_metrics(),
             'excess_vs_buy_hold': {'point': None, 'ci_95': None,
                                    'p_positive': None, 'n_obs': 0,

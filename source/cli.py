@@ -36,12 +36,11 @@ from decision.scoring import (  # noqa: F401
     stat_calmar,
     stat_win_rate,
     stat_profit_factor,
+    edge_assessment,
 )
 from decision.consensus import select_consensus
 from decision.triggers import evaluate_triggers
-from decision import signals as sig_mod
-from decision import actions as act_mod
-from decision import render as rnd_mod
+from decision import signals as sig_mod, actions as act_mod, render as rnd_mod, evaluate as ev_mod
 
 # ---------------------------------------------------------------------------
 # tests/ 契约入口（source/tests/test_p2_engineering.py::test_cli_offline_import_and_fund_split）
@@ -397,6 +396,8 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     signal_block = sig_mod.build(df, signals['buy'], signals['sell'],
                                  strategy=best_name, indicator=_indicator)
     triggers = evaluate_triggers(df, {best_name: signals}, signal_block=signal_block)
+    # F28: 信号级统计（每次买卖点后 1/3/5/10/20 日收益、误报率、踏空成本）
+    stats_block = ev_mod.signal_stats(df, signals['buy'], signals['sell'], strategy=best_name)
     if signal_block['current_value'] is None:
         warnings.append(
             f"策略族 '{_family}' 未提供可复算的指标值：trigger.current 为 null（不以收盘价顶替）")
@@ -427,17 +428,11 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     top_score = final_candidates[0]['score'] if final_candidates else -100.0
     # 双重判定：候选自身有效 + 共识层没有"全员无效"标记（B5 过滤后的结果）
     top_valid = (top_score > -100) and not bool(consensus.get('all_invalid'))
-    # F04: significant 必须同时满足 DSR>0 与超额收益 CI 上界>0
-    significant = bool(dsr > 0 and exc_ci_hi > 0)
-    # F26/F27: 证据等级（契约 §6.3）。判据是"区间下界>0"才算有正优势，
-    # 而不是"上界>0"（后者只说明"不能排除正收益"，002415 曾因此 p=3.5% 仍报显著）。
-    exc_ci_lo = float((exc.get('ci_95') or [0.0, 0.0])[0])
-    if exc_n >= 3 and exc_ci_lo > 0:
-        edge_verdict = 'positive_significant'
-    elif exc_n >= 3 and exc_ci_hi <= 0:
-        edge_verdict = 'negative_significant'
-    else:
-        edge_verdict = 'inconclusive'
+    # F27: 证据等级三档（判据 = CI **下界**>0，而非"不能排除正收益"）
+    edge_verdict, edge_block, _edge_warn = edge_assessment(exc, dsr)
+    significant = bool(edge_verdict == 'positive_significant' and dsr > 0)
+    if _edge_warn:
+        warnings.append(_edge_warn)
     # F26: 原"最近 15 根全部为真"过滤器已删除。均线交叉是**单根事件**，
     # 连续 15 根全为真在数学上不可能，该条件只会把事件型策略的 action 钉死为 hold
     # （002415 在 10-22 的 hold 就是这么来的）。动作改由 decision.actions.decide() 产出。
@@ -570,6 +565,10 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'n_survivors': int((comparison['交易次数'].astype(int) > 5).sum()),
             'deflated_sharpe': round(dsr, 3),
             'significant': significant,
+            # F27: 证据等级三档（positive_significant / inconclusive / negative_significant）
+            'edge': edge_block,
+            # F28: 信号级评价（买卖点后的实际走势，回答"这条提示准不准"）
+            'signal_stats': stats_block,
             'metrics': _build_metrics(result, fast),
             'excess_vs_buy_hold': exc,
             'buy_hold_baseline': calc_buy_hold_baseline(df, config),

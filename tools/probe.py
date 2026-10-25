@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -329,7 +330,11 @@ def check_n_trials(stock_data=None, fund_data=None):
 
 
 def check_significance(stock_data=None):
-    """G18：significant / no_edge 必须与超额收益 CI 自洽（F04/B8）。"""
+    """G18：significant / no_edge 必须与超额收益 CI 自洽。
+
+    F27 收紧：`significant` 只表示"统计上可证明有正超额优势"（CI **下界**>0 且 DSR>0），
+    不再是"不能排除正收益"（CI 上界>0）——后者让 002415 在 p_positive=3.5% 时仍报显著。
+    """
     if stock_data is None:
         return {"status": "BLOCKED", "reason": "无股票输出"}
     ev = stock_data.get("evidence") or {}
@@ -339,17 +344,17 @@ def check_significance(stock_data=None):
     dsr = ev.get("deflated_sharpe")
     sig = ev.get("significant")
     problems = []
-    expect_sig = bool((dsr or 0) > 0 and ci[1] > 0)
+    expect_sig = bool((dsr or 0) > 0 and ci[0] > 0)
     if bool(sig) != expect_sig:
-        problems.append(f"significant={sig} 与 (dsr>0 and ci_hi>0)={expect_sig} 矛盾"
-                        f"（dsr={dsr}, ci_hi={ci[1]}）")
+        problems.append(f"significant={sig} 与 (dsr>0 and ci_lo>0)={expect_sig} 矛盾"
+                        f"（dsr={dsr}, ci_lo={ci[0]}）")
     if rec.get("no_edge") != (rec.get("status") == "no_edge"):
         problems.append(f"no_edge={rec.get('no_edge')} 与 status={rec.get('status')} 矛盾")
     if rec.get("status") == "ok" and ci[1] <= 0:
         problems.append(f"status=ok 但超额收益 CI 上界 {ci[1]} <= 0（B8 要求 no_edge）")
     return {"status": "PASS" if not problems else "FAIL",
             "reason": "; ".join(problems),
-            "observed": {"significant": sig, "dsr": dsr, "ci_hi": ci[1],
+            "observed": {"significant": sig, "dsr": dsr, "ci_lo": ci[0], "ci_hi": ci[1],
                          "status": rec.get("status"), "no_edge": rec.get("no_edge")}}
 
 
@@ -1360,6 +1365,135 @@ def check_otc_fund():
             "reason": "; ".join(problems), "observed": obs}
 
 
+def check_signal_semantics(stock_data=None, fund_data=None):
+    """G40：动作 / 状态 / 文案 / 指标值必须同源（F23/F24/F25）。
+
+    对应 2026-10-25 事故：`action=hold` + `action_reason='...: 卖出信号 (32.42)'`，
+    而 32.42 是当日收盘价、死叉发生在两天前、10-23 大涨当天仍在报卖出。
+
+    四条判据：
+      1. `position_state=flat` 时不得出现 `near_sell` / `sell_triggered`；
+      2. `action=hold` 时文案不得含"卖出信号"/"买入信号"；
+      3. `action=sell` 时文案必须含 `signal.as_of`（今日触发）；
+      4. `trigger.current` 非空时不得等于 `last_close`（指标值被价格顶替）。
+    """
+    problems, obs = [], {}
+    for label, data in (("stock", stock_data), ("fund", fund_data)):
+        if not data:
+            continue
+        rec = data.get("recommendation") or {}
+        sig = rec.get("signal") or {}
+        trig = (data.get("evidence") or {}).get("triggers") or []
+        action = rec.get("action")
+        reason = " ".join(rec.get("action_reason") or [])
+        ps, state = sig.get("position_state"), sig.get("state")
+        obs[label] = {"action": action, "position_state": ps, "state": state,
+                      "reason": reason[:80], "n_triggers": len(trig)}
+
+        if not sig:
+            problems.append(f"{label} 缺 recommendation.signal")
+            continue
+        if ps == "flat" and state in ("near_sell", "sell_triggered"):
+            problems.append(f"{label} position_state=flat 却 state={state}（F24：空仓不得报卖出侧状态）")
+        if action == "hold" and re.search("卖出信号|买入信号", reason):
+            problems.append(f"{label} action=hold 但文案含'卖出信号/买入信号'（F23）")
+        if action == "sell" and sig.get("as_of") and sig["as_of"] not in reason:
+            problems.append(f"{label} action=sell 但文案未写今日日期 {sig.get('as_of')}（F23）")
+        for t in trig:
+            cur, lc = t.get("current"), t.get("last_close")
+            if cur is None or lc in (None, 0):
+                continue
+            try:
+                if abs(float(cur) - float(lc)) < 1e-9:
+                    problems.append(
+                        f"{label} trigger.current={cur} 等于 last_close（F25：指标值被收盘价顶替）")
+                    break
+            except (TypeError, ValueError):
+                problems.append(f"{label} trigger.current 非数值: {cur!r}")
+                break
+    if not obs:
+        return {"status": "BLOCKED", "reason": "无股票/基金输出"}
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
+
+
+def check_edge(stock_data=None):
+    """G41：`evidence.edge` 三档必须与 CI 符号、p_positive 分位数自洽（F27）。
+
+    002415 曾出现 `p_positive=0.035`（96.5% 样本跑输）却 `significant=true`，
+    因为旧判据只看 CI 上界>0。这里锁死：只有 CI **下界**>0 才算正优势。
+    """
+    if stock_data is None:
+        return {"status": "BLOCKED", "reason": "无股票输出"}
+    ev = stock_data.get("evidence") or {}
+    g = ev.get("edge") or {}
+    verdict = g.get("verdict")
+    ci = g.get("ci_95") or [None, None]
+    lo, hi = (ci + [None, None])[:2]
+    p = g.get("p_positive")
+    problems = []
+
+    if verdict not in ("positive_significant", "inconclusive", "negative_significant"):
+        problems.append(f"edge.verdict 非法: {verdict!r}")
+    if lo is not None and hi is not None:
+        expect = ("positive_significant" if lo > 0
+                  else ("negative_significant" if hi < 0 else "inconclusive"))
+        if verdict != expect:
+            problems.append(f"verdict={verdict} 与 CI=[{lo}, {hi}] 不一致（期望 {expect}）")
+    if p is not None and lo is not None and hi is not None:
+        if (float(p) >= 0.975) != (lo > 0):
+            problems.append(f"p_positive={p} 与 ci_lo={lo} 分位数矛盾")
+        if (float(p) <= 0.025) != (hi < 0):
+            problems.append(f"p_positive={p} 与 ci_hi={hi} 分位数矛盾")
+    expect_sig = bool(verdict == "positive_significant" and g.get("dsr_ok") is True)
+    if bool(ev.get("significant")) != expect_sig:
+        problems.append(f"significant={ev.get('significant')} 与 "
+                        f"(verdict=positive 且 dsr_ok)={expect_sig} 矛盾（F27）")
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems),
+            "observed": {"verdict": verdict, "ci_95": [lo, hi], "p_positive": p,
+                         "dsr_ok": g.get("dsr_ok"), "significant": ev.get("significant")}}
+
+
+def check_signal_stats(stock_data=None):
+    """G42：`evidence.signal_stats` 齐备且内部自洽（F28）。"""
+    if stock_data is None:
+        return {"status": "BLOCKED", "reason": "无股票输出"}
+    s = (stock_data.get("evidence") or {}).get("signal_stats") or {}
+    need = ("strategy", "horizons", "n_buy", "n_sell", "buy", "sell",
+            "sell_false_alarm_rate_5d", "note")
+    problems = [f"缺 {k}" for k in need if k not in s]
+    if problems:
+        return {"status": "FAIL", "reason": "; ".join(problems), "observed": s}
+    if s.get("horizons") != [1, 3, 5, 10, 20]:
+        problems.append(f"horizons={s.get('horizons')}（期望 [1,3,5,10,20]）")
+    n_sell, n_buy = s.get("n_sell"), s.get("n_buy")
+    if not isinstance(n_buy, int) or not isinstance(n_sell, int):
+        problems.append(f"n_buy/n_sell 非整数: {n_buy!r}/{n_sell!r}")
+    for side in ("buy", "sell"):
+        block = s.get(side) or {}
+        for field in ("mean_fwd", "hit_rate"):
+            vals = block.get(field)
+            if vals is None:
+                continue
+            if not isinstance(vals, dict) or len(vals) != 5:
+                problems.append(f"{side}.{field} 不是 5 档字典: {vals!r}")
+                continue
+            for h, v in vals.items():
+                if v is None:
+                    continue
+                if field == "hit_rate" and not (0.0 <= float(v) <= 1.0):
+                    problems.append(f"{side}.hit_rate[{h}]={v} 越界")
+    far = s.get("sell_false_alarm_rate_5d")
+    if far is not None and not (0.0 <= float(far) <= 1.0):
+        problems.append(f"sell_false_alarm_rate_5d={far} 越界")
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems),
+            "observed": {"strategy": s.get("strategy"), "n_buy": n_buy, "n_sell": n_sell,
+                         "sell_false_alarm_rate_5d": far,
+                         "sell_hit_rate_5d": ((s.get("sell") or {}).get("hit_rate") or {}).get("5")}}
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     out = {}
@@ -1396,6 +1530,10 @@ def main():
     run("family_map", lambda: check_family_map(stock_data))
     run("n_trials", lambda: check_n_trials(stock_data, fund_data))
     run("significance", lambda: check_significance(stock_data))
+    # 本轮新增：G40 语义同源 / G41 证据等级 / G42 信号级统计
+    run("signal_semantics", lambda: check_signal_semantics(stock_data, fund_data))
+    run("edge", lambda: check_edge(stock_data))
+    run("signal_stats", lambda: check_signal_stats(stock_data))
     run("placeholders", lambda: check_placeholders(stock_data, fund_data))
     run("family_ratio", lambda: check_family_ratio(stock_data, fund_data))
     run("metrics_ci", lambda: check_metrics_ci(stock_data))

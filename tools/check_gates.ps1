@@ -143,7 +143,7 @@ if ($null -eq $probe) {
     foreach ($g in 'G03', 'G04', 'G05', 'G06', 'G07', 'G08', 'G12',
         'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23',
         'G24', 'G25', 'G26', 'G27', 'G28', 'G29', 'G30', 'G31', 'G32',
-        'G33', 'G34', 'G35', 'G36', 'G37', 'G38', 'G39') {
+        'G33', 'G34', 'G35', 'G36', 'G37', 'G38', 'G39', 'G40', 'G41', 'G42') {
         Add-Gate $g '（探针缺失，无法判定）' 'BLOCKED' 'probe.py 未产出结果'
     }
 }
@@ -160,7 +160,10 @@ else {
         @('fund_grid', 'G15', '基金候选必须全部来自基金网格（F01）'),
         @('type_hint', 'G16', '--type 生效（F02）'),
         @('n_trials', 'G17', 'n_trials ≥ 实际评分配置数（F03/B4）'),
-        @('significance', 'G18', 'significant / no_edge 与超额收益 CI 自洽（F04/B8）'),
+        @('significance', 'G18', 'significant / no_edge 与超额收益 CI 自洽（F04/B8；F27 收紧为 ci_lo>0）'),
+        @('signal_semantics', 'G40', '动作/状态/文案/指标值同源（F23/F24/F25）'),
+        @('edge', 'G41', '证据等级三档与 CI / p_positive 自洽（F27）'),
+        @('signal_stats', 'G42', '信号级统计齐备且自洽（F28）'),
         @('exit_codes', 'G19', '退出码与 status 一一对应（F05/C5）'),
         @('placeholders', 'G20', '禁止占位常量（F06）'),
         @('family_map', 'G21', '族名来自注册表 prefix（F14）'),

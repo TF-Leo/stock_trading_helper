@@ -322,3 +322,44 @@ def calculate_dispersion(scores: List[float]) -> float:
     if len(scores) < 2:
         return 0.0
     return float(np.std(scores))
+
+# ---------------------------------------------------------------------------
+# F27：证据等级（契约 §6.3）
+# ---------------------------------------------------------------------------
+EDGE_VERDICTS = ('positive_significant', 'inconclusive', 'negative_significant')
+
+
+def edge_assessment(exc: Dict, dsr: float):
+    """把超额收益 CI 翻译成三档证据等级 + 可读告警。
+
+    判据是"区间**下界**>0"才算有正优势，而不是"上界>0"——后者只说明
+    "不能排除正收益"，会让 p_positive=3.5% 的策略被判为 significant
+    （002415 在 2026-10-22 的实测）。
+
+    Returns:
+        (verdict, edge_block, warning_or_None)
+    """
+    exc = exc or {}
+    ci = exc.get('ci_95') or [0.0, 0.0]
+    lo, hi = float(ci[0]), float(ci[1])
+    n = int(exc.get('n_obs') or 0)
+    if n >= 3 and lo > 0:
+        verdict = 'positive_significant'
+    elif n >= 3 and hi <= 0:
+        verdict = 'negative_significant'
+    else:
+        verdict = 'inconclusive'
+    block = {
+        'verdict': verdict,
+        'point': exc.get('point'),
+        'ci_95': exc.get('ci_95'),
+        'p_positive': exc.get('p_positive'),
+        'n_obs': n,
+        'dsr': round(float(dsr), 4),
+        'dsr_ok': bool(dsr > 0),
+    }
+    p = exc.get('p_positive')
+    warn = None
+    if verdict == 'inconclusive' and p is not None and float(p) < 0.5:
+        warn = f"超额收益点估计为负（p_positive={float(p):.1%}），该策略不应作为择时依据"
+    return verdict, block, warn
