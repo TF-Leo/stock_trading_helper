@@ -1,240 +1,344 @@
-# Goal Contract: Hermes-Ready Trading Decision Engine
+# Goal Contract v2.0 — 信号语义与可执行决策契约
 
-## Goal
-
-把本项目从"面向人眼阅读的回测研究工具"，重构为 **Hermes Agent 可直接消费的、带不确定性量化的交易决策引擎**。
-
-Hermes 会自行 clone 本仓库并自主运行，因此接口必须做到：**仅凭 README 就能被一个没见过本项目的 Agent 正确调用与解析**。主契约为 `python cli.py <code> --json`（stdout 输出单一 JSON 文档），底层由一个可导入函数 `advise()` 产出同一 schema，CLI 仅作薄包装。股票侧与基金侧共用同一契约。目标周期为日线波段（数天~数周）。
-
-工作分四个阶段，**必须按 A → B → C → D 顺序推进，且每阶段结束跑通该阶段门禁后才能进入下一阶段**。理由：A 之前所有回测数字都是失真的，在失真数据上调评分权重等于拟合噪声。
+> 版本：2.0（2026-10-25 重建）
+> 上一版：v1.0（Phase A–D，已全部交付；全文见 `git show d4264a4:GOAL_CONTRACT.md`）
+> 配套：执行清单 `GOAL_FIXLIST.md`（F22–F34）｜唯一台账 `PROGRESS.md`
+> **完成定义不变**：`pwsh -File tools/check_gates.ps1 -Full` 退出码 = 0。
 
 ---
 
-## 执行须知（给执行者的硬约束）
+## 0. 本轮目标（一句话）
 
-### 阶段门禁
-- **Phase A（正确性）完成前，禁止修改任何评分公式、权重、阈值**。A 的验收数字必须在 B 的改动引入之前采集。
-- **Phase B 完成后，A1/A2 中的具体交易数（29/32/42 等）允许变化**，因为 B2（波动率自适应止损）会改变成交结构。届时以 A13 的 after 快照为准，不再要求等于这些值。但 A1 的"可负担 K 线占比 100%"与 A2 的"信号充足却零成交的组数 = 0"是**结构性不变式，任何阶段都必须持续成立**。
-- Phase C 依赖 B 的输出字段；Phase D 的删除动作放在最后，避免中途删掉仍在被引用的代码。
+**让"模型算出来的东西"和"Hermes 读到的字面意思"是同一件事，并让回测评价的就是 Hermes 实际收到的那条规则。**
 
-### 新增模块布局（必须遵守，不要另创结构）
-```
-source/decision/                      # 新增：股票与基金共用的决策层
-    __init__.py                       #   导出 advise()
-    schema.py                         #   SCHEMA_VERSION、dataclass、枚举、退出码、to_dict()
-    sizing.py                         #   仓位/止损/止盈/入场区/horizon 推导
-    scoring.py                        #   风险调整评分、bootstrap CI、Deflated Sharpe
-    consensus.py                      #   策略族去相关、Top-K 共识、分歧度、稳定性
-    triggers.py                       #   策略元信息 -> 触发条件与价位（取代 45 个手写分支）
-    advise_stock.py                   #   advise_stock(code, ...) -> dict
-    advise_fund.py                    #   advise_fund(code, ...) -> dict
-source/fund_analysis/fund_strategy/registry.py   # 新增：基金参数网格单一来源
-```
+v1.0 解决的是"数字可不可信"——数据泄漏、资金基准、多重检验、错误路径同构。它做到了（47 项测试、39 项门禁、下游 Agent 真机复现全过）。
 
-### 禁止事项（执行层面）
-- 禁止把期望值硬编码进测试来"让测试变绿"；禁止用 `pytest.mark.skip` 绕过未实现的验收项。
-- 禁止修改 `source/tests/` 中现有断言，**唯一例外**见 A13/D2 明确点名的那一条。
-- 禁止引入 scikit-learn / statsmodels / scipy / torch 等新依赖；bootstrap、置信区间、Deflated Sharpe 全部用 `numpy` 自实现。
-- 禁止改变策略网格组数（保持 581），因为 `source/tests/test_p1_oos.py::test_registry_single_source` 断言 `len(a) == 581`。若确需变更，必须同步改该断言 + README 中所有"581"字样，并在最终报告说明理由。
-- 禁止在测试中调用 `get_stock_daily` / `fetch_fund_data` / `get_stock_name` 等任何触网函数（它们会发起 HTTP 请求）。测试一律用合成 DataFrame。
+但它留下了一个更隐蔽的问题：**数字可信 ≠ 语义正确**。当前输出里同时存在"动作是 `hold`、理由写着卖出信号"、"卖点发生在两天前、文案却配今天的价格"、"策略大概率跑输基准、却报 `significant=true`"。下游 Agent 只能读文字，于是把文字当成了结论。
 
-### 关键现状事实（已核实，执行时直接采用，不必重新调研）
-- 策略族 = `source/stock_analysis/strategy/registry.py::_grid_defs()` 返回的 4 元组首元素 `prefix`。**B5 的族分组必须取自这里，禁止用字符串按 `(` 切分重新推断**（`optimizer.py::_family_of` 那种做法与 `VWAP(累计)`、`策略组合 (2 票)` 等命名不兼容）。
-- `build_strategy_signals()` 返回 `{namer(kw): inst.generate_trade_signals}`，581 键无冲突。
-- 行情缓存目录：`source/stock_analysis/data/`（`bars.py::DATA_DIR`），文件名 `stock_{symbol}_{adjust}.csv`。基金缓存：`source/fund_analysis/data/`。
-- 现有测试约定：`source/tests/test_p1_oos.py::_toy_df(n, seed)` 用 `np.random.default_rng(seed)` 生成合成日线。**新测试必须沿用这一风格**，并在 `source/tests/conftest.py` 中提供共享 fixture（`toy_df`、`high_price_df`、`flat_df`、`trend_df`）。
-- 板块前缀映射参考 `bars.py::_to_exchange_symbol`：`6/5/9→sh`，`0/3/1/2→sz`，`4/8→bj`。
-- 基金参数网格目前**硬编码为 `cli.py::run_fund_tournament` 第 1562–1607 行的内联 for 循环**（RSI 4×4、双均线 3×3、MACD 2×2×2、波动率目标 3×2、指数轮动 2×2），无注册表。基金策略类为 `fund_analysis/fund_strategy/p2_strategies.py` 的 `FundMaStrategy` / `FundMacdStrategy` / `FundVolTargetStrategy` / `FundIndexRotationStrategy`，四者无共同基类、无 `name` 属性。
-- `cli.py` 当前 1689 行，函数边界：`detect_type` 33、`_build_stock_strategies` 52、`_print_detailed_stock_advice` 58–704、`_build_tomorrow_plan` 705–1263、`run_stock_tournament` 1264–1317、`_print_fund_current_advice` 1319–1549、`run_fund_tournament` 1550–1646、`main` 1647–1689。
-- git：分支 `main`，HEAD `e183cb6`，工作树干净。
+本轮不新增策略、不调参数、不改变量方向，只做三件事：
+
+1. **Phase E 语义**：动作、状态、文案、数字四者由同一份事实生成，且带日期。
+2. **Phase F 评价**：回测必须评价线上真正执行的那条规则，并给出信号级收益统计。
+3. **Phase G 验证**：修掉已失效的门禁打桩，让"绿灯"重新等于"真的验过"。
 
 ---
 
-## 输出契约规格（Phase C 的验收基准，字段名必须逐字一致）
+## 1. 与 v1.0 的关系（**不要重开已完成项**）
 
-### 退出码（`cli.py` 必须以 `sys.exit(code)` 显式返回）
-| code | status | 含义 |
+| v1.0 阶段 | 状态 | 证据位置 |
 |---|---|---|
-| 0 | `ok` | 产出可执行建议 |
-| 10 | `no_edge` | 无统计显著优势，建议观望 |
-| 20 | `insufficient_data` | 数据条数不足（< 100 根） |
-| 30 | `data_source_error` | 渠道池全失败且无可用缓存 |
-| 40 | `untradeable` | 诊断显示无法正常成交，结果不可信 |
-| 2 | — | 参数/用法错误（argparse 默认，勿改） |
+| A 正确性（A1–A14） | 已交付 | `PROGRESS.md` §0.2 档案表 → §1.5 |
+| B 可靠性（B1–B9） | 已交付 | 同上（G17/G18/G23/G26/G27/G28） |
+| C 可消费性（C1–C8） | 已交付 | 同上（G02/G07/G35） |
+| D 收敛与工程（D1–D6） | 已交付 | 同上（G10/G11/G29/G30） |
 
-### 枚举
-- `status` ∈ `ok` / `no_edge` / `insufficient_data` / `data_source_error` / `untradeable`
-- `action` ∈ `buy` / `sell` / `hold` / `avoid` / `insufficient_data`
-- `trigger.state` ∈ `buy_triggered` / `near_buy` / `neutral` / `near_sell` / `sell_triggered`
+**以下 v1.0 条款继续有效，不得违反**：输出契约的顶层结构与字段名、五个退出码、五档 `status`、`position_fraction ≤ 0.30` 且只输出比例、错误路径与成功路径键集合同构、幂等确定性、门禁只加强不放宽、离线测试全绿、`cli.py ≤ 700` 行。
 
-### JSON 结构（`schema_version` 固定为 `"1.0"`）
+**v1.0 中被本轮显式替换的条款只有两条**，替换理由见 §3、§8：
+
+- v1.0 B6 验证一"三窗口 `recommendation.action` 必须完全一致" → 由 §8 的新不变式替换（原判据正是 15 根过滤器的成因）。
+- v1.0 输出规格中 `trigger.current` 的语义（未写明是价格还是指标值）→ 由 §6.1 明确为**指标值**，价格另设 `last_close`。
+
+---
+
+## 2. 事故陈述（已复现，非推测）
+
+标的 002415 海康威视，本地前复权缓存 3928 根。按 `--as-of` 语义截断数据后重跑，实测：
+
+| 日期 | 收盘 | 策略原始信号 | 输出 `action` | 输出 `action_reason` | `trigger.state` |
+|---|---|---|---|---|---|
+| 2026-10-20 | 32.82 | **MA3/MA30 死叉（sell=True）** | — | — | — |
+| 2026-10-22 | 32.42 | `sell=False` | `hold` | `均线趋势(3-30-60): 卖出信号 (32.42)` | `near_sell` |
+| 2026-10-23 | **33.78（+4.19%）** | `sell=False` | `hold` | `均线趋势(3-30-60): 卖出信号 (33.78)` | `near_sell` |
+
+三处直接矛盾：
+
+1. **动作与文案相反**：`action=hold`，文案写"卖出信号"。
+2. **文案里的数字是收盘价，不是指标值**：10/22 是 32.42、10/23 是 33.78，与 `data.last_close` 逐日相等；两条 `trigger.current` 也等于当日收盘价。**文案中没有任何一个数字来自指标。**
+3. **大涨当天仍在报卖出**：10/23 涨 4.19% 后文案不变，只把价格换成了 33.78。用户观察到的"风险提示后次日大涨"，在系统里不是一次性误报，而是**持续误报**。
+
+同时，当日统计标签为：`significant=true`、`deflated_sharpe=0.051`、超额收益 `point=-6.24e-4/日`、`ci_95=[-1.29e-3, +2.42e-5]`、`p_positive=0.035`。
+
+即：**96.5% 的重抽样样本认为该策略跑输买入持有，系统仍标记 `significant=true`。**
+
+### 代码事实（行号为 HEAD `d4264a4`）
+
+| 位置 | 事实 |
+|---|---|
+| `source/cli.py:389` | `trigger_msg = format_trigger_message(triggers, 'hold')` —— 在 `action` 决定（441–446）**之前**生成，且 `'hold'` 是硬编码 |
+| `source/decision/triggers.py:115` | `format_trigger_message(triggers, action)` 的 `action` 形参在函数体内**从未被使用**（死参数） |
+| `source/decision/triggers.py:122-123` | `sell_triggered` 与 `near_sell` 合并渲染为"卖出信号"，不携带日期与年龄 |
+| `source/decision/triggers.py:24,61` | `current` 直接取 `last_close` → 每条触发器的"当前值"都是收盘价 |
+| `source/decision/triggers.py:38-41` | `near_sell` 的定义是"近 10 根内出现过卖点"，与"接近卖出阈值"无关 → 一次死叉在此后 10 个交易日内持续被描述为卖出 |
+| `source/cli.py:419-423` | 要求"最近 15 根**全部**为真"才算强触发；均线死叉是**单根事件**，永远不可能满足 → 事件型策略的 `action` 被机制性钉死为 `hold` |
+| `source/cli.py:418` | `significant = dsr>0 and ci_hi>0` —— 判据是"不能排除正收益"，名字却是"显著" |
+| `source/stock_analysis/backtest/engine.py:155-156,259,277` | 回测执行的是**原始单根信号**，且成交价为 **T+1 收盘** |
+| `tools/probe.py:1016-1030` | G06 三窗口打桩 `cli.get_stock_daily`，而实际取数走 `meta.resolve_and_fetch`（`cli.py:241-242`）→ 打桩不生效 |
+
+---
+
+## 3. 根因（R1–R5）
+
+- **R1 语义层**：动作与文案由两条互不知情的路径生成。文案先算、动作后算，文案还不知道动作。这不是文案疏忽，是结构缺陷——**任何"文案与动作一致"的修复，只要还在两个地方各写一遍，就一定会再漂移**。
+- **R2 时间层**：`near_*` 把"历史上发生过"当成"现在正在发生"，且不带日期。信号因此可以无限期地以"当前"的语气出现在大涨日。
+- **R3 评价层**：三套口径并存——回测跑原始单根信号、线上动作叠了 15 根过滤、Hermes 读到的是近 10 日文案。**回测从未评价过 Hermes 实际收到的规则**，所以回测数字再好也不能证明这条提示有效。
+- **R4 统计层**：`significant` 的判据（CI 上界 > 0）与名字（显著）不匹配，导致"大概率跑输"被判为"显著"。
+- **R5 验证层**：G06 的打桩点在取数重构后失效，三个窗口跑的是同一份全量数据。**绿灯不再等于验过**，这也是 v1.0 末尾几轮"预测全绿、实跑见红"的同源问题。
+
+---
+
+## 4. 执行硬约束
+
+1. **门禁只允许加强**。禁止放宽阈值、删除断言、`pytest.mark.skip`、改现有断言来变绿。
+2. **每修一条，必须同时把它变成门禁项**（写入 `tools/probe.py` 并挂进 `check_gates.ps1` 映射表），否则下轮必然复现。
+3. **打桩必须自检**：任何 monkeypatch 之后，必须断言"被替换的入口确实被调用到、且返回值真的进入了被测代码"（R5 的直接教训）。只替换不校验的桩一律视为无效。
+4. **禁止对 >300 行的文件整体重写**。`source/cli.py` 现 674 行（上限 700），本轮新增逻辑必须落到 `source/decision/` 下，**不得把 cli.py 撑破**。
+5. **禁止用"连续 N 根同向"这类过滤器去换取动作稳定**。那正是 R1/R2 的成因；稳定性要靠 §8 重新定义的不变式达成。
+6. **禁止反转买卖方向**。"卖点之后大涨"不足以证明应当反向操作；先建立度量（Phase F），再谈参数。任何方向性改动必须单独提案。
+7. 一条一提交，提交信息带条目号（如 `fix(F24): 拆分 near_* 的历史与接近语义`）。
+8. Python 一律在 `source/` 下运行；长任务给显式 timeout；中文输出前设 `PYTHONIOENCODING=utf-8`。
+
+---
+
+## 5. 模块布局（增量，不要另创结构）
+
 ```
-schema_version, generated_at, request{}, instrument{}, data{}, market_regime{},
-recommendation{}, evidence{}, candidates[], diagnostics{}, disclaimer
+source/decision/signals.py    # 新增：信号状态机（position_state / event / 历史 / 年龄 / 指标当前值）
+source/decision/actions.py    # 新增：决策表（§7 的唯一实现），纯函数，无 IO
+source/decision/render.py     # 新增：action_reason 唯一出口（§6.2 的规则实现）
+source/decision/evaluate.py   # 新增：signal_stats（§6.4）与 decision replay（F30）
 ```
 
-逐字段：
-- `request`: `code, type, start, opt, jobs, fast`（回显入参，便于 Agent 自证）
-- `instrument`: `code, name, board, price_limit_pct, is_st`；`board` ∈ `sh_main/sh_star/sz_main/sz_gem/bj/fund/unknown`
-- `data`: `bars, start, end, last_close, source, from_cache, stale, cache_last_date, lag_days, expected_date, requested_source, window_note`（`window_note` 用于 A7 声明实际窗口；`source` 为**实际生效渠道**，`requested_source` 为调用方请求的渠道；`stale=true` 表示触网失败后回退了旧缓存，此时 `diagnostics.warnings` 必有说明，`lag_days` 为缓存末日落后期望交易日的自然日数）
-- `market_regime`: `label, confidence, as_of, definition`（`definition` 为字符串标识所用规则版本，满足 A8 单一来源）
-- `recommendation`: `status, action, action_reason[], confidence, position_fraction, horizon_days[2], entry_zone[2]|null, stop_loss|null, take_profit|null, stop_method|null, distance_to_trigger{buy_pct,sell_pct}, invalidation, no_edge`（`stop_method` 标明止损价来源：`atr` / `fixed`；无回测时为 `null`）
-- `evidence`: `consensus{family, agreement, members[]}`, `dispersion`, `stability{windows_tested, action_stable, family_stable, top_k_overlap_min}`, `n_trials`, `n_survivors`, `deflated_sharpe`, `significant`, `metrics{}`, `excess_vs_buy_hold{point, ci_95[2], significant}`, `buy_hold_baseline{total_return, annual_return}`, `regime_win_rates{}`, `triggers[]`
-- `evidence.metrics` 每项形如 `{"point": float, "ci_95": [float,float]|null}`，必须覆盖：`annual_return, max_drawdown, win_rate, sharpe, calmar, profit_factor`；另有标量 `trade_count, avg_holding_days, time_in_market, max_consecutive_losses`
-- `evidence.triggers[]` 每项：`{"indicator", "current", "buy_trigger", "sell_trigger", "state", "buy_price|null", "sell_price|null"}`
-- `candidates[]`（Top-K，K 默认 10）每项：`name, family, score, score_is, score_oos, annual_return, max_drawdown, win_rate, trade_count, calmar, deflated_sharpe`
-- `diagnostics`: `unaffordable_lot_events, blocked_by_limit_events, zero_trade_configs, survivor_configs, warnings[], elapsed_seconds`
-- `disclaimer`: 固定字符串，含"不构成投资建议"
-
-### 派生规则（必须按此实现，避免执行者自由发挥）
-- `stop_loss` = `entry_ref − k×ATR(14)`，`k=2.5`；`take_profit` = `entry_ref + m×ATR(14)`，`m=4.0`。`entry_ref` 为 `last_close`（`action=buy/hold`）或触发价。计算后 clamp 使 `stop_distance=(entry_ref−stop_loss)/entry_ref ∈ [0.03, 0.20]`。
-- `position_fraction` = `clamp( (risk_per_trade / stop_distance) × confidence , 0, max_position_fraction )`，`risk_per_trade=0.01`，`max_position_fraction=0.30`。**只输出比例，绝不输出金额或股数，不接收任何账户资金入参。** `action ∈ {avoid, insufficient_data}` 时固定为 `0.0`。
-- `confidence` = `clamp01( 0.4×clamp01(deflated_sharpe) + 0.3×consensus.agreement + 0.2×stability_score + 0.1×clamp01(trade_count/60) )`
-- `horizon_days` = `[max(2, floor(0.5×avg_holding_days)), min(60, ceil(1.5×avg_holding_days))]`
-- `entry_zone` = `[round(max(buy_price, last_close − 0.5×ATR),2), round(last_close + 0.5×ATR,2)]`；`action=sell` 时为 `null`
-- `distance_to_trigger.buy_pct` = `(buy_price − last_close)/last_close × 100`（`buy_price` 为 null 时该值为 null），`sell_pct` 同理
-- `trigger.state` 判定：`current` 已越过买入阈值 → `buy_triggered`；距阈值 ≤ 5%（按该指标量程归一）→ `near_buy`；卖出侧对称；否则 `neutral`
-- status→action 映射：`insufficient_data`/`data_source_error` → `action=insufficient_data`；`untradeable` → `action=avoid`；`no_edge` → `action=avoid`；`ok` → 由 `triggers[].state` 与 `consensus` 方向决定 `buy/sell/hold`
+`decision/triggers.py` 降级为"指标级触发器求值"，**不再负责文案、不再负责动作**。
+`cli.py` 只做装配：取数 → 选策略 → `signals.build()` → `actions.decide()` → `render.reason()` → 填 schema。
 
 ---
 
-## Acceptance criteria
+## 6. 输出契约增量（字段名逐字一致）
 
-### Phase A — 正确性：让数字重新可信
+### 6.1 `recommendation.signal`（新增，必填）
 
-- [ ] **A1 资金/整手与绝对股价解耦**。修改 `source/stock_analysis/backtest/analyzer.py::run_strategy_tournament`，使其传给 `compare_strategies` 与最终 `best_result` 的引擎都使用**与标的价格自适应的资金基准**（现有 `adaptive_oos_config()` 仅作用于 `engine_oos`，这是本 bug 的直接成因）。同时修改 `source/stock_analysis/backtest/optimizer.py::bayes_search` 第 106 行 `best_result = eng_is.run_backtest(...)`，令选优与报告共用同一基准（满足 A12）。
-  **验证（Phase A 结束时执行）**：对 600519 全样本，`close×100 ≤ initial_capital×max_position_pct` 的 K 线占比 = **100%**（当前 66/1643 = 4%）；`唐奇安 (20/10)`、`MACD(12-26-9)`、`均线趋势 (5-20-60)` 交易数分别 = **29 / 32 / 42**。
-- [ ] **A2 无"信号充足却零成交"**。对全部 581 组：凡 `buy` 信号数 ≥ 20 者，成交笔数为 0 的组数 = **0**。
-  **验证**：新增离线测试 `source/tests/test_a_affordability.py`，用 `high_price_df` fixture（合成 1500 元/股、400 根、含明确金叉的均线数据）断言：(a) 可负担占比 100%；(b) buy 信号 ≥ 20 的策略成交数 > 0。
-- [ ] **A3 失败变响**。`BacktestResult` 增加计数字段 `unaffordable_lot_events`、`blocked_by_limit_events`，在 `engine.py::_calc_max_shares` 返回 0 时与涨跌停拦截时累加，并透出到 JSON `diagnostics`。当 `unaffordable_lot_events > 0` 时：文本输出打印 `[WARN]` 行，`status=untradeable`，退出码 **40**。
-  **验证**：构造 `BacktestConfig(initial_capital=1000, max_position_pct=1.0)` 跑任意合成高价数据，断言 `status=="untradeable"` 且 `diagnostics.unaffordable_lot_events > 0`；CLI 层断言退出码 40。
-- [ ] **A4 暴露时长**。`BacktestResult` 增加 `time_in_market`（持仓 bar 数 / 总 bar 数），在 `analyzer.py::_calculate_metrics` 中计算（需由 `engine.run_backtest` 传入逐 bar 持仓序列）。JSON `evidence.metrics.time_in_market` 必填。
-  **验证**：合成一段"前 100 根持仓、后 300 根空仓"的数据，断言 `time_in_market ≈ 0.25`（容差 ±0.02）。
-- [ ] **A5 基金 T+1**。`source/fund_analysis/fund_backtest.py::_fund_backtest_signals` 第 97–98 行必须对 `buy_sig`/`sell_sig` 施加 `shift(1)`，与股票引擎 `engine.py` 第 102–103 行规则一致。
-  **验证**：新增测试，构造仅最后一根 K 线 `buy=True` 的信号，断言 `trade_count == 0`（当日不得成交）。
-- [ ] **A6 基金单一成本模型**。删除 `source/fund_analysis/fund_strategy/runner.py::backtest_strategy` 的零费率成交路径，令其与 `optimize_parameters` 统一走含 `FUND_FEE_RATE=0.0015` 的实现。基金侧最终只允许存在一个成交模拟函数。
-  **验证**：`grep -rn "position = cash / price" source/` 无结果；`grep -rn "FUND_FEE_RATE" source/` 命中所有基金成交路径；新增测试断言同一信号下含费结果的 `total_return` 严格小于零费结果。
-- [ ] **A7 尊重调用窗口**。移除 `fund_backtest.py` 第 24、93 行与 `fund_strategy/runner.py` 第 21 行的无条件 `pd.DateOffset(years=3)` 截断，改为使用调用方传入的 `start`。若因数据长度必须截断，写入 `data.window_note`。
-  **验证**：新增测试，传入 5 年合成基金数据 + `start` 覆盖全区间，断言回测使用的 bar 数等于全样本数（而非约 3 年）。
-- [ ] **A8 单一 regime 定义**。`source/stock_analysis/advisor/analyzer.py::get_current_market_regime`（输出 StrongBull/Bull/Bear/Crash/Shock）与 `source/stock_analysis/strategy_master/config.py::get_market_regime_series`（输出 Bull/Bear/Shock）必须合并为单一函数、单一标签集合，置于 `source/decision/` 或 `stock_analysis/` 下的唯一模块，两处调用点全部改为引用它。
-  **验证**：新增测试断言 `set(历史序列可能标签) == set(当前判定可能标签)`；`grep -rn "StrongBull\|Crash" source/` 要么无结果，要么只出现在该唯一模块内。
-- [ ] **A9 对比表卫生**。`analyzer.py::run_strategy_tournament` 第 388–392 行不得再向 `comparison` 注入 `__买入持有基线__` 行；基线改由 `calc_buy_hold_baseline()` 独立返回并进入 JSON `evidence.buy_hold_baseline`。
-  **验证**：新增测试断言 `comparison` 的所有行 `策略名` 均存在于 `build_strategy_signals().keys()`，且 `comparison["交易次数"].astype(int)` 不抛异常。
-- [ ] **A10 涨跌停按板块**。新增 `source/decision/instrument.py`（或置于 `schema.py`）函数 `classify_board(code) -> (board, price_limit_pct, is_st)`，规则：`sh 688/689 → sh_star, 0.20`；`sh 60 → sh_main, 0.10`；`sz 300/301/302 → sz_gem, 0.20`；`sz 000/001/002/003 → sz_main, 0.10`；`bj 4/8 → bj, 0.30`；名称含 `ST` 且非 `sh_star/sz_gem` → `0.05`；基金 → `fund, 0.10`。`engine.py` 第 124–125 行的 `1.099/0.901` 硬编码必须改为由该 `price_limit_pct` 驱动（阈值取 `1 ± (limit − 0.001)`）。
-  **验证**：新增测试覆盖 `600519→0.10`、`688981→0.20`、`300750→0.20`、`002371→0.10`、`830799→0.30`；并断言科创板合成数据在 +15% 当日仍可买入（旧逻辑会错误拦截）。
-- [ ] **A11 止损跳空**。`engine.py` 第 129–131 行止损成交价必须为 `min(entry_price×(1−stop_loss_pct), open_px)`（经滑点调整后）；止盈对称处理为 `max(entry_price×(1+take_profit_pct), open_px)`。
-  **验证**：新增测试，构造某根 K 线 `open` 比止损价低 5%，断言该笔 `trade.exit_price < entry_price×(1−stop_loss_pct)`。
-- [ ] **A12 贝叶斯基准一致**（并入 A1 实施）。
-  **验证**：新增测试断言 `bayes_search` 返回的 `best_result.trade_count` 与用同一 config 直接全样本回测该策略的结果一致。
-- [ ] **A13 修复影响留证**。新建 `docs/validation_600519.md`，包含下方"基线快照"的 before 数据、Phase A 结束时的 after 数据、Phase D 结束时的 final 数据，三列对照，并标注运行日期、数据区间、Python 与依赖版本。
-  **验证**：文件存在且三列数据齐全；after 列的可负担占比 = 100%、`唐奇安/MACD/均线趋势` 交易数 = 29/32/42。
-- [ ] **A14 离线修复现有失败测试**。`source/tests/test_p1_oos.py::test_adaptive_oos_high_price`（第 81 行 `pd.read_csv('stock_analysis/data/stock_600519_qfq.csv')`）是**唯一被授权修改的现有测试**。改为使用 `conftest.py` 的 `high_price_df` fixture，保留其原始意图（高价股必须可评估、可成交），不得删除该测试函数。
-  **验证**：`python -m pytest tests/ -q` 在**断网**环境下 0 failed / 0 error。
+```json
+{
+  "strategy": "均线趋势(3-30-60)",
+  "position_state": "holding | flat",
+  "state": "buy_triggered | near_buy | neutral | near_sell | sell_triggered",
+  "as_of": "2026-10-22",
+  "last_buy_date": "2026-10-15 | null",
+  "last_buy_age": 5,
+  "last_sell_date": "2026-10-20 | null",
+  "last_sell_age": 2,
+  "current_value": 0.9795,
+  "last_close": 32.42,
+  "threshold": {"buy": 1.0, "sell": 1.0}
+}
+```
 
-### Phase B — 可靠性：风险调整 + 共识 + 多重检验校正
+**`state` 的语义被重新定义（这是本轮最核心的改动）**：
 
-- [ ] **B1 评分量纲一致**。在 `source/decision/scoring.py` 实现新评分，替换 `analyzer.py::score_backtest_result` / `score_oos_result` 中 `Wilson×0.5 + 年化×0.2 − 回撤×0.3` 的公式。新评分必须以风险调整后收益为主项（Calmar 或 Sharpe），胜率仅作次要项或仅用于置信度。所有权重集中为该模块顶部的具名常量。
-  **验证**：新增测试 `test_scoring_risk_adjusted`：构造两个 `BacktestResult`，A(年化 12%、回撤 35%)、B(年化 10%、回撤 7%)，断言 `score(B) > score(A)` 且差值 > 0.05。另断言对 600519 实测 Top12，胜率项对 |总分| 的贡献占比 ≤ **40%**（before = 72.8%）。
-- [ ] **B2 波动率自适应止损止盈**。`BacktestConfig` 增加 `stop_mode: str = "atr"`（可选 `"fixed"`）、`atr_period: int = 14`、`atr_stop_mult: float = 2.5`、`atr_profit_mult: float = 4.0`。`engine.py` 在 `stop_mode=="atr"` 时用逐 bar `ATR` 计算止损止盈距离（须为**滚动历史 ATR**，禁止使用当 bar 之后的数据），默认启用 `atr`。
-  **验证**：新增测试，同一策略在同一合成序列的高波动段与低波动段上，断言实际止损距离不同（差异 > 20%）；并断言 `stop_mode="fixed"` 时行为与旧逻辑一致（回归保护）。
-- [ ] **B3 真正的 walk-forward**。改造 `analyzer.py::walk_forward_splits` 的使用方式：每折必须在**该折训练集上独立重新选参**，再用该折测试集评估所选参数；不得继续用固定策略重跑子窗口。函数命名须反映语义（如 `walk_forward_optimize`）。
-  **验证**：新增测试，用两段统计特性明显不同的合成序列拼接（前段趋势、后段均值回归），断言不同折选出的参数**不完全相同**（至少一折的 best 与全局 best 不同）。
-- [ ] **B4 多重检验校正**。在 `scoring.py` 实现 Deflated Sharpe Ratio（或等价的按试验次数调整的置信下界），输入为 `n_trials`（= 参与评分的配置数）、观测 Sharpe、收益偏度与峰度、样本长度。JSON 输出 `evidence.n_trials`、`evidence.deflated_sharpe`、`evidence.significant`。当 `deflated_sharpe ≤ 0` 时 `status` 必须为 `no_edge`、退出码 **10**。
-  **验证**：新增测试：(a) 固定观测 Sharpe，`n_trials` 从 10 增至 1000 时 `deflated_sharpe` 单调不增；(b) 用纯随机收益序列跑完整锦标赛，断言最终 `status == "no_edge"`。
-- [ ] **B5 族去相关共识**。在 `source/decision/consensus.py` 实现：候选按 `_grid_defs()` 的 `prefix` 分族 → 每族只保留最优代表 → 取 Top-K（K 默认 10）构成共识集，输出 `consensus.family`（主导族）、`consensus.agreement`（族内/跨族方向一致比例 0–1）、`dispersion`（Top-K 评分标准差）。**硬约束：最终候选集中任一族占比 ≤ 50%**。
-  **验证**：新增测试，构造一个 Top12 中某族占 7 席的评分表，断言 `select_consensus()` 输出中该族占比 ≤ 50%。对 600519 实测断言 `candidates` 中任一族计数 ≤ ceil(len(candidates)/2)。
-- [ ] **B6 建议可复现（本契约最硬的可靠性标准）**。共识选择必须对数据窗口的小扰动稳健（族级选择 + 评分平滑 + 必要时引入滞回）。
-  **验证一（离线，进 pytest）**：对合成 `trend_df`，分别用全样本与"砍掉末尾 5% bar"两个窗口调用 `advise()`，断言 `recommendation.action` 与 `evidence.consensus.family` 完全一致，且 `evidence.stability.action_stable == true`。
-  **验证二（真实数据，不进 pytest，结果写入 `docs/validation_600519.md`）**：对 600519 分别以 `full` / 去掉末尾 60 根 / 去掉末尾 120 根 三个窗口运行，`recommendation.action` 与 `evidence.consensus.family` 必须**三者完全一致**。**若实测确实无法达成，必须在最终报告中如实说明并给出实测差异，禁止通过放宽断言或调参凑数使其"通过"。**
-- [ ] **B7 bootstrap 置信区间**。在 `scoring.py` 实现 `bootstrap_ci(values, stat_fn, n_boot=2000, seed=7)`，对 `annual_return, max_drawdown, win_rate, sharpe, calmar, profit_factor` 与超额收益给出 95% CI，填入 `evidence.metrics.*.ci_95`。随机种子固定。
-  **验证**：新增测试：(a) 固定输入下两次调用返回完全相同的 CI（确定性）；(b) 交易数 10 的样本其 `win_rate` CI 宽度严格大于交易数 200 的样本（不确定性随样本量收敛）。
-- [ ] **B8 基线显著性**。`no_edge` 判定改为基于 `excess_vs_buy_hold.ci_95`：当 CI 上界 ≤ 0 时判 `no_edge`；不得再只比较年化点值（替换 `analyzer.py` 第 377–386 行的判定逻辑）。
-  **验证**：新增测试：(a) 构造一个收益与买入持有逐 bar 相同的策略，断言 `status=="no_edge"`；(b) 构造一个每 bar 稳定跑赢 0.1% 的策略，断言 `status=="ok"`。
-- [ ] **B9 失效条件**。`recommendation.invalidation` 必须为具体可读字符串，包含数值化止损价与时间界限（模板：`"收盘跌破 {stop_loss:.2f}，或 {family} 族共识转为看空，或 {n} 个交易日内未触发入场"`）。
-  **验证**：新增测试断言该字段非空、包含至少一个数字、且包含 `stop_loss` 的字符串形式。
+| 取值 | 含义（唯一解释） |
+|---|---|
+| `buy_triggered` | **本根**产生买入事件：`buy[t]=True` 且 `position_state[t-1]=flat` |
+| `sell_triggered` | **本根**产生卖出事件：`sell[t]=True` 且 `position_state[t-1]=holding` |
+| `near_buy` | 未触发，`position_state=flat`，且指标距买入阈值 ≤ 5%（按该指标量程归一） |
+| `near_sell` | 未触发，`position_state=holding`，且指标距卖出阈值 ≤ 5% |
+| `neutral` | 其余 |
 
-### Phase C — 可消费性：Hermes 决策契约
+**硬规则**：`position_state=flat` 时 `state` **不得**为 `near_sell` 或 `sell_triggered`。这条规则单独就能消灭本次事故——10/22 策略已是空仓，`near_sell` 不可能成立。
 
-- [ ] **C1 纯 JSON stdout**。新增 `--json` 参数。启用时 stdout **只**输出一个 JSON 文档；所有 `print` 的人类可读文本（含 `data_loader` 的 `正在拉取...`、`[INFO]`、`[WARN]`）必须改走 stderr。`data_loader/meta.py` 与 `bars.py` 中的 `print` 需改为 `print(..., file=sys.stderr)` 或 `logging`（`logging` 的 handler 须配置到 stderr）。
-  **验证**：`cd source; python cli.py 600519 --json 2>$null | python -c "import json,sys; d=json.load(sys.stdin); print(d['schema_version'])"` 输出 `1.0` 且不报错。
-- [ ] **C2 schema 入文档**。README 必须新增"给 Agent 的接口契约"章节，含：调用示例、完整字段表（名称/类型/含义/可否为 null）、枚举取值、退出码表、一份**真实运行产出**的示例 JSON。
-  **验证**：README 中可检索到 `schema_version`、全部 6 个退出码、5 个 `action` 枚举值、5 个 `status` 枚举值；示例 JSON 能被 `json.loads` 成功解析（新增一个测试读取 README 中的 JSON 代码块并解析）。
-- [ ] **C3 字段齐备**。对 600519（股票）与 510300（基金）各运行一次，`recommendation` 与 `evidence` 中"输出契约规格"列出的字段全部存在；不适用时为显式 `null` 并在 `recommendation.action_reason` 或 `diagnostics.warnings` 说明原因。`position_fraction ∈ [0, 0.30]`。
-  **错误路径同样适用（同构要求）**：`insufficient_data` / `data_source_error` 响应的**键集合必须与成功响应一致**，不得整块缺失（`evidence.metrics` 9 项 point 全 `null`、`horizon_days=[null,null]`、`stop_method=null`、`candidates=[]`、`triggers=[]`）；且 `data.bars` 必须是真实根数，不得填 0 而与 `invalidation` 文本自相矛盾。门禁 **G35** 逐路径比对。
-  **验证**：新增 `source/tests/test_c_schema.py`，用合成数据分别驱动 `advise_stock` 与 `advise_fund`，对产出的 dict 做**递归键集合校验**（期望键集合以常量形式写在测试里），并断言无 `NaN`/`Infinity`（`json.dumps(..., allow_nan=False)` 不抛异常）。
-- [ ] **C4 无自相矛盾**。属性测试：对任意合成数据，若 `triggers[].state == "sell_triggered"` 则 `action ∈ {sell, hold, avoid}`；若 `== "buy_triggered"` 则 `action ∈ {buy, hold, avoid}`。且 `distance_to_trigger` 的符号必须与 `state` 自洽。
-  **验证**：新增 `hypothesis`-free 的参数化测试（枚举 ≥ 20 组合成行情形态：暴涨、暴跌、横盘、单边趋势、极端超买、极端超卖、数据极短、全零成交量等），全部断言通过。特别地，构造 StochRSI=100 的极度超买形态，断言 `action != "buy"`。
-- [ ] **C5 状态与退出码可分支**。四种情形（成功 / 数据不足 / 无优势 / 数据源失败）各自返回上表退出码且互不相同。
-  **验证**：用 `subprocess` 分别驱动四个用例（数据不足用超短合成 CSV；数据源失败用不存在的代码 + 屏蔽网络），断言 `returncode` 分别为 0 / 20 / 10 / 30。
-- [ ] **C6 单一真源 API**。`from decision import advise` 可用，`advise(code, type="auto", start="20200101", opt="grid", jobs=1, fast=False) -> dict`，返回的 dict 与 `--json` 输出**键集合完全一致**。`cli.py` 中不得残留任何独立计算建议的逻辑。
-  **验证**：新增测试断言 `set(advise(...).keys()) == set(json.loads(cli_stdout).keys())`（递归到二级键）。
-- [ ] **C7 基金同一契约**。`python cli.py 510300 --json` 通过与 C3 相同的 schema 校验。基金侧参数网格必须先从 `cli.py::run_fund_tournament` 第 1562–1607 行抽取到 `fund_analysis/fund_strategy/registry.py`，提供与股票侧同构的 `_grid_defs()`（含族前缀）与 `build_fund_strategy_signals()`，使 B5 共识逻辑可直接复用。
-  **验证**：新增测试断言 `fund_strategy.registry.grid_size() == 44`（保持现有组数），且族数 = 6；`cli.py` 中不再存在内联基金参数 for 循环。
-- [ ] **C8 幂等确定性**。同一份缓存数据下连续两次运行，JSON 除 `generated_at` 与 `diagnostics.elapsed_seconds` 外逐字节相同。所有随机过程（bootstrap、bayes）使用固定 seed。
-  **验证**：连跑两次，用 Python 剔除上述两个字段后断言 `json.dumps(d1, sort_keys=True) == json.dumps(d2, sort_keys=True)`；此验证以脚本形式加入 `docs/validation_600519.md` 的复现命令清单。
+`position_state` 由策略自身信号回放得出（初值 `flat`；`buy` 置 1、`sell` 置 0；同根同时为真时以 `sell` 优先并记 `conflict`）。它表示**策略视角的隐含仓位，不是用户账户持仓**；`advise()` 仍不接收任何账户态入参。
 
-### Phase D — 范围收敛与工程健康
+### 6.2 `action_reason` 生成规则（强制，可机器校验）
 
-- [ ] **D1 删除冗余**。删除：`source/stock_analysis/strategy_master/config.py` 的 `load_config`/`save_config` 与 `stock_config.json` 读写、`source/stock_analysis/strategy_master/runner.py`、`source/stock_analysis/advisor/recommender.py::main`（含硬编码 watchlist）、`source/fund_analysis/fund_strategy/runner.py::main` 的 `save_config` 回写、`source/stock_analysis/stock_config.example.json`、`source/fund_analysis/fund_config.example.json`、`fund_strategy/strategy.py` 的 `load_config`/`save_config`/`CONFIG_PATH`。`get_market_regime_series` 若仍被使用，须迁移到 `source/decision/` 后再删除 `strategy_master` 包。
-  **验证**：`grep -rn "watchlist\|save_config\|load_config\|stock_config\|fund_config" source/` 无结果；上述文件/目录不存在；`python -c "import cli"` 成功（无悬空 import）。
-- [ ] **D2 测试离线全绿**。全部测试在断网、无预置缓存 CSV 的环境下通过。用例总数 ≥ **25**。
-  **验证**：`cd source; python -m pytest tests/ -q` → `0 failed, 0 error`，且通过数 ≥ 25（预期显著多于 25）。
-- [ ] **D3 文档与代码一致**。README 必须修正：(a) 示例输出来自一次真实运行并标注运行日期与数据区间；(b) 删除网格中不存在的 `均线趋势 (5-13-34)`（`ma_windows` 无 34），换成真实存在的组合；(c) walk-forward 的描述与实际实现一致（B3 之后应能如实宣称"逐折重新寻优"）；(d) 基金侧"均含双边申赎费""评分与股票侧一致（Wilson 下界）"的描述与 A6/B1 之后的实际实现一致；(e) `requirements.txt` 固定版本改为**实测通过全部测试的环境版本**（当前实测：Python 3.12.10 / akshare 1.18.29 / numpy 2.2.6 / pandas 3.0.1，而 requirements 固定为 akshare 1.17.44 / numpy 2.3.5 / pandas 3.0.6，二者不一致）；(f) README 声明的 Python 版本与实际一致。
-  **验证**：`grep -n "均线趋势 (5-13-34)" README.md` 无结果；`pip install -r requirements.txt --dry-run` 所列版本与 `python -c "import akshare,numpy,pandas;print(...)"` 输出一致。
-- [ ] **D4 输出数据驱动**。在 `BaseStrategy`（`source/stock_analysis/strategy/base.py`）增加声明式方法 `describe_triggers(df) -> dict`，返回 `{indicator, current, buy_trigger, sell_trigger, buy_price, sell_price, state}`；各策略子类按需覆写，基类提供基于 MA/阈值的通用默认实现。`source/decision/triggers.py` 只调用该方法生成 `evidence.triggers` 与文本预案。`cli.py` 中 `_print_detailed_stock_advice`（58–704）与 `_build_tomorrow_plan`（705–1263）的 **45 个 `if best_name...` 分支必须全部删除**，由统一渲染器替代。
-  **验证**：`grep -c "if best_name" source/cli.py` = **0**；`cli.py` 行数 ≤ **700**（当前 1689）；新增测试定义一个临时策略类（仅实现 `generate_trade_signals` + `describe_triggers`），注册后**不修改任何渲染代码**即可在 `--json` 与文本输出中同时得到正确触发信息。
-- [ ] **D5 性能有界且分档**。新增 `--fast` 参数（降低 bootstrap 次数 / 缩减候选池 / 跳过部分 walk-forward 折）。实测：全量模式单标的 ≤ **300s**（`--jobs 4`），`--fast` ≤ **60s**。两档实测耗时写入 README。
-  **验证**：`Measure-Command { python cli.py 600519 --jobs 4 }` ≤ 300s；`Measure-Command { python cli.py 600519 --fast --jobs 4 }` ≤ 60s；README 记录两者实测值。
-- [ ] **D6 CLI 向后兼容**。`--detail / --no-regime / --start / --jobs / --opt / --opt-iters / -t|--type` 全部保持可用；新增 `--json / --fast`。语义变更须在 README 标注。
-  **验证**：新增测试用 `subprocess` 对每个旧参数各跑一次（可用 `--fast` + 合成/缓存数据），断言 `returncode` ∈ {0,10,20,30,40}（即不因参数本身报 usage error 2）。
+`action_reason` 是 `list[str]`，1–3 条，**必须由 `actions.decide()` 的输出生成**，禁止在别处拼装：
 
----
+1. 第一条必含**当前策略仓位**与**依据日期**：`"策略当前空仓（2026-10-20 死叉离场，距今 2 个交易日）"`。
+2. `action == hold` 且 `state ∈ {neutral, near_buy, near_sell}` 时，**禁止**出现 `"卖出信号"` / `"买入信号"` 字样；历史信号只能表述为 `"曾于 YYYY-MM-DD 出现卖点"`。
+3. `action == sell` 时必须写明 `"今日（YYYY-MM-DD）触发"`，且 `position_state` 必须为 `holding`。
+4. `action == buy` 时必须写明今日触发与证据等级（`edge.verdict`）。
+5. 文案中的任何数字必须可回溯到 `signal.current_value` / `threshold` / `last_close` / `edge` 之一，**不得出现无出处的数字**。
 
-## 基线快照（before，已实测，直接写入 `docs/validation_600519.md`，执行者无需重测）
+> 判据不是"读起来顺"，而是正则可查：`action=hold` 时 `reason` 不含 `卖出信号|买入信号`；含日期的句子必须能对上 `last_*_date`。
 
-环境：Python 3.12.10 / akshare 1.18.29 / numpy 2.2.6 / pandas 3.0.1；git HEAD `e183cb6`；数据 600519，`--start 20200101`，source=sina，1643 根，2020-01-02 ~ 2026-10-16，close min/max/last = 843.0 / 2227.2 / 1329.0。
+### 6.3 `evidence.edge`（新增，替换 `significant` 的模糊语义）
 
-- **可负担性**：`close×100 ≤ 100000` 的 bar = **66/1643（4%）**，区间 2020-01-02 ~ 2020-04-13。
-- **本金敏感性（交易笔数，10 万 → 100 万）**：唐奇安 (20/10) 1→29；MACD(12-26-9) 1→32；均线趋势 (5-20-60) 1→42；量价突破 1→35；StochRSI(14,25/75) 32→79；Kelly(5-20,60) 0→19。
-- **网格存活**：581 组中 零买零卖信号 8 组、零交易 **197** 组、交易 <10 笔 **564** 组、≥10 笔仅 **17** 组（2.9%）；40 族中 **36 族全灭**。
-- **信号充足却零成交实例**：MACD(12-26-9) buy=47/sell=42→1 笔；均线趋势 (5-20-60) buy=139/sell=50→1 笔；唐奇安 (20/10) buy=107/sell=163→1 笔；量价突破 buy=58/sell=827→1 笔；三维共振 buy=10/sell=413→0 笔；Kelly(5-20,60) buy=19/sell=582→0 笔。对照：KAMA(10) buy=111/sell=111→48 笔；StochRSI(14,25/75) buy=118/sell=131→32 笔。
-- **评分结构**：Top12 中 Wilson 胜率项占 |总分| **72.8%**。实例 StochRSI(9,25/80) 年化 12.65%/回撤 34.96%/103 笔（IS 0.1343）排名**低于** StochRSI(14,25/75) 年化 10.14%/回撤 6.78%/32 笔（IS 0.2612）。IS→OOS 衰减示例：StochRSI(14,25/80) 0.2403→0.0403；CCI(14,-150/150) 0.1865→0.0246；KAMA(10) 0.0976→**−0.0755**。
-- **稳定性**：full→`StochRSI(14,25/75)`；drop60→`StochRSI(14,25/75)`；drop120→`StochRSI(14,25/80)`（argmax 翻转）。Top5 重合：full/drop60 = 2，full/drop120 = **1**，drop60/drop120 = 4。Top12 族集中度：StochRSI 7/12 = **58%**。
-- **CLI 实测输出（`python cli.py 600519 --no-regime`，41.3s）**：最优 `StochRSI(14,25/75)`，胜率 75.00%，盈亏比 5.78，年化 10.14%，回撤 6.78%，夏普 1.10，32 笔，平均持仓 11.1 天；`今日信号：无（观望）`；`StochRSI = 100.00 (超买 (>75 触发卖出))`；`买入触发: StochRSI 上穿 25（当前 100.00）` ← 自相矛盾实证。
-- **其他标的可负担性（@100k，`max_position_pct` 1.0 / 0.3）**：600519 66/1643、0/1643；002371(593.6 元) 1643、1205/1643；300750(277.0 元) 1643、1331/1643；000858、603259、601398、600036、688981、002594、601318 均 1643/1643。
-- **测试**：`python -m pytest tests/ -q` → **24 passed, 1 failed**（`test_p1_oos.py::test_adaptive_oos_high_price`，`FileNotFoundError: stock_analysis/data/stock_600519_qfq.csv`），24.51s。
-- **代码规模**：`cli.py` 1689 行，`if best_name` 分支 45 处。
+```json
+{
+  "verdict": "positive_significant | inconclusive | negative_significant",
+  "point": -0.000624,
+  "ci_95": [-0.001290, 0.0000242],
+  "p_positive": 0.035,
+  "n_obs": 3926,
+  "dsr": 0.051,
+  "dsr_ok": true
+}
+```
+
+- `verdict`：`ci_95[0] > 0` → `positive_significant`；`ci_95[1] < 0` → `negative_significant`；否则 `inconclusive`。
+- `evidence.significant = (verdict == "positive_significant") and dsr_ok`。**语义收紧为"统计上可证明有超额优势"**，而不是"不能排除正收益"。
+- `p_positive` 必须与 CI 自洽：`p_positive >= 0.975 ⟺ ci_95[0] > 0`，`p_positive <= 0.025 ⟺ ci_95[1] < 0`（2000 次重抽样下的分位数等价关系）。
+- 当 `verdict == "inconclusive"` 且 `p_positive < 0.5` 时，`diagnostics.warnings` **必须**含一条：`"超额收益点估计为负（p_positive=3.5%），该策略不应作为择时依据"`。
+
+**为什么 `inconclusive` 不直接判 `no_edge`**：`no_edge` 保留给"统计上可证明为负"（`negative_significant`）。把"无证据"也判成 `no_edge` 会让系统对所有标的都输出 `avoid`，反而丢失信息。区别在于 `action` 被证据门控（§7），Hermes 可以自己按 `verdict` 决定要不要听。
+
+### 6.4 `evidence.signal_stats`（新增，必填）
+
+对**被选中的那一个策略**，统计其历史上每次买卖点之后的实际走势（这是用户问题的直接答案）：
+
+```json
+{
+  "strategy": "<被选中策略名>",
+  "horizons": [1, 3, 5, 10, 20],
+  "n_buy": "<int>", "n_sell": "<int>",
+  "buy":  {"mean_fwd": {"<h>": "<float>"}, "hit_rate": {"<h>": "<float>"}},
+  "sell": {"mean_fwd": {"<h>": "<float>"}, "hit_rate": {"<h>": "<float>"},
+           "missed_rally_mean_5d": "<float>"},
+  "sell_false_alarm_rate_5d": "<float>",
+  "note": null
+}
+```
+
+> 上表是**结构示意**（尖括号为占位类型说明），真实数值由 F28 计算后写入。禁止在实现里回填示例值。
+
+- `hit_rate`：买点后收益 > 0 的比例；卖点后收益 < 0 的比例。
+- `sell_false_alarm_rate_5d`：卖点后 5 日收益 > 0 的比例（即"卖错了"的比例）。
+- `missed_rally_mean_5d`：卖点后 5 日收益为正的那些样本的均值（踏空成本）。
+- 样本不足（`n_sell < 5`）时 `note` 写明原因，字段保留、值为 `null`，**不得整块缺失**（C3 同构要求）。
+
+### 6.5 `data.execution`（新增，必填）
+
+```json
+{"signal_bar": "close", "fill": "next_open | next_close", "slippage_bps": 5, "commission_bps": 3}
+```
+
+声明本次结论对应的**成交假设**。`evidence.metrics` 必须由同一假设下的回测产生。当前实现为 `next_close`；改为 `next_open` 是 F29 的内容。
 
 ---
 
-## Definition of Done（最终验证命令清单，全部必须通过）
+## 7. 决策表（唯一真源，`decision/actions.py`）
 
-在 `source/` 目录下依次执行：
-1. `python -m pytest tests/ -q` → 0 failed / 0 error，通过数 ≥ 25（断网环境）
-2. `python cli.py 600519 --json 2>$null | python -c "import json,sys; d=json.load(sys.stdin); assert d['schema_version']=='1.0'; assert d['recommendation']['status'] in {'ok','no_edge','insufficient_data','data_source_error','untradeable'}; assert 0 <= d['recommendation']['position_fraction'] <= 0.30; assert d['diagnostics']['unaffordable_lot_events']==0; print('OK')"` → 打印 `OK`
-3. `python cli.py 510300 --json` → 同样通过 schema 校验，退出码 ∈ {0,10,20,30,40}
-4. `python cli.py 600519 --json` 连跑两次，剔除 `generated_at` 与 `diagnostics.elapsed_seconds` 后 JSON 完全相同
-5. 600519 三窗口（full / drop60 / drop120）运行的 `action` 与 `consensus.family` 三者一致，结果记入 `docs/validation_600519.md`
-6. `grep -c "if best_name" cli.py` → `0`；`(Get-Content cli.py).Count` → ≤ 700
-7. `grep -rn "watchlist\|save_config\|load_config\|stock_config\|fund_config" .` → 无结果
-8. `Measure-Command { python cli.py 600519 --jobs 4 }` ≤ 300s；`--fast` ≤ 60s
-9. `python cli.py --help` 列出全部旧参数 + `--json` + `--fast`
-10. README 含"给 Agent 的接口契约"章节，其示例 JSON 可被 `json.loads` 解析
+```python
+def decide(status, state, edge_verdict, confidence, significant) -> str:
+    if status in ("insufficient_data", "data_source_error"): return "insufficient_data"
+    if status in ("untradeable", "no_edge"):                 return "avoid"
+    if state == "sell_triggered":                            return "sell"
+    if state == "buy_triggered" and edge_verdict == "positive_significant" \
+       and significant and confidence >= 0.30:               return "buy"
+    return "hold"
+```
 
-最终报告须逐条列出上述 10 项的实际执行结果（含失败项与真实数字），不得以"应该通过"代替实测。
+> **不要传 `position_state`**。`state` 的定义已包含"事件前"的仓位
+> （`buy_triggered` ⇔ 此前空仓，`sell_triggered` ⇔ 此前持仓）。
+> 首版实现曾传事件**后**的仓位来判断事前前提，导致 `buy` 永不触发。
+
+设计原则（写进代码注释，防止下轮又被"优化"掉）：
+
+- **卖出靠纪律，买入靠证据**：风控动作不等统计显著性；建仓动作必须有证据下限。
+- **动作是增量，不是判断**：`buy`/`sell` 表示"相对策略当前仓位要做什么"，`hold` 表示"不动作"。`position_state` 单独给出，Hermes 不必从文案猜。
+- **不再有"连续 N 根"**。事件型信号按事件处理，状态型策略由 `position_state` 自然承载。
 
 ---
 
-## Boundaries
+## 8. 稳定性不变式（替换 v1.0 B6 验证一）
 
-- **不新增数据库、不新增任何前端/Web UI/可视化界面、不新增账户持仓或自选股持久化**。`advise()` **不得**接收账户资金、持仓、成本价等任何账户态入参；仓位只以相对比例表达。
-- **不引入需要 API key、登录或付费的数据源**；沿用现有公开接口与本地 CSV 缓存，不改变缓存目录（`source/stock_analysis/data/`、`source/fund_analysis/data/`）与 `.gitignore` 策略。
-- **不新增第三方依赖**（含 scipy / scikit-learn / statsmodels / hypothesis）；只用现有 `numpy` / `pandas` / `requests` / `akshare` / `pytest`。所有统计功能用 numpy 自实现。
-- **不得为了让测试通过而放宽阈值、放宽门槛或把期望值硬编码进断言**；任何阈值调整必须给出量化依据并写入最终报告。
-- **不删除现有测试用例**；唯一被授权修改的是 `test_p1_oos.py::test_adaptive_oos_high_price` 的数据获取方式（A14），其测试意图必须保留。
-- **不改变策略网格组数**（股票 581 / 基金 44），以免破坏 `test_registry_single_source` 与 README 数字；若确需变更须同步更新断言与全部文档数字并说明理由。
-- **不提交任何真实配置文件、账户信息、持仓数据或个人隐私**；示例与测试数据一律用公开标的或合成数据。
-- **不做确定性收益承诺**；所有输出必须保留"不构成投资建议"免责，并如实表达不确定性（CI、DSR、分歧度）。证据不足时必须输出 `no_edge`/观望，禁止强行给方向。
-- **不扩大范围**：不实现自动下单、实盘对接、行情推送、多账户、风控中台、定时任务等未列入验收标准的功能。
+v1.0 要求三窗口（full / drop60 / drop120）的 `recommendation.action` 完全一致。为满足它，实现里加了"15 根全真"过滤器——**这是用语义错误换来的稳定**，本轮必须撤掉。
+
+新不变式（对同一标的、同一份缓存，只改窗口）：
+
+| 层级 | 要求 | 说明 |
+|---|---|---|
+| L1 必须一致 | `recommendation.signal.position_state` | 决策的真正输入，路径依赖但鲁棒 |
+| L2 必须如实上报 | `evidence.stability.action_stable` / `family_stable` | `action` 允许因窗口不同而变化，但**必须如实报告**，禁止用过滤器凑 `true`；单次运行只跑一个窗口时一律 `null` |
+| L3 必须不同 | 三窗口 `data.bars` **互不相同** | 这是"打桩真的生效"的证据（R5） |
+| 观察项（不判失败） | `evidence.consensus.family` | 它是 40 个族"评分中位数"的 argmax，窗口小幅变化即可翻转；只影响 `invalidation` 文案与 `agreement`，不参与 `action` 计算 |
+
+**2026-10-25 实测（600519，full/drop60/drop120）**：`bars = 6027 / 5967 / 5907`（互不相同 ✓）、
+`position_state` 三窗口均为 `flat` ✓、`action` 均为 `avoid` ✓、`consensus.family` 在
+`唐奇安` / `ATR通道` 之间漂移（`family_drift=true`，已如实上报，不再声称稳定）。
+
+> 原 v2.0 草稿曾把 `family` 也列为 L1 硬不变式。实测表明这会把"两个近似趋势通道族之间
+> 的 argmax 抖动"判成失败，从而逼着实现重新引入某种平滑/过滤器——那正是本轮要拆的东西。
+> 因此改为观察项：**允许漂移，但禁止谎称稳定**。若将来要让 family 真正稳定，应单独提案
+> 族级滞回，不得靠收紧门禁解决。
+
+若 L1 实测不稳，允许的处理顺序是：族级共识 → 评分平滑 → 滞回（带明确状态转移条件）。**不允许**重新引入"连续 N 根"或"末根瞬时态"之类的口径把差异藏起来。
+
+---
+
+## 9. Phase E — 语义（P0，先做）
+
+- [ ] **E1 决策表落地**（F26）。新建 `decision/actions.py`，实现 §7；`cli.py:419-423` 的 15 根过滤器删除；`action` 只由 `decide()` 产生。
+  **验证**：合成"单根金叉 + 后续 15 根无信号"的序列，断言 `action=buy`（旧实现必然 `hold`）；再构造"金叉后一根死叉"，断言 `action=sell`。
+- [ ] **E2 信号状态机**（F24/F25）。新建 `decision/signals.py`，产出 §6.1 全部字段；`position_state=flat` 时禁止 `near_sell`。
+  **验证**：用 002415 截至 2026-10-22 的数据，断言 `position_state=flat`、`state ∈ {neutral, near_buy}`（实测为 `near_buy`：MA3/MA30=0.9795，距金叉 2%）、`last_sell_date=2026-10-20`、`last_sell_age=2`、`current_value != last_close`。
+- [ ] **E3 文案单出口**（F23）。新建 `decision/render.py`；`format_trigger_message` 的 `action` 死参数删除；`cli.py:389` 的提前生成删除。
+  **验证**：`action=hold` 时 `action_reason` 不含 `卖出信号|买入信号`；`action=sell` 时含当日日期；`action_reason` 与 `action` 的一致性对 9 只标的 × 3 窗口全部成立。
+- [ ] **E4 `trigger.current` 改指标值**（F25）。`evidence.triggers[].current` 为指标当前值，新增 `last_close` 字段；`buy_trigger`/`sell_trigger` 文案不得再把收盘价当指标值。
+  **验证**：`current != last_close` 至少在 8/9 标的成立（允许极少数恰好相等）；同一标的在两个不同截止日的 `current` 不相等，而 `last_close` 各自等于当日收盘。
+- [ ] **E5 契约与 README 同步**（F33）。§6 全部字段写入 README「给 Agent 的接口契约」，并给出 002415 的真实示例。
+  **验证**：README 可检索到 `position_state`、`last_sell_age`、`edge.verdict`、`signal_stats`、`execution.fill`；示例 JSON 可被 `json.loads` 解析。
+
+---
+
+## 10. Phase F — 评价（P1，E 之后）
+
+- [ ] **F1 信号级统计**（F28）。新建 `decision/evaluate.py::signal_stats()`，产出 §6.4。
+  **验证**：对 002415 断言 `n_sell > 0`、`horizons == [1,3,5,10,20]`、`sell.hit_rate["1"]` 与手算一致（容差 1e-9）；`sell_false_alarm_rate_5d ∈ [0,1]`。
+- [ ] **F2 成交时点声明**（F29）。`BacktestConfig` 增 `exec_price: str = "next_open"`；`data.execution.fill` 如实回报。
+  **验证**：同一信号序列在 `next_open` 与 `next_close` 下 `trade_count` 相同但成交价不同；`data.execution.fill` 与配置一致。
+- [ ] **F3 决策回放**（F30）。`decision/evaluate.py::decision_replay()`：用**被选中策略**的日频信号 + §7 决策表 + 250 根滚动超额收益点估计，逐日回放，产出 `evidence.decision_replay`。
+  **验证**：`method` 字段必须写明近似方式；断言 `trade_count` 与原始信号回测**不同**（证明它真的在跑另一套规则），且 `exposure ∈ [0,1]`。
+  > 允许的近似：不逐日重跑 581 组网格。**禁止**把该结果称为 walk-forward。
+- [ ] **F4 `--as-of` 复盘**（F31）。新增参数，把数据截断到指定日期后完整运行，`data.window_note` 注明。
+  **验证**：`002415 --as-of 2026-10-22` 与 `--as-of 2026-10-23` 的 `data.bars` 分别为 3927 / 3928；后者 `last_close=33.78`。
+
+---
+
+## 11. Phase G — 验证完整性（G1 最先，必须与 F22 同批完成；G2–G7 随各阶段落地）
+
+- [ ] **G1 修 G06 打桩**（F22）。`probe.py::check_windows` 改为打桩 `meta.resolve_and_fetch`；并断言三窗口 `bars` 互不相同。
+  **验证**：`drop120` 下 `bars` 必须等于 `len(full)-120`（002415 应为 3808，当前实测 3928）；三值互不相等。
+- [ ] **G2 打桩自检通用化**（F32）。probe 内所有 monkeypatch 必须紧跟一条"生效断言"；新增 `check_stub_selfcheck()`，任一处缺自检即 FAIL。
+  **验证**：临时移除某处自检 → **G44** FAIL（变异测试）；恢复后 PASS。
+- [ ] **G3 语义门禁 G40**（F23/F24）。断言 `action_reason` 与 `action` 一致、`flat` 时无 `near_sell`、日期与 `age` 自洽。
+- [ ] **G4 统计门禁 G41**（F27）。断言 `significant == (ci_lo>0 and dsr>0)`、`verdict` 与 CI 一致、`p_positive` 与 CI 分位数一致。
+- [ ] **G5 统计门禁 G42**（F28）。断言 `signal_stats` 齐备且 `hit_rate ∈ [0,1]`、`n_sell` 与信号序列一致。
+- [ ] **G6 成交声明门禁 G43**（F29）。断言 `data.execution` 五键齐备且 `fill` 与 `BacktestConfig.exec_price` 一致。
+- [ ] **G7 回归语料**（F34）。9 只实盘标的 × 3 窗口的语义不变式固化为测试（断言不变式，不锁死数值）。
+  **验证**：`pytest -k semantic_corpus` 全绿；任一标的出现"flat + near_sell"即红。
+
+---
+
+## 12. Definition of Done（逐条跑，贴原始输出）
+
+在 `source/` 下：
+
+1. `python -m pytest tests/ -q` → `0 failed / 0 error`，通过数 ≥ **60**（2026-10-25 实测 60）。
+2. `python tools/probe.py all` → **35 个 key 全 PASS**（2026-10-25 实测 35/35）。
+3. `pwsh -File tools/check_gates.ps1 -Full` → `FAIL 0 / BLOCKED 0 / SKIP 0`，退出码 **0**，PASS = **42**。
+4. `python cli.py 002415 --as-of 2026-10-22 --json --fast` → `action=hold`；`signal.position_state=flat`；`signal.last_sell_date=2026-10-20`；`action_reason` **不含** `卖出信号`；`trigger.current != last_close`。
+5. `python cli.py 002415 --as-of 2026-10-23 --json --fast` → 同上，且 `data.last_close=33.78`；`action_reason` 说明"空仓 + 卖点距今 3 个交易日"。
+6. `python cli.py 600519 --json --fast` → `evidence.edge.verdict` 与 `significant` 自洽；`evidence.signal_stats.n_sell > 0`；`data.execution.fill` 非空。
+7. 三窗口（full/drop60/drop120）→ `bars` 三者互不相同，`position_state` 与 `consensus.family` 一致，`stability.action_stable` 如实。
+8. 连跑两次（剔除 `generated_at`/`elapsed_seconds`）JSON 完全相同。
+9. `(Get-Content cli.py).Count` → ≤ **700**。
+10. README 含 §6 全部新字段与 002415 示例；示例 JSON 可解析。
+
+最终报告必须逐条列出实测结果（命令 + 原始输出片段 + 退出码）。**没跑过的写"未验证"，不要写 ✅。**
+
+> **截至 2026-10-25 的实际进度**：第 1–3 项已实测（60 passed / 35 keys 全 PASS / ps1 待用户执行）；
+> 第 4–6 项用截断脚本等价验证通过（`--as-of` 属 F31，尚未实现）；第 7–10 项见 `PROGRESS.md` §2.1。
+
+---
+
+## 13. Boundaries
+
+- **不新增策略、不改网格组数、不调评分权重**。本轮只改语义、评价与验证。
+- **不反转买卖方向**。"低点应买"是一个假设，必须先用 `signal_stats` 量化（F1）再单独提案。
+- **不引入新依赖**（含 scipy / sklearn / hypothesis）；统计一律 numpy 自实现。
+- **不接收账户态**：无资金、无持仓、无成本价；仓位只输出比例。
+- **不新增前端 / 数据库 / 定时任务 / 自动下单**。
+- **不放宽任何现有门禁**；`check_gates.ps1` 与 `probe.py` 只允许加强。
+- **不删除现有测试**；新增用例优先，确需修改必须在 `PROGRESS.md` 写明"错在哪、为什么、怎么算才对"。
+- **如实表达不确定性**：证据不足时 `action` 只能是 `hold`/`avoid`，禁止给方向；`inconclusive` 必须在 warnings 里说清。
 - **不重写 git 历史**；在当前 `main` 工作树内以新提交推进。
-- **B6 验证二若无法达成，必须如实报告实测差异**，禁止调参凑数或修改断言使其假性通过。
