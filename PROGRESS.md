@@ -1,7 +1,7 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
-- **最后更新**：2026-10-25 13:50（**F22–F34 全部完成 13/13**；门禁 48/48；外部验证 V2–V5 已执行）
-- **当前 HEAD**：`a726203`（已推送 `origin/main`：`d4264a4..a726203`）｜工作树仅本台账验证记录待提交
+- **最后更新**：2026-10-25 14:20（**F22–F34 全部完成 13/13**；门禁 48/48；外部验证 V2–V6 已执行）
+- **当前 HEAD**：`01ee33b`（V2–V5 验证记录已推送）｜工作树：V6 台账记录待提交
 - **当前基线**：**门禁 48/48 退出码 0**｜`pytest` **67 passed**｜probe **41 keys 全 PASS**｜`cli.py` 665 行
 - **本轮状态**：v3.0 决策层重写 + F32 打桩自检 + F34 语义语料，全部完成。
 - **门禁已由本机自证**：`check_gates.ps1 -Full -Python <py3.12>` → `PASS 48 / FAIL 0 / BLOCKED 0 / SKIP 0`，退出码 0。
@@ -372,6 +372,7 @@ PASS 46 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0     （370.2s）
 | V3 CLI 语义 | `cli.py 002415 --json --fast --as-of 2026-10-22/23` | 两日均 `action=hold`、`target_position=1.0`、`position_state=holding`；`review_date=11-19/11-20`；全文无“卖出信号/风险提示/减仓” | `evidence/handoff-20261025/hermes.txt` |
 | V4 推送 | `git push origin main` | `d4264a4..a726203`，`push_exit=0`；推送后工作树 clean | `evidence/handoff-20261025/push.txt` |
 | V5 前向台账 | `python tools/forward_log.py record` | 新增 **12 行**，累计 **14 只**；`as_of=2026-10-23`；13 只 `flat/hold` + 002415 `holding` | `evidence/forward_log.csv` |
+| V6 IC 复验 | `warm_cache.py` 沪深300 ×300 + `ic_report.py --min-bars 500` | 298 只可用（297 成分 + 002270）；默认区间 2018-01~2026-10：**mom60 20d IC -0.0171 (t=-2.95)**；2020+ 区间 -0.0261 (t=-4.73)；不重叠 20d **-0.0239 (t=-0.93)**、价差 **+0.499% (t=0.62)** | `evidence/handoff-20261025/V6_IC_REPORT.md` |
 
 **V3 残留风险**：JSON 仍保留 `recommendation.signal.last_sell_date/last_sell_age`、
 `evidence.signal_stats.sell`、`evidence.triggers[].sell_trigger` 等描述字段
@@ -379,4 +380,9 @@ PASS 46 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0     （370.2s）
 `position_state`，禁止按 "sell"/“卖点”关键词扫描**；否则仍会误报。
 **V3 未完成**：Hermes 侧提示词原文、渲染输出、版本与取动作方式需用户补录（本机无 Hermes 入口，未伪造）。
 **V5 尚未到期**：自 2026-10-23 起需 20 个交易日，`evaluate` 目前不会有 `matured=true` 行。
-**V6 未执行**：扩票池复验 IC（200–500 只）为可选项，等待决定。
+**V6 结论（2026-10-25 14:20）**：同一 2020+ 区间（1612 个交易日）下，14 只票 mom60 20 日
+不重叠价差 **+4.17%（t=2.68, n=79）**；297 只沪深300 仅 **+0.499%（t=0.62, n=79）**，
+20 日 IC 符号反转为 **-0.0239（t=-0.93）**。→ **14 只票的横截面动量是选样偏差，
+不作为下一版主线；维持 v3.0 单标的买点+风控路线。** `lowvol20` 在大池 IC 为正、
+Top-Bottom 为负（符号冲突），同样不可用。
+局限：成分取 2026-10-23 名单（幸存者偏差）、新标的仅 2020+、未扣换手成本、非 walk-forward。
