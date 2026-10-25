@@ -241,29 +241,39 @@ def decide(status, state, edge_verdict, confidence, significant) -> str:
 
 ## 8. 稳定性不变式（替换 v1.0 B6 验证一）
 
-v1.0 要求三窗口（full / drop60 / drop120）的 `recommendation.action` 完全一致。为满足它，实现里加了"15 根全真"过滤器——**这是用语义错误换来的稳定**，本轮必须撤掉。
-
-新不变式（对同一标的、同一份缓存，只改窗口）：
+**实验设计更正（2026-10-25）**：v1.0/v2.0 草稿的"三窗口"是从**末尾**砍 60/120 根，
+这等于把决策日也一起往前挪了 60/120 个交易日——不同交易日的仓位本来就该不同，
+测到的是"仓位随时间变化"，不是稳定性。正确做法是**固定决策日、只改训练窗口**（从头砍）：
+`full` / `drop_head60` / `drop_head120`，三者 `data.end` 必须相同。
 
 | 层级 | 要求 | 说明 |
 |---|---|---|
-| L1 必须一致 | `recommendation.signal.position_state` | 决策的真正输入，路径依赖但鲁棒 |
-| L2 必须如实上报 | `evidence.stability.action_stable` / `family_stable` | `action` 允许因窗口不同而变化，但**必须如实报告**，禁止用过滤器凑 `true`；单次运行只跑一个窗口时一律 `null` |
-| L3 必须不同 | 三窗口 `data.bars` **互不相同** | 这是"打桩真的生效"的证据（R5） |
-| 观察项（不判失败） | `evidence.consensus.family` | 它是 40 个族"评分中位数"的 argmax，窗口小幅变化即可翻转；只影响 `invalidation` 文案与 `agreement`，不参与 `action` 计算 |
+| L1 必须一致 | `recommendation.action` | 下游真正消费的东西；若它会因训练窗口而翻转，说明结论不可复现 |
+| L2 必须如实上报 | `position_state` / `family` **允许不同**，但 `stability.*_stable` 不得为 `true` | 换训练窗口后可能换胜出策略，仓位自然不同；只要求不撒谎 |
+| L3 必须不同 | 三窗口 `data.bars` 互不相同 | 打桩生效的证据（R5） |
+| 必须相同 | `data.end` | 否则测的是不同日期 |
 
-**2026-10-25 实测（600519，full/drop60/drop120）**：`bars = 6027 / 5967 / 5907`（互不相同 ✓）、
-`position_state` 三窗口均为 `flat` ✓、`action` 均为 `avoid` ✓、`consensus.family` 在
-`唐奇安` / `ATR通道` 之间漂移（`family_drift=true`，已如实上报，不再声称稳定）。
+**实测（2026-10-25）**
 
-> 原 v2.0 草稿曾把 `family` 也列为 L1 硬不变式。实测表明这会把"两个近似趋势通道族之间
-> 的 argmax 抖动"判成失败，从而逼着实现重新引入某种平滑/过滤器——那正是本轮要拆的东西。
-> 因此改为观察项：**允许漂移，但禁止谎称稳定**。若将来要让 family 真正稳定，应单独提案
-> 族级滞回，不得靠收紧门禁解决。
+| 标的 | 三窗口 `action` | `position_state` | 胜出策略 | 判定 |
+|---|---|---|---|---|
+| 002415 | `hold` ×3 | `flat` ×3，`state=near_buy` ×3 | 均线趋势(5-30-120) ×3 | 完全一致 |
+| 600519 | `avoid` ×3 | `flat`/`flat`/`holding` | 唐奇安(30/20) → (20/10) | `action` 稳定；`position_drift=true` 如实上报 |
 
-若 L1 实测不稳，允许的处理顺序是：族级共识 → 评分平滑 → 滞回（带明确状态转移条件）。**不允许**重新引入"连续 N 根"或"末根瞬时态"之类的口径把差异藏起来。
+> 600519 的漂移不是噪声：丢掉最老 120 根后，唐奇安的参数从 (30/20) 变成 (20/10)，
+> 其仓位历史自然不同。因为 `status=no_edge` → `action=avoid`，这个漂移不影响建议。
+> **禁止**为了让 `position_state` 一致而重新引入任何过滤器或平滑——那正是 15 根过滤器的老路。
 
----
+### 8.1 为什么必须撤掉 15 根过滤器
+
+`cli.py` 原实现要求"最近 15 根全部为真"才算强触发，注释写明动机是"避免瞬时单根信号
+在三窗口间翻转 —— G06 稳定的前提"。但：
+
+1. 均线交叉是**单根事件**，连续 15 根全为真数学上不可能 → 事件型策略的 `action` 被钉死为 `hold`；
+2. 它把"稳定性"建立在一个**测错了的实验**（末尾砍窗口）之上；
+3. 于是系统用语义错误换来了绿灯，而 002415 在 10-22 的"卖出信号"正是这套口径的产物。
+
+撤掉后：`action` 由决策表产生，稳定性由"固定决策日 + 只改训练窗口"重新度量。
 
 ## 9. Phase E — 语义（P0，先做）
 
@@ -314,12 +324,12 @@ v1.0 要求三窗口（full / drop60 / drop120）的 `recommendation.action` 完
 在 `source/` 下：
 
 1. `python -m pytest tests/ -q` → `0 failed / 0 error`，通过数 ≥ **60**（2026-10-25 实测 60）。
-2. `python tools/probe.py all` → **35 个 key 全 PASS**（2026-10-25 实测 35/35）。
-3. `pwsh -File tools/check_gates.ps1 -Full` → `FAIL 0 / BLOCKED 0 / SKIP 0`，退出码 **0**，PASS = **42**。
-4. `python cli.py 002415 --as-of 2026-10-22 --json --fast` → `action=hold`；`signal.position_state=flat`；`signal.last_sell_date=2026-10-20`；`action_reason` **不含** `卖出信号`；`trigger.current != last_close`。
-5. `python cli.py 002415 --as-of 2026-10-23 --json --fast` → 同上，且 `data.last_close=33.78`；`action_reason` 说明"空仓 + 卖点距今 3 个交易日"。
+2. `python tools/probe.py all` → **37 个 key 全 PASS**（2026-10-25 实测 37/37）。
+3. `pwsh -File tools/check_gates.ps1 -Full` → `FAIL 0 / BLOCKED 0 / SKIP 0`，退出码 **0**，PASS = **44**。
+4. `python cli.py 002415 --as-of 2026-10-22 --json --fast` → `data.bars=3927`、`data.end=2026-10-22`、`data.last_close=32.42`；`action=hold`；`signal.position_state=flat`；`action_reason` **不含** `卖出信号`；`trigger.current != last_close`；`request.as_of=2026-10-22`。
+5. `python cli.py 002415 --as-of 2026-10-23 --json --fast` → `bars=3928`、`last_close=33.78`；`signal.last_sell_age` 比上一窗口恰好 +1（决策日推进一天，卖点年龄同步推进）。
 6. `python cli.py 600519 --json --fast` → `evidence.edge.verdict` 与 `significant` 自洽；`evidence.signal_stats.n_sell > 0`；`data.execution.fill` 非空。
-7. 三窗口（full/drop60/drop120）→ `bars` 三者互不相同，`position_state` 与 `consensus.family` 一致，`stability.action_stable` 如实。
+7. 三窗口（固定决策日：full / drop_head60 / drop_head120）→ `bars` 三者互不相同、`data.end` 三者相同、`action` 三者一致；`position_state` 若漂移，`position_drift` 必须如实为 `true`。
 8. 连跑两次（剔除 `generated_at`/`elapsed_seconds`）JSON 完全相同。
 9. `(Get-Content cli.py).Count` → ≤ **700**。
 10. README 含 §6 全部新字段与 002415 示例；示例 JSON 可解析。

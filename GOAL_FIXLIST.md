@@ -57,9 +57,9 @@ A1–A14、B1–B9、C1–C8、D1–D6 已全部交付并由下游 Agent 真机�
 | `[x]` | **F23** 文案在动作之前生成 + 死参数 | P0 | **新建** `decision/render.py`、`cli.py` | G40 |
 | `[x]` | **F27** `significant` 语义过宽（p=3.5% 仍为 true） | P1 | `cli.py`、`decision/scoring.py` | G41 |
 | `[x]` | **F28** 无信号级评价（卖点后到底涨还是跌） | P1 | **新建** `decision/evaluate.py`、`cli.py` | G42 |
-| `[ ]` | **F29** 成交时点未声明且不可配 | P1 | `engine.py`、`cli.py`、`schema.py` | G43 |
+| `[x]` | **F29** 成交时点未声明且不可配 | P1 | `engine.py`、`cli.py`、`schema.py` | G43 |
 | `[ ]` | **F30** 回测不评价线上规则 | P1 | `decision/evaluate.py`、`cli.py` | G42 |
-| `[ ]` | **F31** 无 `--as-of`，无法复盘历史截面 | P2 | `cli.py`、`decision/__init__.py` | G40 |
+| `[x]` | **F31** 无 `--as-of`，无法复盘历史截面 | P2 | `cli.py`、`decision/__init__.py` | G40 |
 | `[ ]` | **F32** 打桩自检未通用化 | P1 | `tools/probe.py` | G44 |
 | `[ ]` | **F33** README 契约章节缺新字段 | P2 | `README.md` | —（C2 已覆盖） |
 | `[ ]` | **F34** 9 只标的语义回归语料缺失 | P2 | `tests/test_semantic_corpus.py` | G40 |
@@ -111,7 +111,12 @@ actual_end                      = 2026-10-23
    assert got == len(full) - drop, f"打桩未生效：期望 {len(full)-drop}，实得 {got}"
    ```
 3. 三窗口结果里增加 `bars` 字段，断言 `len(set(bars)) == 3`。
-4. 判据从"`action` 完全一致"改为契约 §8 的三层不变式：`position_state` 与 `family` 一致、`action_stable` 如实、`bars` 互不相同。
+4. 判据按契约 §8 重写（**2026-10-25 已更正实验设计**）：
+   - **固定决策日、从头砍训练窗口**（`full` / `drop_head60` / `drop_head120`），三者 `data.end` 必须相同。
+     原实现从**末尾**砍，等于把决策日也往前挪了 60/120 天——不同日期的仓位本来就该不同，
+     那不是稳定性问题。这是本轮发现的第二个"门禁本身错了"。
+   - L1 `action` 必须一致；L2 `position_state`/`family` 允许变化但 `stability` 不得谎称稳定；
+     L3 `bars` 必须互不相同。
 
 **验收**（在 `source/` 下）
 ```powershell
