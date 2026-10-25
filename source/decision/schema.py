@@ -230,6 +230,19 @@ def window_note(start=None, as_of=None, bars=0):
     return f"{' + '.join(parts)} 截取后 {int(bars or 0)} 根" if parts else None
 
 
+def review_date(last_date, horizon: int):
+    """v3.0：复审日 = 决策日 + horizon 个工作日（按工作日推算，非交易所日历）。
+
+    只用于告诉调用方"什么时候该重新看"，不参与任何计算。
+    """
+    try:
+        import pandas as pd
+        start = pd.Timestamp(str(last_date)[:10])
+        return str(pd.bdate_range(start, periods=int(horizon) + 1)[-1].date())
+    except Exception:
+        return None
+
+
 def execution_block(config=None) -> dict:
     """F29：成交假设（与 BacktestConfig 同源，禁止在别处再写一份）。
 
@@ -262,7 +275,9 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
     """
     from .instrument import classify_board
     from .signals import null_signal as _null_signal
-    from .evaluate import null_stats, null_replay
+    from .evaluate import null_stats
+    from .policy import null_policy
+    from .expectancy import null_expectancy as _null_expectancy
 
     fi = dict(fetch_info or {})
     try:
@@ -309,6 +324,10 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'action_reason': [message],
             # F24: 与成功路径同构（G35 递归比对键集合）；无信号时全部显式 null
             'signal': _null_signal(),
+            # v3.0: 目标仓位 / 复审日 / 该侧条件期望
+            'target_position': 0.0,
+            'review_date': None,
+            'side_expectancy': _null_expectancy(),
             'confidence': 0.0,
             'position_fraction': 0.0,
             # 未知持仓时长时给 [null, null] 而不是编造 [1, 5]
@@ -336,7 +355,7 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             # F28: 信号级统计；无信号时保留键、值为 null
             'signal_stats': null_stats('无可用信号，无法统计'),
             # F30: 决策回放；无数据时键齐全、值为 null
-            'decision_replay': null_replay('无可用信号，无法回放'),
+            'decision_replay': null_policy('无可用信号，无法回放'),
             'metrics': empty_metrics(),
             'excess_vs_buy_hold': {'point': None, 'ci_95': None,
                                    'p_positive': None, 'n_obs': 0,

@@ -19,8 +19,10 @@ from stock_analysis.strategy.registry import (
 from fund_analysis.fund_strategy.registry import (
     build_fund_strategy_signals, grid_size, family_map as fund_family_map,
 )
+
 from decision.instrument import classify_board
-from decision.schema import EXIT_CODES, exit_code_for, execution_block, window_note  # noqa: F401
+from decision.schema import (EXIT_CODES, exit_code_for, execution_block,  # noqa: F401
+                             window_note, review_date as schema_review_date)
 from decision import sizing
 from decision.scoring import (  # noqa: F401
     risk_adjusted_score,
@@ -41,6 +43,7 @@ from decision.scoring import (  # noqa: F401
 from decision.consensus import select_consensus
 from decision.triggers import evaluate_triggers
 from decision import signals as sig_mod, actions as act_mod, render as rnd_mod, evaluate as ev_mod
+from decision import expectancy as exp_mod, policy as pol_mod
 
 # ---------------------------------------------------------------------------
 # tests/ 契约入口（source/tests/test_p2_engineering.py::test_cli_offline_import_and_fund_split）
@@ -51,6 +54,13 @@ from fund_analysis.fund_backtest import (  # noqa: F401
     _fund_backtest_signals,
     _fund_backtest_with_stats,
 )
+
+# v3.0 契约：默认有效期 20 个交易日（横截面 IC 在 20 日达峰 t=4.4）。
+# 所有评价、复审日、失效条件都以它为准；1–5 日尺度不给方向。
+HORIZON = 20
+
+# 兼容旧调用点/测试：指标组装已迁至 decision.evaluate，这里保留同名入口。
+_build_metrics = ev_mod.build_metrics
 
 
 def _build_stock_strategies():
@@ -100,22 +110,6 @@ from decision.schema import (  # noqa: E402
     create_error_response,
 )
 from decision.schema import empty_metrics as _empty_metrics  # noqa: E402
-
-
-def _ci_block(values, stat_fn, point, n_boot):
-    """F10: 组装 {'point', 'ci_95'}；CI 覆盖点估计，样本不足时 ci_95 为 None。"""
-    try:
-        point = float(point)
-    except (TypeError, ValueError):
-        point = 0.0
-    if not np.isfinite(point):
-        # 非有限值（如零亏损时的 profit_factor=inf）不得进 JSON：显式 null
-        return {'point': None, 'ci_95': None}
-    out = metric_with_ci(values, stat_fn, n_boot=n_boot)
-    ci = out.get('ci_95')
-    if ci:
-        ci = [round(min(ci[0], point), 6), round(max(ci[1], point), 6)]
-    return {'point': round(point, 6), 'ci_95': ci}
 
 
 def _stability_score(consensus):
@@ -194,40 +188,6 @@ def _market_regime(df):
             'as_of': str(df.index[-1]) if df is not None and len(df) else '',
             'definition': 'unavailable',
         }
-
-def _build_metrics(result, fast=False):
-    """F10/B7: evidence.metrics 逐项填 point + bootstrap 95% CI。
-
-    数据源：result.equity_curve（收益类）与 result.trades（逐笔类）。
-    计数型指标（trade_count）与状态型指标（time_in_market）不适用 bootstrap，ci_95 显式 None。
-    """
-    rets = equity_to_returns(list(getattr(result, 'equity_curve', None) or []))
-    trades = list(getattr(result, 'trades', None) or [])
-    pnl = [float(t.pnl_pct) for t in trades]
-    hold = [float(t.holding_days) for t in trades]
-    nb = 400 if fast else 2000
-    block = {
-        'annual_return': _ci_block(rets, stat_annual_return, getattr(result, 'annual_return', 0), nb),
-        'max_drawdown': _ci_block(rets, stat_max_drawdown, getattr(result, 'max_drawdown', 0), nb),
-        'win_rate': _ci_block(pnl, stat_win_rate, getattr(result, 'win_rate', 0), nb),
-        'sharpe': _ci_block(rets, stat_sharpe, getattr(result, 'sharpe_ratio', 0), nb),
-        'calmar': _ci_block(rets, stat_calmar, getattr(result, 'calmar_ratio', 0), nb),
-        'profit_factor': _ci_block(pnl, stat_profit_factor, getattr(result, 'profit_factor', 0), nb),
-        'trade_count': {'point': int(getattr(result, 'trade_count', 0) or 0), 'ci_95': None},
-        'avg_holding_days': _ci_block(hold, lambda v: float(np.mean(v)),
-                                      getattr(result, 'avg_holding_days', 0), nb),
-        'time_in_market': {'point': round(float(getattr(result, 'time_in_market', 0.0) or 0.0), 6),
-                           'ci_95': None},
-    }
-    # C3/G35: 与 _empty_metrics() 的键集合必须完全一致，否则成功路径与错误路径再次不同构。
-    # 只在开发者改了其中一侧时才会触发，属自检而非业务校验。
-    if set(block) != set(METRIC_KEYS):
-        raise RuntimeError(
-            'evidence.metrics 键集合漂移（C3 同构被破坏）：'
-            f'仅在一侧存在 {sorted(set(block) ^ set(METRIC_KEYS))}'
-        )
-    return block
-
 
 def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
                     fast=False, detail=False, no_regime=False, opt_iters=30,
@@ -405,17 +365,28 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     # F24/F25: 信号状态机 —— 事件 / 历史 / 指标值三者分离（契约 v2.0 §6.1）
     #   旧实现把"近 10 根内出现过卖点"当成 near_sell，且 trigger.current 恒等于收盘价，
     #   于是 10-20 的死叉会让 10-21~11-03 天天报"卖出信号"，10-23 大涨当天也不例外。
+    # v3.0：条件期望 + 策略引擎（买入看期望、卖出只看风控）
+    #   依据（2026-10-25 实测）：买点后 20 日 +1.72%、13/14 只为正；
+    #   卖点后 20 日 +1.04%、仅 5/14 只为负 → 趋势反转卖出是负期望，不能用来清仓。
+    exp_buy = exp_mod.side_expectancy(df['close'], signals['buy'], horizon=HORIZON, side='buy')
+    exp_ok = exp_mod.trailing_expectancy_ok(df['close'], signals['buy'], horizon=HORIZON)
+    policy_block = pol_mod.run_policy(df, signals['buy'], exp_ok, horizon=HORIZON,
+                                      exec_price=config.exec_price)
     _inst = getattr(strategies.get(best_name), '__self__', None)
     _family = fam_map.get(best_name)
     _indicator = sig_mod.describe_indicator(_inst, _family, df)
-    signal_block = sig_mod.build(df, signals['buy'], signals['sell'],
-                                 strategy=best_name, indicator=_indicator)
+    signal_block = sig_mod.build(df, signals['buy'], signals['sell'], strategy=best_name,
+                                 indicator=_indicator, policy=policy_block)
     triggers = evaluate_triggers(df, {best_name: signals}, signal_block=signal_block)
     # F28: 信号级统计（每次买卖点后 1/3/5/10/20 日收益、误报率、踏空成本）
     stats_block = ev_mod.signal_stats(df, signals['buy'], signals['sell'], strategy=best_name)
     if signal_block['current_value'] is None:
         warnings.append(
             f"策略族 '{_family}' 未提供可复算的指标值：trigger.current 为 null（不以收盘价顶替）")
+    if not exp_buy['ok']:
+        warnings.append(
+            f"买侧 {HORIZON} 日期望不足（n={exp_buy['n']}，t={exp_buy['t_stat']}）："
+            "不给买入方向，仅保留风控")
 
     # 计算置信度 - Fast mode: reduce bootstrap iterations
     # B4: 真实 Deflated Sharpe（同频口径）；F03: 分母用真实试验次数
@@ -466,16 +437,15 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     else:
         status = 'ok'
 
-    # F26: 动作 = 决策表（唯一真源，契约 §7）
-    action = act_mod.decide(
-        status, signal_block['state'], edge_verdict, confidence, significant)
-    # F23: 文案必须在 action 之后生成（旧实现在 action 之前写死，导致 hold + "卖出信号"）
+    # v3.0 决策表：买入看条件期望，卖出只看风控；no_edge 不再阻断交易
+    action = act_mod.decide(status, policy_block['pending'], bool(exp_buy['ok']),
+                            bool(policy_block['holding']))
+    target_position = act_mod.target_position_for(action, bool(policy_block['holding']))
+    review_date = schema_review_date(df.index[-1], HORIZON)
     action_reason = rnd_mod.build_reasons(
-        action, signal_block, {'verdict': edge_verdict}, status=status)
-    # F30: 决策回放 —— 评价 Hermes 实际收到的那条规则（近似口径见 method 字段）
-    replay_block = ev_mod.decision_replay(
-        df, signals['buy'], signals['sell'], status=status, confidence=confidence,
-        significant=significant, exec_price=config.exec_price)
+        action, signal_block, exp_buy, policy_block, status=status,
+        review_date=review_date, horizon=HORIZON)
+    replay_block = pol_mod.public_view(policy_block)
 
     # F12: 止损/止盈/入场区/仓位/horizon 全部由 decision.sizing 推导（cli 不再写字面量）
     atr_val = None
@@ -564,9 +534,13 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'action_reason': action_reason,
             # F24/F25: 仓位、信号状态、指标值、信号日期与年龄（契约 §6.1）
             'signal': signal_block,
+            # v3.0: 目标仓位 + 复审日 + 该侧条件期望
+            'target_position': target_position,
+            'review_date': review_date,
+            'side_expectancy': exp_buy,
             'confidence': round(confidence, 3),
             'position_fraction': round(position_fraction, 3),
-            'horizon_days': horizon,
+            'horizon_days': [HORIZON, HORIZON],
             'entry_zone': entry_zone,
             'stop_loss': stops['stop_loss'],
             'take_profit': stops['take_profit'],
@@ -593,7 +567,7 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'signal_stats': stats_block,
             # F30: 决策回放（按线上决策表执行，近似口径写在 method）
             'decision_replay': replay_block,
-            'metrics': _build_metrics(result, fast),
+            'metrics': ev_mod.build_metrics(result, fast),
             'excess_vs_buy_hold': exc,
             'buy_hold_baseline': calc_buy_hold_baseline(df, config),
             # F06g: 分市况胜率（此前是空占位 {}）

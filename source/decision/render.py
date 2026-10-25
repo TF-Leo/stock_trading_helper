@@ -49,44 +49,64 @@ def _near_phrase(state: Optional[str]) -> Optional[str]:
 
 
 def build_reasons(action: str, signal: Dict[str, Any],
-                  edge: Optional[Dict[str, Any]] = None,
-                  status: Optional[str] = None) -> List[str]:
-    """生成 `recommendation.action_reason`（1–3 条）。"""
+                  expectancy: Optional[Dict[str, Any]] = None,
+                  policy: Optional[Dict[str, Any]] = None,
+                  status: Optional[str] = None,
+                  review_date: Optional[str] = None,
+                  horizon: int = 20) -> List[str]:
+    """生成 `recommendation.action_reason`（1–3 条）。
+
+    v3.0 规则：
+      1. 每条都带日期与有效期，读者能判断"什么时候该重新看"；
+      2. `action=hold` 时禁止出现"卖出信号"/"买入信号"，历史信号只写"卖点/买点 + 日期"；
+      3. `action=sell` 必须说明是哪种风控（止损/止盈/时间止损），并声明"不代表趋势判断"；
+      4. `action=buy` 必须给出该侧条件期望的数值（均值/样本/命中/t 值）。
+    """
+    from .actions import EXIT_LABELS
+
     signal = signal or {}
-    edge = edge or {}
+    expectancy = expectancy or {}
+    policy = policy or {}
     as_of = signal.get('as_of') or '未知日期'
-    pos = _position_phrase(signal)
     reasons: List[str] = []
 
+    mean = expectancy.get('mean')
+    n = expectancy.get('n')
+    hit = expectancy.get('hit_rate')
+    t = expectancy.get('t_stat')
+    exp_txt = (f"{horizon} 日期望 {mean:+.2%}（n={n}，命中 {hit:.1%}，t={t:+.1f}）"
+               if None not in (mean, n, hit, t) else f"{horizon} 日期望样本不足")
+
     if action == 'sell':
-        # 规则 3：明确"今日触发"与仓位变化
-        reasons.append(f"今日（{as_of}）触发卖点，策略由持有转为空仓")
-        reasons.append(pos)
+        kind = EXIT_LABELS.get(policy.get('pending') or '', '风控')
+        reasons.append(f"今日（{as_of}）触发{kind}，目标仓位 0%")
+        reasons.append("这是风控离场（止损/止盈/到期），不代表趋势判断")
+        if review_date:
+            reasons.append(f"{review_date} 后可重新评估入场")
 
     elif action == 'buy':
-        # 规则 4：今日触发 + 证据等级
-        verdict = edge.get('verdict') or 'inconclusive'
-        reasons.append(f"今日（{as_of}）触发买点，证据等级 {verdict}")
-        reasons.append(pos)
+        reasons.append(f"今日（{as_of}）触发买点；{exp_txt}")
+        tail = "目标仓位 100%"
+        if policy.get('stop_price') is not None and policy.get('target_price') is not None:
+            tail += f"，止损 {policy['stop_price']}，止盈 {policy['target_price']}"
+        reasons.append(tail + (f"；{review_date} 复审" if review_date else ""))
 
     elif action == 'avoid':
-        why = "无统计优势，建议不参与" if status == 'no_edge' else "不可交易或结果不可信，建议不参与"
-        reasons.append(f"{pos}；{why}")
+        reasons.append("不可交易或结果不可信，建议不参与")
 
     elif action == 'insufficient_data':
         reasons.append("数据不足，无法给出方向")
 
     else:  # hold
-        # 规则 2：不得出现"卖出信号"/"买入信号"
-        tail = "今日无新信号，维持当前仓位"
-        near = _near_phrase(signal.get('state'))
-        if near:
-            tail = f"{tail}；{near}"
-        reasons.append(f"{pos}；{tail}")
-
-    # 规则 5：证据等级为负时如实提示，避免下游把 hold 当成"看多"
-    if edge.get('verdict') == 'negative_significant':
-        reasons.append("超额收益显著为负，该策略不宜作为择时依据")
+        if policy.get('holding'):
+            reasons.append(
+                f"持有中（第 {policy.get('bars_held', 0)}/{horizon} 个交易日，"
+                f"入场 {policy.get('entry_date')} @ {policy.get('entry_price')}）；未触发风控")
+            tail = (f"止损 {policy.get('stop_price')}、止盈 {policy.get('target_price')}"
+                    if policy.get('stop_price') is not None else "止损/止盈不可用")
+            reasons.append(tail + (f"；{review_date} 复审" if review_date else ""))
+        else:
+            reasons.append(f"策略当前空仓；今日无合格买点（{exp_txt}）")
 
     return reasons[:3]
 

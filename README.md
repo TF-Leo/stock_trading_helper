@@ -64,25 +64,28 @@ python cli.py 600519 --start 20200101 --json
 - **action**: `buy` / `sell` / `hold` / `avoid` / `insufficient_data`
 - **trigger.state**: `buy_triggered` / `near_buy` / `neutral` / `near_sell` / `sell_triggered`
 
-### v2.0 语义变更（**消费方必读**）
+### v3.0 语义（**消费方必读**）
 
-2026-10-25 修复了一类"字面意思与内部事实不一致"的事故：`action=hold` 却输出
-`均线趋势(3-30-60): 卖出信号 (32.42)`，而 32.42 是当日收盘价、死叉发生在两天前。
-请按下面两条读：
+2026-10-25 架构复审（`ARCHITECTURE_REVIEW.md`）后，输出的含义有三处根本变化：
 
-1. **`action` 是"增量动作"，不是对行情的判断。**
-   `buy` = 相对当前空仓建仓，`sell` = 相对当前持仓清仓，`hold` = 不动作。
-   当前仓位由 `recommendation.signal.position_state`（`flat` / `holding`）单独给出。
-   **不要**从 `action_reason` 里抓关键词反推动作——`hold` 的文案里可能出现"卖点"二字，
-   那是在描述**历史**（带日期），不是当前建议。
+1. **每条建议都有有效期。** `recommendation.horizon_days` 固定为 `[20, 20]`，
+   `review_date` 给出复审日。**这不是"今天买、明天看"的信号** —— 实测 1–5 日尺度
+   IC 不显著（|t|<2），20 日尺度才有边际。请不要用它做次日交易判断。
 
-2. **`near_buy` / `near_sell` 表示"接近阈值"，不表示"曾经发生过"。**
-   历史信号请看 `signal.last_buy_date` / `last_sell_date` 与 `last_*_age`（交易日数）。
+2. **`action` 是"相对当前仓位的增量动作"，且买入与卖出用不同机制。**
+   - `buy`：当根买点 + 该侧 20 日条件期望达标（`side_expectancy.ok=true`）。
+     **不再要求**"策略全样本 alpha 显著"——那是"策略值不值得信"的检验，不是单笔门槛。
+   - `sell`：**只由风控触发**（止损 / 止盈 / 时间止损），文案会说明是哪一种。
+     "跌破均线/死叉"**不再产生卖出**：实测卖点后 20 日平均 +1.04%、仅 5/14 只为负。
+   - `hold`：不动作。`action_reason` 里可能出现"买点"二字，那是在描述**历史**（带日期）。
+   - `target_position`（0/0.5/1.0）给出动作后的目标仓位，`signal.position_state` 给出当前仓位。
+
+3. **`near_buy` / `near_sell` 表示"接近阈值"，不表示"曾经发生过"。**
+   历史信号看 `signal.last_buy_date` / `last_sell_date` 与 `last_*_age`。
    硬规则：`position_state=flat` 时不会出现 `near_sell` 或 `sell_triggered`。
 
-3. **`significant` 的语义已收紧**为"统计上可证明有正超额优势"（`edge.verdict ==
-   positive_significant` 且 DSR>0）。旧版只要求"CI 上界>0"，会让 `p_positive=3.5%`
-   的策略也被标成显著。判断证据强弱请直接看 `evidence.edge.verdict` 三档。
+`evidence.significant` 仍然输出，但**只描述"该策略全样本超额收益是否显著"**，
+不参与 `action` 判定；判断"这笔该不该做"请看 `recommendation.side_expectancy`。
 
 ### 完整字段表
 
@@ -135,15 +138,15 @@ python cli.py 600519 --start 20200101 --json
   "recommendation": {
     "status": "ok",
     "action": "hold",
-    "action_reason": ["策略当前空仓（2026-10-21 卖点离场，距今 1 个交易日）；今日无新信号，维持当前仓位；指标已接近买点阈值，但尚未触发"],
+    "action_reason": ["持有中（第 4/20 个交易日，入场 2026-10-19 @ 33.3333）；未触发风控", "止损 31.6494、止盈 36.0276；2026-11-19 复审"],
     "signal": {
       "strategy": "均线趋势(5-30-120)",
       "indicator": "MA5/MA30",
-      "position_state": "flat",
-      "state": "near_buy",
+      "position_state": "holding",
+      "state": "near_sell",
       "as_of": "2026-10-22",
-      "last_buy_date": "2026-10-20",
-      "last_buy_age": 2,
+      "last_buy_date": "2026-10-19",
+      "last_buy_age": 3,
       "last_sell_date": "2026-10-21",
       "last_sell_age": 1,
       "current_value": 0.9903,
@@ -151,9 +154,13 @@ python cli.py 600519 --start 20200101 --json
       "threshold": {"buy": 1.0, "sell": 1.0},
       "conflict": false
     },
+    "target_position": 1.0,
+    "review_date": "2026-11-19",
+    "side_expectancy": {"side": "buy", "horizon": 20, "mean": 0.02874,
+                        "hit_rate": 0.5931, "n": 231, "t_stat": 4.2, "ok": true},
     "confidence": 0.65,
     "position_fraction": 0.20,
-    "horizon_days": [5, 20],
+    "horizon_days": [20, 20],
     "entry_zone": [1302.42, 1355.58],
     "stop_loss": 1262.55,
     "take_profit": 1461.90,

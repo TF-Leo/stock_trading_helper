@@ -35,6 +35,8 @@ REQUIRED_REC_KEYS = [
     "status", "action", "action_reason", "confidence", "position_fraction",
     "horizon_days", "entry_zone", "stop_loss", "take_profit",
     "distance_to_trigger", "invalidation", "stop_method", "no_edge",
+    # v3.0：有效期契约（G47 校验其内部自洽）
+    "signal", "target_position", "review_date", "side_expectancy",
 ]
 # F06f/F20 的数据新鲜度字段同样锁定，防止"降级不可见"回归。
 # window_note（2026-10-18 补登）：`--start` 生效时的截取说明，两条路径都输出。
@@ -167,8 +169,16 @@ def check_semantic_consistency(data):
             problems.append(f"首选候选评分 {top_score} 却给 action=buy")
     if rec.get("action") == "buy" and (rec.get("confidence") or 0) <= 0:
         problems.append("action=buy 但 confidence<=0")
-    if rec.get("action") == "buy" and (data.get("evidence") or {}).get("significant") is False:
-        problems.append("action=buy 但 evidence.significant=False（B4 要求不显著时不得给出买入）")
+    # v3.0：买入不再要求全样本 alpha 显著（那是"策略值不值得信"的检验，
+    # 不是"这笔能不能做"的门槛）。买入改由 side_expectancy.ok 决定，见 G47。
+    if rec.get("action") == "buy":
+        exp = rec.get("side_expectancy") or {}
+        if exp.get("ok") is not True:
+            problems.append("action=buy 但 side_expectancy.ok 不为 true（买侧期望不达标）")
+    if rec.get("action") == "sell":
+        txt = " ".join(rec.get("action_reason") or [])
+        if not any(k in txt for k in ("止损", "止盈", "时间止损", "风控")):
+            problems.append("action=sell 但文案未说明风控类型（趋势卖出已废弃）")
     return {
         "status": "FAIL" if problems else "PASS",
         "reason": "; ".join(problems),
@@ -1593,37 +1603,79 @@ def check_as_of(code="002415"):
 
 
 def check_replay(stock_data=None):
-    """G46：`evidence.decision_replay` 必须真按决策表回放且内部自洽（F30）。"""
+    """G46：`evidence.decision_replay` 必须真按**策略引擎**回放且内部自洽（v3.0）。
+
+    v3.0 的回放对象是"买点+条件期望入场、止损/止盈/时间止损出场"，
+    不再是"原始信号买点买、卖点卖"。
+    """
     if stock_data is None:
         return {"status": "BLOCKED", "reason": "无股票输出"}
     ev = stock_data.get("evidence") or {}
     r = ev.get("decision_replay") or {}
     rec = stock_data.get("recommendation") or {}
     need = ("method", "trade_count", "annual_return", "max_drawdown",
-            "exposure", "vs_buy_hold", "note")
+            "exposure", "vs_buy_hold", "exit_reasons", "note")
     problems = [f"缺 {k}" for k in need if k not in r]
     if problems:
         return {"status": "FAIL", "reason": "; ".join(problems), "observed": r}
 
-    if not str(r.get("method") or "").startswith("trailing_"):
-        problems.append(f"method={r.get('method')!r} 未声明近似口径")
+    if not str(r.get("method") or "").startswith("policy_h"):
+        problems.append(f"method={r.get('method')!r} 未声明为策略引擎口径")
     if "walk" in str(r.get("method") or "").lower():
-        problems.append("method 不得声称 walk-forward（参数仍来自全样本选择）")
+        problems.append("method 不得声称 walk-forward")
     exp = r.get("exposure")
     if exp is None or not (0.0 <= float(exp) <= 1.0):
         problems.append(f"exposure={exp} 越界")
+    reasons = r.get("exit_reasons") or {}
+    bad = set(reasons) - {"stop", "target", "time"}
+    if bad:
+        problems.append(f"exit_reasons 出现非风控类型 {sorted(bad)}（趋势卖出已废弃）")
     if int(r.get("trade_count") or 0) == 0 and not r.get("note"):
         problems.append("零交易却没有 note 说明原因")
-    # 与决策表一致：不显著时不得有买入
-    if rec.get("status") == "ok" and ev.get("significant") is False:
-        if int(r.get("trade_count") or 0) != 0:
-            problems.append(f"significant=False 但回放成交 {r.get('trade_count')} 笔"
-                            "（决策表不允许买入，二者矛盾）")
+    # 买侧期望可用且有足够历史时，引擎必须真的产生过交易
+    if (rec.get("side_expectancy") or {}).get("ok") is True and (stock_data.get("data") or {}).get("bars", 0) > 400:
+        if int(r.get("trade_count") or 0) == 0:
+            problems.append("买侧期望可用却零交易（引擎未生效）")
     return {"status": "PASS" if not problems else "FAIL",
             "reason": "; ".join(problems),
             "observed": {"method": r.get("method"), "trade_count": r.get("trade_count"),
                          "exposure": exp, "vs_buy_hold": r.get("vs_buy_hold"),
-                         "note": r.get("note")}}
+                         "exit_reasons": reasons}}
+
+
+def check_horizon_contract(stock_data=None):
+    """G47：有效期契约 —— target_position / review_date / horizon_days 自洽（v3.0）。"""
+    if stock_data is None:
+        return {"status": "BLOCKED", "reason": "无股票输出"}
+    rec = stock_data.get("recommendation") or {}
+    sig = rec.get("signal") or {}
+    problems, obs = [], {}
+    tp = rec.get("target_position")
+    hd = rec.get("horizon_days") or []
+    rd = rec.get("review_date")
+    exp = rec.get("side_expectancy") or {}
+    obs = {"action": rec.get("action"), "target_position": tp,
+           "horizon_days": hd, "review_date": rd,
+           "position_state": sig.get("position_state")}
+
+    if tp is None or float(tp) not in (0.0, 0.5, 1.0):
+        problems.append(f"target_position={tp!r}（应为 0/0.5/1.0）")
+    if not (isinstance(hd, list) and len(hd) == 2 and hd[0] == hd[1] and int(hd[0]) == 20):
+        problems.append(f"horizon_days={hd}（v3.0 固定为 [20, 20]）")
+    if not rd or not isinstance(rd, str) or len(rd) != 10:
+        problems.append(f"review_date={rd!r} 缺失或格式非法")
+    if exp.get("horizon") != 20:
+        problems.append(f"side_expectancy.horizon={exp.get('horizon')}（应为 20）")
+    # 动作与目标仓位必须一致
+    act = rec.get("action")
+    if act == "buy" and float(tp) != 1.0:
+        problems.append(f"action=buy 但 target_position={tp}")
+    if act == "sell" and float(tp) != 0.0:
+        problems.append(f"action=sell 但 target_position={tp}")
+    if act == "hold" and sig.get("position_state") == "holding" and float(tp) != 1.0:
+        problems.append("持有中且 hold，但 target_position 不是 1.0")
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
 
 
 def main():
@@ -1669,8 +1721,10 @@ def main():
     # 本轮新增：G43 成交口径 / G45 历史复盘
     run("execution", lambda: check_execution(stock_data))
     run("as_of", check_as_of)
-    # F30：决策回放
+    # F30：决策回放（v3.0 起为策略引擎口径）
     run("replay", lambda: check_replay(stock_data))
+    # v3.0：有效期契约
+    run("horizon", lambda: check_horizon_contract(stock_data))
     run("placeholders", lambda: check_placeholders(stock_data, fund_data))
     run("family_ratio", lambda: check_family_ratio(stock_data, fund_data))
     run("metrics_ci", lambda: check_metrics_ci(stock_data))

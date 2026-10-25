@@ -109,7 +109,8 @@ def _safe_last(series) -> Optional[float]:
 
 
 def build(df: pd.DataFrame, buy, sell, strategy: Optional[str] = None,
-          indicator: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+          indicator: Optional[Dict[str, Any]] = None,
+          policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """产出契约 §6.1 的 `recommendation.signal` 块。
 
     Args:
@@ -149,19 +150,34 @@ def build(df: pd.DataFrame, buy, sell, strategy: Optional[str] = None,
     sell_event = s & (prev == 1)
 
     last = n - 1
-    holding = bool(pos[last] == 1)
-
-    if buy_event[last]:
-        state = 'buy_triggered'
-    elif sell_event[last]:
-        state = 'sell_triggered'
-    elif (not holding) and _near(current_value, buy_th, scale):
-        # 空仓时才谈"接近买入"；同理，持仓时才谈"接近卖出"
-        state = 'near_buy'
-    elif holding and _near(current_value, sell_th, scale):
-        state = 'near_sell'
+    if policy is not None:
+        # v3.0：仓位与事件由**策略引擎**给出（买点+期望入场、风控出场），
+        # 不再用"策略自身买卖历史"的隐含仓位。趋势卖点只作描述，不产生动作。
+        holding = bool(policy.get('holding'))
+        pending = policy.get('pending')
+        if pending == 'entry':
+            state = 'buy_triggered'
+        elif pending in ('stop', 'target', 'time'):
+            state = 'sell_triggered'
+        elif (not holding) and _near(current_value, buy_th, scale):
+            state = 'near_buy'
+        elif holding and _near(current_value, sell_th, scale):
+            state = 'near_sell'
+        else:
+            state = 'neutral'
     else:
-        state = 'neutral'
+        holding = bool(pos[last] == 1)
+        if buy_event[last]:
+            state = 'buy_triggered'
+        elif sell_event[last]:
+            state = 'sell_triggered'
+        elif (not holding) and _near(current_value, buy_th, scale):
+            # 空仓时才谈"接近买入"；同理，持仓时才谈"接近卖出"
+            state = 'near_buy'
+        elif holding and _near(current_value, sell_th, scale):
+            state = 'near_sell'
+        else:
+            state = 'neutral'
 
     bidx = np.flatnonzero(b)
     sidx = np.flatnonzero(s)

@@ -144,7 +144,7 @@ if ($null -eq $probe) {
         'G15', 'G16', 'G17', 'G18', 'G19', 'G20', 'G21', 'G22', 'G23',
         'G24', 'G25', 'G26', 'G27', 'G28', 'G29', 'G30', 'G31', 'G32',
         'G33', 'G34', 'G35', 'G36', 'G37', 'G38', 'G39', 'G40', 'G41', 'G42',
-        'G43', 'G45', 'G46') {
+        'G43', 'G45', 'G46', 'G47') {
         Add-Gate $g '（探针缺失，无法判定）' 'BLOCKED' 'probe.py 未产出结果'
     }
 }
@@ -167,7 +167,8 @@ else {
         @('signal_stats', 'G42', '信号级统计齐备且自洽（F28）'),
         @('execution', 'G43', '成交口径与 BacktestConfig 同源且真的生效（F29）'),
         @('as_of', 'G45', '--as-of 真截断且不泄露未来数据（F31）'),
-        @('replay', 'G46', '决策回放真按决策表执行且自洽（F30）'),
+        @('replay', 'G46', '决策回放真按策略引擎执行且自洽（F30 / v3.0）'),
+        @('horizon', 'G47', '有效期契约：target_position / review_date / horizon 自洽（v3.0）'),
         @('exit_codes', 'G19', '退出码与 status 一一对应（F05/C5）'),
         @('placeholders', 'G20', '禁止占位常量（F06）'),
         @('family_map', 'G21', '族名来自注册表 prefix（F14）'),

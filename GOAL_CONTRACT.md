@@ -1,6 +1,6 @@
-# Goal Contract v2.0 — 信号语义与可执行决策契约
+# Goal Contract v3.0 — 有效期契约与不对称决策
 
-> 版本：2.0（2026-10-25 重建）
+> 版本：3.0（2026-10-25 架构复审后重写；v2.0 的"加严证据门槛"方向已废弃，见 `ARCHITECTURE_REVIEW.md`）
 > 上一版：v1.0（Phase A–D，已全部交付；全文见 `git show d4264a4:GOAL_CONTRACT.md`）
 > 配套：执行清单 `GOAL_FIXLIST.md`（F22–F34）｜唯一台账 `PROGRESS.md`
 > **完成定义不变**：`pwsh -File tools/check_gates.ps1 -Full` 退出码 = 0。
@@ -218,26 +218,29 @@ source/decision/evaluate.py   # 新增：signal_stats（§6.4）与 decision rep
 ## 7. 决策表（唯一真源，`decision/actions.py`）
 
 ```python
-def decide(status, state, edge_verdict, confidence, significant) -> str:
+def decide(status, pending, expectancy_ok, holding) -> str:
     if status in ("insufficient_data", "data_source_error"): return "insufficient_data"
-    if status in ("untradeable", "no_edge"):                 return "avoid"
-    if state == "sell_triggered":                            return "sell"
-    if state == "buy_triggered" and edge_verdict == "positive_significant" \
-       and significant and confidence >= 0.30:               return "buy"
+    if status == "untradeable":                              return "avoid"
+    if pending in ("stop", "target", "time"):                return "sell"
+    if pending == "entry" and expectancy_ok and not holding: return "buy"
     return "hold"
 ```
 
-> **不要传 `position_state`**。`state` 的定义已包含"事件前"的仓位
-> （`buy_triggered` ⇔ 此前空仓，`sell_triggered` ⇔ 此前持仓）。
-> 首版实现曾传事件**后**的仓位来判断事前前提，导致 `buy` 永不触发。
+三处与 v2.0 的根本差别（都有实测依据）：
 
-设计原则（写进代码注释，防止下轮又被"优化"掉）：
+1. **`significant` 不再门控买入。** v2.0 要求"策略全样本超额收益 CI 下界 > 0"，
+   那是"策略值不值得信"的检验，几乎不可能通过 → `action=buy` 实际不可达。
+   现在买入只看 `side_expectancy.ok`（该侧 20 日条件期望：n≥30、方向正确、|t|≥1.5）。
+2. **卖出只由风控触发。** 实测卖点后 20 日平均 +1.04%、仅 5/14 只为负；
+   "跌破均线即清仓"是负期望。卖出只有 `stop` / `target` / `time` 三种。
+3. **`no_edge` 不再阻断交易。** 它只描述"全样本 alpha 不显著"，是信任度信息。
 
-- **卖出靠纪律，买入靠证据**：风控动作不等统计显著性；建仓动作必须有证据下限。
-- **动作是增量，不是判断**：`buy`/`sell` 表示"相对策略当前仓位要做什么"，`hold` 表示"不动作"。`position_state` 单独给出，Hermes 不必从文案猜。
-- **不再有"连续 N 根"**。事件型信号按事件处理，状态型策略由 `position_state` 自然承载。
+设计原则（不要"优化"掉）：
 
----
+- **买入靠期望，卖出靠纪律**：建仓要证据，风控不等统计显著性。
+- **动作是增量，不是判断**：`buy`/`sell` 表示"相对当前仓位要做什么"，
+  当前仓位见 `signal.position_state`，动作后的目标见 `target_position`。
+- **有效期是契约的一部分**：默认 20 个交易日；1–5 日尺度 IC 不显著，不给方向。
 
 ## 8. 稳定性不变式（替换 v1.0 B6 验证一）
 

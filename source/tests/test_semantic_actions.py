@@ -1,159 +1,215 @@
 # -*- coding: utf-8 -*-
-"""F23/F24/F25/F26 语义回归：动作、状态、文案、指标值必须同源。
+"""v3.0 决策层回归：条件期望、策略引擎、动作与文案。
 
-这些用例对应 2026-10-25 的实盘事故：
-    002415 在 2026-10-22 输出 action=hold，文案却是"卖出信号 (32.42)"，
-    而 32.42 是收盘价、死叉发生在 10-20、10-23 大涨当天仍在报卖出。
+对应 2026-10-25 的架构复审（`ARCHITECTURE_REVIEW.md`）：
+  * 买点后 20 日 +1.72%（13/14 只为正）→ 买入看条件期望；
+  * 卖点后 20 日 +1.04%（仅 5/14 只为负）→ 趋势卖出不成立，卖出只做风控；
+  * 全样本 alpha 显著性不再门控单笔动作（那是"策略值不值得信"的检验）。
 """
 import numpy as np
 import pandas as pd
 import pytest
 
 from decision import actions as act_mod
+from decision import expectancy as exp_mod
+from decision import policy as pol_mod
 from decision import render as rnd_mod
 from decision import signals as sig_mod
 from stock_analysis.strategy.base import TrendStrategy
 
 
-def _df(n=120, start=10.0, step=0.05):
+def _df(n=120, start=10.0, step=0.0, vol=0.0):
     idx = pd.date_range('2024-01-01', periods=n, freq='B')
     close = start + np.arange(n, dtype=float) * step
     return pd.DataFrame({
-        'open': close, 'high': close * 1.01, 'low': close * 0.99,
+        'open': close, 'high': close * (1 + vol), 'low': close * (1 - vol),
         'close': close, 'volume': np.full(n, 1e6),
     }, index=idx)
 
 
-def _flat_signals(index):
-    return (pd.Series(False, index=index), pd.Series(False, index=index))
+def _flat(index):
+    return pd.Series(False, index=index)
 
 
 # ---------------------------------------------------------------------------
-# 结构：信号块键集合必须稳定（G35 同构的前提）
+# 决策表：买入看期望，卖出看风控
+# ---------------------------------------------------------------------------
+def test_buy_requires_expectancy_not_significance():
+    assert act_mod.decide('ok', 'entry', True, False) == 'buy'
+    # no_edge 不再阻断交易：它只描述"策略全样本 alpha 不显著"
+    assert act_mod.decide('no_edge', 'entry', True, False) == 'buy'
+    # 期望不达标 → 不买
+    assert act_mod.decide('ok', 'entry', False, False) == 'hold'
+    # 已持仓时不再重复买
+    assert act_mod.decide('ok', 'entry', True, True) == 'hold'
+
+
+@pytest.mark.parametrize('pending', ['stop', 'target', 'time'])
+def test_sell_only_from_risk_events(pending):
+    assert act_mod.decide('ok', pending, True, True) == 'sell'
+
+
+def test_trend_sell_does_not_produce_sell():
+    """趋势卖点（state=sell_triggered）不再产生 sell 动作。"""
+    assert act_mod.decide('ok', None, True, True) == 'hold'
+
+
+def test_status_overrides():
+    assert act_mod.decide('untradeable', 'entry', True, False) == 'avoid'
+    assert act_mod.decide('insufficient_data', 'entry', True, False) == 'insufficient_data'
+
+
+def test_target_position():
+    assert act_mod.target_position_for('buy', False) == 1.0
+    assert act_mod.target_position_for('sell', True) == 0.0
+    assert act_mod.target_position_for('hold', True) == 1.0
+    assert act_mod.target_position_for('hold', False) == 0.0
+    assert act_mod.target_position_for('avoid', False) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 条件期望
+# ---------------------------------------------------------------------------
+def test_expectancy_detects_positive_edge():
+    # 带噪声的上涨序列：有漂移也有方差，避免"零方差导致 t 值无定义"的合成假象
+    rng = np.random.default_rng(7)
+    rets = rng.normal(0.004, 0.012, 400)
+    close = 10.0 * np.exp(np.cumsum(rets))
+    idx = pd.date_range('2024-01-01', periods=400, freq='B')
+    df = pd.DataFrame({'open': close, 'high': close, 'low': close,
+                       'close': close, 'volume': 1e6}, index=idx)
+    buy = _flat(df.index)
+    for i in range(10, 340, 10):
+        buy.iloc[i] = True
+    e = exp_mod.side_expectancy(df['close'], buy, horizon=20, side='buy')
+    assert e['n'] >= 10
+    assert e['mean'] > 0 and e['ok'] is True
+
+
+def test_expectancy_rejects_short_sample():
+    df = _df(80)
+    buy = _flat(df.index)
+    buy.iloc[10] = True
+    e = exp_mod.side_expectancy(df['close'], buy, horizon=20, side='buy')
+    assert e['n'] < exp_mod.MIN_SAMPLES
+    assert e['ok'] is False
+
+
+def test_trailing_expectancy_has_no_lookahead():
+    """第 t 根只能用 j+horizon<=t 的已实现收益，预热期内必须为 False。"""
+    df = _df(400, step=0.02)
+    buy = _flat(df.index)
+    buy.iloc[::5] = True
+    ok = exp_mod.trailing_expectancy_ok(df['close'], buy, horizon=20, warmup=250)
+    assert len(ok) == len(df)
+    assert not ok[:250].any(), "预热期内不得声称期望可用"
+
+
+# ---------------------------------------------------------------------------
+# 策略引擎
+# ---------------------------------------------------------------------------
+def _policy(df, buy, ok_all=True, **kw):
+    ok = np.full(len(df), ok_all, dtype=bool)
+    return pol_mod.run_policy(df, buy, ok, horizon=20, **kw)
+
+
+def test_policy_enters_on_buy_and_exits_on_stop():
+    df = _df(120, start=10.0)
+    # 入场后砸盘触发止损
+    df.loc[df.index[40]:, 'low'] = 8.0
+    df.loc[df.index[40]:, 'close'] = 9.0
+    buy = _flat(df.index)
+    buy.iloc[30] = True
+    p = _policy(df, buy)
+    assert p['trade_count'] >= 1
+    assert p['exit_reasons'].get('stop', 0) >= 1
+
+
+def test_policy_no_entry_without_expectancy():
+    df = _df(120)
+    buy = _flat(df.index)
+    buy.iloc[30] = True
+    p = _policy(df, buy, ok_all=False)
+    assert p['trade_count'] == 0
+    assert p['holding'] is False
+
+
+def test_policy_time_stop():
+    df = _df(160, start=10.0, step=-0.01)   # 缓慢下跌
+    buy = _flat(df.index)
+    buy.iloc[60] = True
+    p = _policy(df, buy)
+    assert p['trade_count'] >= 1
+    assert sum(p['exit_reasons'].values()) >= 1
+
+
+def test_policy_public_view_has_only_json_keys():
+    df = _df(120)
+    p = _policy(df, _flat(df.index))
+    view = pol_mod.public_view(p)
+    assert set(view) == set(pol_mod.POLICY_KEYS)
+    assert 'position_series' not in view
+
+
+# ---------------------------------------------------------------------------
+# 信号块与文案
 # ---------------------------------------------------------------------------
 def test_signal_keys_are_stable():
     df = _df()
-    buy, sell = _flat_signals(df.index)
+    buy, sell = _flat(df.index), _flat(df.index)
     block = sig_mod.build(df, buy, sell, strategy='X')
     assert set(block) == set(sig_mod.SIGNAL_KEYS)
     assert set(sig_mod.null_signal()) == set(sig_mod.SIGNAL_KEYS)
 
 
-# ---------------------------------------------------------------------------
-# F24：仓位状态机
-# ---------------------------------------------------------------------------
-def test_position_state_machine():
-    buy = np.array([0, 1, 0, 0, 0, 0], dtype=bool)
-    sell = np.array([0, 0, 0, 1, 0, 0], dtype=bool)
-    pos = sig_mod.position_states(buy, sell)
-    assert list(pos) == [0, 1, 1, 0, 0, 0]
-
-
-def test_sell_wins_when_both_true_on_same_bar():
-    buy = np.array([0, 1, 1], dtype=bool)
-    sell = np.array([0, 0, 1], dtype=bool)
-    pos = sig_mod.position_states(buy, sell)
-    assert list(pos) == [0, 1, 0], "同根同时为真时必须按 sell 优先（风控优先）"
-
-
 def test_flat_never_reports_near_sell():
-    """核心回归：空仓时不得出现 near_sell。
-
-    旧实现用"近 10 根内出现过卖点"判定 near_sell，导致 10-20 的死叉
-    在之后 10 个交易日天天被报"卖出信号"。这里让指标**恰好等于卖出阈值**，
-    如果仍按旧口径就会命中 near_sell。
-    """
     df = _df()
-    buy, sell = _flat_signals(df.index)
-    sell.iloc[100] = True                     # 19 根之前的卖点
+    buy, sell = _flat(df.index), _flat(df.index)
+    sell.iloc[100] = True
     ind = {'current_value': 1.0, 'buy_threshold': 1.0,
            'sell_threshold': 1.0, 'scale': 1.0}
     block = sig_mod.build(df, buy, sell, strategy='X', indicator=ind)
     assert block['position_state'] == 'flat'
-    assert block['last_sell_date'] == str(df.index[100])[:10]
-    assert block['last_sell_age'] == len(df) - 1 - 100
     assert block['state'] not in ('near_sell', 'sell_triggered')
 
 
-# ---------------------------------------------------------------------------
-# F26：决策表
-# ---------------------------------------------------------------------------
-def test_single_bar_buy_event_triggers_buy():
-    """单根金叉必须能产生 buy —— 旧实现要求"连续 15 根全为真"，永不触发。"""
+def _exp(mean=0.0287, n=231, hit=0.593, t=4.4):
+    return {'side': 'buy', 'horizon': 20, 'mean': mean, 'hit_rate': hit,
+            'n': n, 't_stat': t, 'ok': True}
+
+
+def test_hold_reason_has_no_signal_words():
     df = _df()
-    buy, sell = _flat_signals(df.index)
-    buy.iloc[-1] = True
-    block = sig_mod.build(df, buy, sell, strategy='X')
-    assert block['state'] == 'buy_triggered'
-    assert act_mod.decide('ok', block['state'], 'positive_significant', 0.5, True) == 'buy'
-
-
-def test_single_bar_sell_event_triggers_sell():
-    df = _df()
-    buy, sell = _flat_signals(df.index)
-    buy.iloc[-3] = True
-    sell.iloc[-1] = True
-    block = sig_mod.build(df, buy, sell, strategy='X')
-    assert block['state'] == 'sell_triggered'
-    assert act_mod.decide('ok', block['state'], 'inconclusive', 0.2, False) == 'sell'
-
-
-def test_buy_requires_significance_and_positive_verdict():
-    assert act_mod.decide('ok', 'buy_triggered', 'positive_significant', 0.5, False) == 'hold'
-    assert act_mod.decide('ok', 'buy_triggered', 'inconclusive', 0.9, True) == 'hold'
-    assert act_mod.decide('ok', 'buy_triggered', 'positive_significant', 0.1, True) == 'hold'
-
-
-def test_status_overrides_state():
-    assert act_mod.decide('no_edge', 'sell_triggered', 'inconclusive', 0.9, True) == 'avoid'
-    assert act_mod.decide('untradeable', 'buy_triggered', 'positive_significant', 0.9, True) == 'avoid'
-    assert act_mod.decide('insufficient_data', 'neutral', None, 0.0, False) == 'insufficient_data'
-
-
-# ---------------------------------------------------------------------------
-# F23：文案
-# ---------------------------------------------------------------------------
-def _block(**kw):
-    base = sig_mod.null_signal()
-    base.update({'strategy': 'X', 'as_of': '2026-10-22', 'position_state': 'flat',
-                 'state': 'neutral', 'last_sell_date': '2026-10-20', 'last_sell_age': 2})
-    base.update(kw)
-    return base
-
-
-def test_hold_reason_never_says_signal_words():
-    reason = rnd_mod.build_reasons('hold', _block(), {'verdict': 'inconclusive'})
-    text = ' '.join(reason)
+    block = sig_mod.build(df, _flat(df.index), _flat(df.index), strategy='X')
+    text = ' '.join(rnd_mod.build_reasons('hold', block, _exp(), {'holding': False},
+                                          review_date='2026-11-20', horizon=20))
     assert '卖出信号' not in text and '买入信号' not in text
-    assert '2026-10-20' in text and '2 个交易日' in text
+    assert '空仓' in text
 
 
-def test_sell_reason_mentions_today_and_position_change():
-    text = ' '.join(rnd_mod.build_reasons('sell', _block(), {'verdict': 'inconclusive'}))
-    assert '2026-10-22' in text and '由持有转为空仓' in text
-
-
-def test_buy_reason_carries_verdict():
-    text = ' '.join(rnd_mod.build_reasons('buy', _block(), {'verdict': 'positive_significant'}))
-    assert '2026-10-22' in text and 'positive_significant' in text
-
-
-# ---------------------------------------------------------------------------
-# F25：指标值不得是收盘价
-# ---------------------------------------------------------------------------
-def test_indicator_value_is_not_close_price():
+def test_sell_reason_names_risk_type():
     df = _df()
+    block = sig_mod.build(df, _flat(df.index), _flat(df.index), strategy='X')
+    pol = {'holding': True, 'pending': 'stop', 'bars_held': 3,
+           'entry_price': 10.0, 'entry_date': '2026-10-01',
+           'stop_price': 9.5, 'target_price': 11.0}
+    text = ' '.join(rnd_mod.build_reasons('sell', block, _exp(), pol,
+                                          review_date='2026-11-20', horizon=20))
+    assert '止损' in text
+    assert '不代表趋势判断' in text
+
+
+def test_buy_reason_carries_expectancy_numbers():
+    df = _df()
+    block = sig_mod.build(df, _flat(df.index), _flat(df.index), strategy='X')
+    pol = {'holding': False, 'pending': 'entry', 'stop_price': 9.5, 'target_price': 11.0}
+    text = ' '.join(rnd_mod.build_reasons('buy', block, _exp(), pol,
+                                          review_date='2026-11-20', horizon=20))
+    assert '+2.87%' in text and 'n=231' in text and '2026-11-20' in text
+
+
+def test_indicator_value_is_not_close_price():
+    df = _df(step=0.05)
     ind = sig_mod.describe_indicator(TrendStrategy(3, 30, 60), '均线趋势', df)
     assert ind['current_value'] is not None
     assert abs(ind['current_value'] - float(df['close'].iloc[-1])) > 1e-6
-    assert ind['buy_threshold'] == 1.0 and ind['sell_threshold'] == 1.0
-    assert 'MA' in ind['indicator']
-
-
-def test_unknown_family_returns_null_not_price():
-    df = _df()
-    ind = sig_mod.describe_indicator(object(), '不存在的族', df)
-    assert ind['current_value'] is None
-    block = sig_mod.build(df, *_flat_signals(df.index), strategy='X', indicator=ind)
-    assert block['current_value'] is None
-    assert block['last_close'] is not None
