@@ -16,16 +16,18 @@ from . import sizing
 
 
 def advise(code, type_hint='auto', start=None, opt='grid', jobs=1, fast=False,
-           detail=False, no_regime=False, opt_iters=30):
+           detail=False, no_regime=False, opt_iters=30, as_of=None):
     """C6 契约：单一真源 API。
 
     返回 dict，键集合与 `python cli.py <code> --json` 的输出完全一致
     （CLI 只是本函数的薄包装）。延迟导入 cli 以避免循环导入。
+
+    `as_of`（F31）：把行情截断到该日期，用于历史复盘，确保不含未来数据。
     """
     from cli import advise_internal
     return advise_internal(
         code, type_hint=type_hint, start=start, opt=opt, jobs=jobs, fast=fast,
-        detail=detail, no_regime=no_regime, opt_iters=opt_iters,
+        detail=detail, no_regime=no_regime, opt_iters=opt_iters, as_of=as_of,
     )
 
 

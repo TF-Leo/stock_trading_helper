@@ -220,10 +220,37 @@ def empty_metrics():
     return {k: {'point': None, 'ci_95': None} for k in METRIC_KEYS}
 
 
+def window_note(start=None, as_of=None, bars=0):
+    """F31：如实说明本次用了哪个窗口（成功/错误路径共用，避免两边写法漂移）。"""
+    parts = []
+    if start:
+        parts.append(f"--start {start}")
+    if as_of:
+        parts.append(f"--as-of {as_of}")
+    return f"{' + '.join(parts)} 截取后 {int(bars or 0)} 根" if parts else None
+
+
+def execution_block(config=None) -> dict:
+    """F29：成交假设（与 BacktestConfig 同源，禁止在别处再写一份）。
+
+    下游 Agent 必须知道回测数字对应哪种执行口径：`next_open` = 信号次日开盘成交
+    （可执行），`next_close` = 次日收盘成交（旧行为，晚一天）。
+    """
+    if config is None:
+        from stock_analysis.backtest.engine import BacktestConfig
+        config = BacktestConfig()
+    return {
+        'signal_bar': 'close',
+        'fill': str(getattr(config, 'exec_price', 'next_open')),
+        'slippage_bps': int(round(float(config.slippage_rate) * 10000)),
+        'commission_bps': int(round(float(config.commission_rate) * 10000)),
+    }
+
+
 def create_error_response(status, message, code, data_type, type_hint='auto',
                           bars=0, start=None, end=None, last_close=None,
                           fetch_info=None, elapsed=0.0, warnings=None,
-                          requested_start=None):
+                          requested_start=None, requested_as_of=None):
     """创建错误响应。
 
     C3: 键集合必须与正常响应**同构**；不适用处显式 null，并在
@@ -249,7 +276,9 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
         'schema_version': SCHEMA_VERSION,
         'generated_at': datetime.datetime.now().isoformat(),
         'request': {'code': code, 'type': data_type, 'type_hint': type_hint,
-                    'start': None, 'opt': 'grid', 'jobs': 1, 'fast': False},
+                    'start': requested_start, 'opt': 'grid', 'jobs': 1, 'fast': False,
+                    # F31: 回显 --as-of，便于 Agent 自证"这条结论基于哪一天"
+                    'as_of': requested_as_of},
         'instrument': {'code': code, 'name': '', 'board': board,
                        'price_limit_pct': price_limit_pct, 'is_st': is_st},
         'data': {
@@ -268,8 +297,9 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'requested_source': fi.get('requested_source'),
             # 与成功路径同语义：带 --start 时必须如实说明窗口，不能恒为 None。
             # （G35 只比对"键是否存在"，值被硬编码成 None 时它查不出来 —— 这里补齐值。）
-            'window_note': (f"--start {requested_start} 截取后 {int(bars or 0)} 根"
-                            if requested_start else None),
+            'window_note': window_note(requested_start, requested_as_of, bars),
+            # F29: 成交假设（错误路径也必须给出，G35 递归比对键集合）
+            'execution': execution_block(),
         },
         'market_regime': {'label': 'Unknown', 'confidence': 0.0,
                           'as_of': None, 'definition': None},

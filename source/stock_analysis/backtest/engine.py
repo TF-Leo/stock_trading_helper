@@ -48,6 +48,9 @@ class BacktestConfig:
     atr_period: int = 14
     atr_stop_mult: float = 2.5
     atr_profit_mult: float = 4.0
+    # F29: 成交时点。信号在 T 日收盘算出，最早只能 T+1 日开盘成交（可执行时点）；
+    # "next_close" 是旧行为（T+1 收盘成交，比真实可执行时点晚一天），保留用于回归对照。
+    exec_price: str = "next_open"
 
 
 @dataclass
@@ -178,6 +181,8 @@ class BacktestEngine:
         low_arr = df['low'].to_numpy(dtype=float)
         open_arr = (df['open'].to_numpy(dtype=float) if 'open' in df.columns
                     else close_arr)
+        # F29: 成交价口径（见 BacktestConfig.exec_price）
+        fill_open = (str(getattr(self.config, 'exec_price', 'next_open')) == 'next_open')
         buy_arr = df['buy_signal'].to_numpy(dtype=bool)
         sell_arr = df['sell_signal'].to_numpy(dtype=bool)
         atr_arr = None
@@ -200,9 +205,13 @@ class BacktestEngine:
             low = low_arr[i]
             close = close_arr[i]
             open_px = open_arr[i]
-            # A股涨跌停：涨停买不进、跌停卖不出（默认10%）
-            is_limit_up = prev_close > 0 and close >= prev_close * 1.099
-            is_limit_down = prev_close > 0 and close <= prev_close * 0.901
+            # F29: 成交价 —— 信号 T 日收盘算出，T+1 日**开盘**才能成交。
+            # 旧实现用 T+1 收盘成交，比 Hermes 拿到建议后可执行的时点晚一整天。
+            fill_px = (open_px if (fill_open and open_px == open_px and open_px > 0)
+                       else close)
+            # A股涨跌停：涨停买不进、跌停卖不出（按成交价判定）
+            is_limit_up = prev_close > 0 and fill_px >= prev_close * 1.099
+            is_limit_down = prev_close > 0 and fill_px <= prev_close * 0.901
 
             if position > 0 and not is_limit_down:
                 if self.config.enable_stop_loss:
@@ -256,7 +265,7 @@ class BacktestEngine:
                         continue
 
             if position > 0 and sell_arr[i] and not is_limit_down:
-                exit_price = self._apply_slippage(close, OrderType.SELL)
+                exit_price = self._apply_slippage(fill_px, OrderType.SELL)
                 trade = self._execute_sell(
                     date, exit_price, position, cash,
                     entry_date, entry_price, entry_cost_total,
@@ -270,11 +279,11 @@ class BacktestEngine:
                 entry_profit_dist = None
 
             elif position == 0 and buy_arr[i] and not is_limit_up:
-                max_shares = self._calc_max_shares(cash, close)
+                max_shares = self._calc_max_shares(cash, fill_px)
                 if max_shares <= 0:
                     unaffordable_count += 1
                 if max_shares > 0:
-                    entry_price = self._apply_slippage(close, OrderType.BUY)
+                    entry_price = self._apply_slippage(fill_px, OrderType.BUY)
                     cost = entry_price * max_shares
                     commission = self._calc_commission(cost, OrderType.BUY)
                     if cost + commission <= cash:

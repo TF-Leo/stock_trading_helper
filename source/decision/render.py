@@ -89,3 +89,33 @@ def build_reasons(action: str, signal: Dict[str, Any],
         reasons.append("超额收益显著为负，该策略不宜作为择时依据")
 
     return reasons[:3]
+
+
+def print_detail(response) -> None:
+    """`--detail` 的文本输出（F29 期间从 cli 迁出，保持 cli 在 700 行以内）。"""
+    rec = response['recommendation']
+    ev = response['evidence']
+    print(f"\n--- 详细 ---")
+    print(f"止损/止盈方式：{rec.get('stop_method')}")
+    print(f"入场区：{rec.get('entry_zone')}  距触发：{rec.get('distance_to_trigger')}")
+    print(f"horizon：{rec.get('horizon_days')} 天  失效条件：{rec.get('invalidation')}")
+    print(f"市场环境：{response.get('market_regime', {}).get('label')}"
+          f"（{response.get('market_regime', {}).get('definition')}）")
+    print(f"n_trials={ev.get('n_trials')}  DSR={ev.get('deflated_sharpe')}  "
+          f"significant={ev.get('significant')}")
+    exc = ev.get('excess_vs_buy_hold') or {}
+    print(f"超额收益：point={exc.get('point')} ci_95={exc.get('ci_95')} "
+          f"p_positive={exc.get('p_positive')} n_obs={exc.get('n_obs')}")
+    print("候选（族 / 评分 / 年化 / 回撤 / 交易数）：")
+    for c in response.get('candidates') or []:
+        print(f"  - {c['name']:<28} {c['family']:<10} {c['score']:>8.4f} "
+              f"{c['annual_return']:>8.2%} {c['max_drawdown']:>8.2%} {c['trade_count']:>5d}")
+    print("触发器：")
+    for t in ev.get('triggers') or []:
+        print(f"  - {t['indicator']}: state={t['state']} current={t['current']} "
+              f"buy_price={t['buy_price']} sell_price={t['sell_price']}")
+    warns = (response.get('diagnostics') or {}).get('warnings') or []
+    if warns:
+        print("告警：")
+        for w in warns:
+            print(f"  [WARN] {w}")

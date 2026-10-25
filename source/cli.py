@@ -20,7 +20,7 @@ from fund_analysis.fund_strategy.registry import (
     build_fund_strategy_signals, grid_size, family_map as fund_family_map,
 )
 from decision.instrument import classify_board
-from decision.schema import EXIT_CODES, exit_code_for  # noqa: F401
+from decision.schema import EXIT_CODES, exit_code_for, execution_block, window_note  # noqa: F401
 from decision import sizing
 from decision.scoring import (  # noqa: F401
     risk_adjusted_score,
@@ -230,7 +230,8 @@ def _build_metrics(result, fast=False):
 
 
 def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
-                    fast=False, detail=False, no_regime=False, opt_iters=30):
+                    fast=False, detail=False, no_regime=False, opt_iters=30,
+                    as_of=None):
     """核心建议生成逻辑（供 CLI 和 API 共用）"""
     start_time = time.time()
     warnings = []
@@ -247,6 +248,20 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'data_source_error', type_err, code, data_type, type_hint,
             fetch_info=last_fetch_info(), elapsed=time.time() - start_time,
             requested_start=start)
+
+    # F31: 历史复盘 —— 截断到指定日期，确保回测里不含任何未来数据。
+    # 必须在 len(df)<100 判定之前，否则"as-of 之后数据不足"会被误报成数据源问题。
+    if as_of:
+        try:
+            df = df.loc[df.index <= pd.Timestamp(str(as_of))]
+        except Exception:
+            df = df.iloc[:0]
+        if len(df) == 0:
+            return create_error_response(
+                'insufficient_data', f"--as-of {as_of} 之前无可用行情",
+                code, data_type, type_hint, fetch_info=last_fetch_info(),
+                elapsed=time.time() - start_time, requested_start=start,
+                requested_as_of=as_of)
 
     # F05: 拉取失败(30) 与 数据太短(20) 是两种状态，不得都压成 10
     if df is None:
@@ -508,7 +523,8 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'start': start,
             'opt': opt,
             'jobs': jobs,
-            'fast': fast
+            'fast': fast,
+            'as_of': as_of,
         },
         'instrument': {
             'code': code,
@@ -531,7 +547,9 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'lag_days': fetch_info.get('lag_days'),
             'expected_date': fetch_info.get('expected_date'),
             'requested_source': fetch_info.get('requested_source'),
-            'window_note': (f"--start {start} 截取后 {len(df)} 根" if start else None)
+            'window_note': window_note(start, as_of, len(df)),
+            # F29: 成交假设（signal_bar/fill/slippage_bps/commission_bps）
+            'execution': execution_block(config),
         },
         'market_regime': ({'label': 'Unknown', 'confidence': 0.0,
                            'as_of': str(df.index[-1]), 'definition': 'disabled'}
@@ -615,36 +633,9 @@ def build_parser():
                         help='跳过 market_regime 计算，输出 Unknown/disabled（不假装 Bull）')
     parser.add_argument('--opt-iters', type=int, default=30,
                         help='--opt bayes 的迭代次数（--fast 时上限 12）')
+    parser.add_argument('--as-of', dest='as_of', default=None, metavar='YYYY-MM-DD',
+                        help='历史复盘：把行情截断到该日期（不含未来数据）')
     return parser
-
-
-def _print_detail(response):
-    rec = response['recommendation']
-    ev = response['evidence']
-    print(f"\n--- 详细 ---")
-    print(f"止损/止盈方式：{rec.get('stop_method')}")
-    print(f"入场区：{rec.get('entry_zone')}  距触发：{rec.get('distance_to_trigger')}")
-    print(f"horizon：{rec.get('horizon_days')} 天  失效条件：{rec.get('invalidation')}")
-    print(f"市场环境：{response.get('market_regime', {}).get('label')}"
-          f"（{response.get('market_regime', {}).get('definition')}）")
-    print(f"n_trials={ev.get('n_trials')}  DSR={ev.get('deflated_sharpe')}  "
-          f"significant={ev.get('significant')}")
-    exc = ev.get('excess_vs_buy_hold') or {}
-    print(f"超额收益：point={exc.get('point')} ci_95={exc.get('ci_95')} "
-          f"p_positive={exc.get('p_positive')} n_obs={exc.get('n_obs')}")
-    print("候选（族 / 评分 / 年化 / 回撤 / 交易数）：")
-    for c in response.get('candidates') or []:
-        print(f"  - {c['name']:<28} {c['family']:<10} {c['score']:>8.4f} "
-              f"{c['annual_return']:>8.2%} {c['max_drawdown']:>8.2%} {c['trade_count']:>5d}")
-    print("触发器：")
-    for t in ev.get('triggers') or []:
-        print(f"  - {t['indicator']}: state={t['state']} current={t['current']} "
-              f"buy_price={t['buy_price']} sell_price={t['sell_price']}")
-    warns = (response.get('diagnostics') or {}).get('warnings') or []
-    if warns:
-        print("告警：")
-        for w in warns:
-            print(f"  [WARN] {w}")
 
 
 def main():
@@ -662,6 +653,7 @@ def main():
             detail=args.detail,
             no_regime=args.no_regime,
             opt_iters=args.opt_iters,
+            as_of=args.as_of,
         )
         rec = response['recommendation']
 
@@ -676,7 +668,7 @@ def main():
             print(f"触发信号：{rec['action_reason'][0]}")
             print(f"止损价：{rec['stop_loss']}   止盈价：{rec['take_profit']}")
             if args.detail:
-                _print_detail(response)
+                rnd_mod.print_detail(response)
             print(f"\n免责声明：本结果不构成投资建议。")
 
         # F05/C5: status -> 退出码一一对应（0/10/20/30/40）

@@ -1022,9 +1022,14 @@ def check_windows(code="600519"):
     G06 的 PASS 当时只证明了"同一份数据跑三次结果相同"，与稳定性无关。
 
     新判据（契约 v2.0 §8）：
-      L1 `position_state` 与 `consensus.family` 必须一致（决策的真正输入）
-      L2 `action` 允许因窗口变化，但 `stability.action_stable` 必须如实上报
+      L1 `action` 必须一致 —— 这是下游真正消费的东西
+      L2 `position_state` / `family` 允许不同（换训练窗口后可能换胜出策略），
+         但 `stability.*_stable` 不得谎称稳定
       L3 三窗口 `bars` 必须互不相同（打桩生效的证据）
+
+    **2026-10-25 设计更正**：原实现从**末尾**砍 60/120 根，等于把决策日期也一起
+    往前挪了 60/120 个交易日 —— 不同日期的仓位本来就该不同，这不是稳定性问题。
+    正确做法是**固定决策日、只改训练窗口**（从头砍），否则测的是"仓位随时间变化"。
     """
     cli, df = _load_cli_and_full_df(code)
     if df is None or len(df) < 300:
@@ -1035,8 +1040,9 @@ def check_windows(code="600519"):
     orig = meta.resolve_and_fetch
     results = {}
     try:
-        for label, drop in (("full", 0), ("drop60", 60), ("drop120", 120)):
-            sub = (df.iloc[: len(df) - drop] if drop else df).copy()
+        for label, drop in (("full", 0), ("drop_head60", 60), ("drop_head120", 120)):
+            # 从头砍：保留同一决策日（最后一根），只改训练窗口长度
+            sub = (df.iloc[drop:] if drop else df).copy()
             expected = len(sub)
             meta.resolve_and_fetch = (lambda d: (lambda *a, **k: (d, "stock", None)))(sub)
             one = cli.advise_internal(code, start=None, fast=True)
@@ -1051,8 +1057,10 @@ def check_windows(code="600519"):
             rec = one.get("recommendation") or {}
             results[label] = {
                 "bars": got,
+                "end": str((one.get("data") or {}).get("end"))[:10],
                 "action": rec.get("action"),
                 "position_state": (rec.get("signal") or {}).get("position_state"),
+                "strategy": (rec.get("signal") or {}).get("strategy"),
                 "family": (one.get("evidence") or {}).get("consensus", {}).get("family"),
                 "status": rec.get("status"),
                 "claimed_stability": (one.get("evidence") or {}).get("stability"),
@@ -1061,36 +1069,34 @@ def check_windows(code="600519"):
         meta.resolve_and_fetch = orig
 
     bars = [v["bars"] for v in results.values()]
+    ends = {v["end"] for v in results.values()}
     states = {v["position_state"] for v in results.values()}
     families = {v["family"] for v in results.values()}
     actions = {v["action"] for v in results.values()}
+    strategies = {v["strategy"] for v in results.values()}
     problems = []
     if len(set(bars)) != 3:
         problems.append(f"三窗口 bars 未互不相同 {bars}（打桩未生效）")
-    if len(states) != 1:
-        problems.append(f"position_state 跨窗口不一致: {sorted(map(str, states))}")
-    # family 是 40 个族"评分中位数"的 argmax，窗口小幅变化即可翻转；它只影响
-    # invalidation 文案与 agreement，不参与 action 计算。因此**不**因漂移判 FAIL，
-    # 但要求不得把它声称为稳定（见下）。
+    if len(ends) != 1:
+        problems.append(f"决策日不一致 {sorted(ends)}（窗口必须固定同一决策日）")
     if len(actions) != 1:
+        problems.append(f"action 跨训练窗口不一致: {sorted(map(str, actions))}")
+    # position_state / family 允许变化，但不得谎称稳定
+    if len(states) != 1 or len(families) != 1:
         for v in results.values():
             st = v.get("claimed_stability") or {}
-            if st.get("action_stable") is True:
-                problems.append("evidence.stability.action_stable=true，但实测 action 跨窗口不一致"
+            if st.get("action_stable") is True or st.get("family_stable") is True:
+                problems.append("stability 声称稳定，但实测 position_state/family 跨窗口不一致"
                                 "（自评与实际不符）")
                 break
-    for v in results.values():
-        st = v.get("claimed_stability") or {}
-        if st.get("family_stable") is True and len(families) != 1:
-            problems.append("evidence.stability.family_stable=true，但实测共识族跨窗口不一致"
-                            "（自评与实际不符）")
-            break
     return {"status": "PASS" if not problems else "FAIL",
             "reason": "; ".join(problems),
             "observed": {"windows": results, "bars": bars,
                          "actions": sorted(map(str, actions)),
                          "position_state": sorted(map(str, states)),
                          "families": sorted(map(str, families)),
+                         "strategies": sorted(map(str, strategies)),
+                         "position_drift": len(states) != 1,
                          "family_drift": len(families) != 1}}
 
 
@@ -1494,6 +1500,98 @@ def check_signal_stats(stock_data=None):
                          "sell_hit_rate_5d": ((s.get("sell") or {}).get("hit_rate") or {}).get("5")}}
 
 
+def check_execution(stock_data=None):
+    """G43：`data.execution` 与 `BacktestConfig` 同源，且成交价真的随口径变化（F29）。
+
+    旧实现固定用 T+1 **收盘**成交，而 Hermes 拿到建议最早只能 T+1 开盘动作，
+    差一整个交易日；输出里也没有任何字段声明这件事。
+    """
+    if stock_data is None:
+        return {"status": "BLOCKED", "reason": "无股票输出"}
+    ex = (stock_data.get("data") or {}).get("execution") or {}
+    need = ("signal_bar", "fill", "slippage_bps", "commission_bps")
+    problems = [f"data.execution 缺 {k}" for k in need if k not in ex]
+    if ex.get("fill") not in ("next_open", "next_close"):
+        problems.append(f"execution.fill={ex.get('fill')!r} 非法")
+
+    os.chdir(SRC)
+    try:
+        import numpy as np
+        import pandas as pd
+        from stock_analysis.backtest.engine import BacktestConfig, BacktestEngine
+
+        if ex.get("fill") != BacktestConfig().exec_price:
+            problems.append(f"execution.fill={ex.get('fill')} 与 BacktestConfig().exec_price="
+                            f"{BacktestConfig().exec_price} 不一致（两处各写一份）")
+
+        n = 300
+        idx = pd.date_range("2020-01-01", periods=n, freq="B")
+        close = np.linspace(10, 20, n)
+        df = pd.DataFrame({"open": close * 0.98, "high": close * 1.01,
+                           "low": close * 0.97, "close": close, "volume": 1e6}, index=idx)
+        buy = pd.Series(False, index=idx)
+        buy.iloc[10] = True
+        sell = pd.Series(False, index=idx)
+        sell.iloc[100] = True
+
+        def _entry(mode):
+            eng = BacktestEngine(BacktestConfig(exec_price=mode))
+            r = eng.run_backtest(df, lambda d: {"buy": buy, "sell": sell})
+            return (r.trade_count, float(r.trades[0].entry_price)) if r.trades else (0, None)
+
+        cnt_o, px_o = _entry("next_open")
+        cnt_c, px_c = _entry("next_close")
+        if cnt_o != cnt_c:
+            problems.append(f"两种成交口径交易数不同: {cnt_o} vs {cnt_c}")
+        if px_o is None or px_c is None or abs(px_o - px_c) < 1e-9:
+            problems.append(f"两种成交口径成交价相同（{px_o} vs {px_c}）：exec_price 未生效")
+    except Exception as e:
+        problems.append(f"成交口径行为验证异常: {type(e).__name__}: {e}")
+        px_o = px_c = None
+
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems),
+            "observed": {"execution": ex, "entry_next_open": px_o, "entry_next_close": px_c}}
+
+
+def check_as_of(code="002415"):
+    """G45：`--as-of` 必须真的截断，且不得泄露未来数据（F31）。"""
+    os.chdir(SRC)
+    problems, obs = [], {}
+    try:
+        import pandas as pd
+        csv = os.path.join(SRC, "stock_analysis", "data", f"stock_{code}_qfq.csv")
+        full = pd.read_csv(csv, index_col=0, parse_dates=True)
+    except Exception as e:
+        return {"status": "BLOCKED", "reason": f"读不到本地缓存: {type(e).__name__}: {e}"}
+
+    for day in ("2026-10-22", "2026-10-23"):
+        rec = run_cli_json([code, "--json", "--fast", "--as-of", day], cache=False)
+        d = rec.get("data") or {}
+        dd = d.get("data") or {}
+        sub = full.loc[full.index <= pd.Timestamp(day)]
+        bars, end = dd.get("bars"), str(dd.get("end"))[:10]
+        lc = dd.get("last_close")
+        obs[day] = {"bars": bars, "expect_bars": len(sub), "end": end,
+                    "last_close": lc, "echo": (d.get("request") or {}).get("as_of"),
+                    "exit": rec.get("exit")}
+        if end != day:
+            problems.append(f"{day}: data.end={end}（应等于 as-of，不得含未来数据）")
+        if bars != len(sub):
+            problems.append(f"{day}: bars={bars} != 缓存截断 {len(sub)}")
+        expect_close = float(sub["close"].iloc[-1])
+        if lc is None or abs(float(lc) - expect_close) > 1e-6:
+            problems.append(f"{day}: last_close={lc} != 该日收盘 {expect_close:.4f}")
+        if (d.get("request") or {}).get("as_of") != day:
+            problems.append(f"{day}: request.as_of 未回显")
+        if not str(dd.get("window_note") or "").startswith("--as-of"):
+            problems.append(f"{day}: window_note={dd.get('window_note')!r} 未说明 as-of")
+        if rec.get("exit") not in (0, 10):
+            problems.append(f"{day}: 退出码 {rec.get('exit')}（期望 0 或 10）")
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     out = {}
@@ -1534,6 +1632,9 @@ def main():
     run("signal_semantics", lambda: check_signal_semantics(stock_data, fund_data))
     run("edge", lambda: check_edge(stock_data))
     run("signal_stats", lambda: check_signal_stats(stock_data))
+    # 本轮新增：G43 成交口径 / G45 历史复盘
+    run("execution", lambda: check_execution(stock_data))
+    run("as_of", check_as_of)
     run("placeholders", lambda: check_placeholders(stock_data, fund_data))
     run("family_ratio", lambda: check_family_ratio(stock_data, fund_data))
     run("metrics_ci", lambda: check_metrics_ci(stock_data))
