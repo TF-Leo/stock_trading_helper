@@ -326,9 +326,9 @@ def decide(status, pending, expectancy_ok, holding) -> str:
 
 在 `source/` 下：
 
-1. `python -m pytest tests/ -q` → `0 failed / 0 error`，通过数 ≥ **60**（2026-10-25 实测 60）。
-2. `python tools/probe.py all` → **38 个 key 全 PASS**（2026-10-25 实测 38/38）。
-3. `pwsh -File tools/check_gates.ps1 -Full` → `FAIL 0 / BLOCKED 0 / SKIP 0`，退出码 **0**，PASS = **45**。
+1. `python -m pytest tests/ -q` → `0 failed / 0 error`，通过数 ≥ **67**（2026-10-25 实测 67）。
+2. `python tools/probe.py all` → **41 个 key 全 PASS**（2026-10-25 实测 41/41）。
+3. `pwsh -File tools/check_gates.ps1 -Full` → `FAIL 0 / BLOCKED 0 / SKIP 0`，退出码 **0**，PASS = **48**（2026-10-25 实测 48/48）。
 4. `python cli.py 002415 --as-of 2026-10-22 --json --fast` → `data.bars=3927`、`data.end=2026-10-22`、`data.last_close=32.42`；`action=hold`；`signal.position_state=flat`；`action_reason` **不含** `卖出信号`；`trigger.current != last_close`；`request.as_of=2026-10-22`。
 5. `python cli.py 002415 --as-of 2026-10-23 --json --fast` → `bars=3928`、`last_close=33.78`；`signal.last_sell_age` 比上一窗口恰好 +1（决策日推进一天，卖点年龄同步推进）。
 6. `python cli.py 600519 --json --fast` → `evidence.edge.verdict` 与 `significant` 自洽；`evidence.signal_stats.n_sell > 0`；`data.execution.fill` 非空；`evidence.decision_replay.method` 以 `trailing_` 开头且零交易时 `note` 非空。

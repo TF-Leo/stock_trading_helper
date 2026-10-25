@@ -6,9 +6,10 @@
 > **唯一"完成"定义不变**：`pwsh -File tools/check_gates.ps1 -Full` 退出码 = 0。
 > **本清单额外要求**：每修完一条，**必须同时把它变成门禁项**。上一轮的 G06 就是活反例——它至今仍是绿的，但打桩早已失效。
 >
-> **进度（2026-10-25）**：**F22–F31、F33 已完成并提交**（`954df2e` / `1ba98c8` / `090660b` /
-> `1b9f567` / `12fafc0`），实测 **60 passed、probe 38/38**；**F32（打桩自检）/ F34（9 只标的语料）待做**。
-> 实测证据见 `PROGRESS.md` §2.1。
+> **进度（2026-10-25 12:1x）**：**F22–F34 全部完成**（13/13）。
+> 实测：**门禁 48/48 退出码 0**、pytest **67 passed**、probe **41 keys 全 PASS**。
+> 提交：`954df2e` / `1ba98c8` / `090660b` / `1b9f567` / `12fafc0` / `213edee` / `cccb44d` + 本轮收尾。
+> 实测证据见 `PROGRESS.md` §2.1 与 §7。
 
 ---
 
@@ -61,9 +62,9 @@ A1–A14、B1–B9、C1–C8、D1–D6 已全部交付并由下游 Agent 真机�
 | `[x]` | **F29** 成交时点未声明且不可配 | P1 | `engine.py`、`cli.py`、`schema.py` | G43 |
 | `[x]` | **F30** 回测不评价线上规则 | P1 | `decision/evaluate.py`、`cli.py` | G42 |
 | `[x]` | **F31** 无 `--as-of`，无法复盘历史截面 | P2 | `cli.py`、`decision/__init__.py` | G40 |
-| `[ ]` | **F32** 打桩自检未通用化 | P1 | `tools/probe.py` | G44 |
+| `[x]` | **F32** 打桩自检未通用化 | P1 | `tools/probe.py` | G44 |
 | `[x]` | **F33** README 契约章节缺新字段 | P2 | `README.md` | —（C2 已覆盖） |
-| `[ ]` | **F34** 9 只标的语义回归语料缺失 | P2 | `tests/test_semantic_corpus.py` | G40 |
+| `[x]` | **F34** 9 只标的语义回归语料缺失 | P2 | `tests/test_semantic_corpus.py` | G40 |
 
 **代码文件总览**：`source/cli.py`（7 条会碰）、`source/decision/{signals,actions,render,evaluate}.py`（**4 个新文件**）、
 `source/decision/{triggers,scoring,schema,__init__}.py`、`source/stock_analysis/backtest/engine.py`、

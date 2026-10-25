@@ -10,9 +10,9 @@
 
 | 项 | 命令 | 结果 | 证据 |
 |---|---|---|---|
-| 权威门禁 | `check_gates.ps1 -Full -Python <py3.12>` | **PASS 46 / FAIL 0 / BLOCKED 0 / SKIP 0**，退出码 **0**，370.2s | `evidence/20261025-113829/gates_full.txt` |
+| 权威门禁 | `check_gates.ps1 -Full -Python <py3.12>` | **PASS 48 / FAIL 0 / BLOCKED 0 / SKIP 0**，退出码 **0** | `evidence/20261025-120754/gates_full.txt` |
 | 测试 | `pytest tests/ -q` | **67 passed / 11.1s** | `pytest.txt` |
-| 探针 | `probe.py all` | **39 keys，0 non-PASS**（345.8s） | `probe_summary.json` |
+| 探针 | `probe.py all` | **41 keys，0 non-PASS** | `probe_summary.json` |
 | 幂等 | `cli.py 600519 --json --fast` ×2 | 除 `generated_at`/`elapsed_seconds` 外完全一致 | `idem_result.json` |
 | 历史截面 | `--as-of 2026-10-22 / 10-23` | `hold` / 3927 根、`hold` / 3928 根；文案不含"卖出信号" | `asof_summary.json` |
 | 横截面 IC | `tools/ic_report.py` | 20 日不重叠超额 **+2.55%，t=2.82，胜率 56.3%** | `evidence/ic_report.csv` |

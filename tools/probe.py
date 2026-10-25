@@ -54,6 +54,61 @@ EXIT_CODES = {"ok": 0, "no_edge": 10, "insufficient_data": 20,
 _CLI_CACHE = {}
 
 
+def _check_stub(label, expected, actual):
+    """打桩生效自检（F32）：只替换不校验的桩一律视为无效。
+
+    背景：G06 曾长期假绿——`check_windows` 打桩 `cli.get_stock_daily`，
+    而取数早已改走 `meta.resolve_and_fetch`，于是三个窗口跑的是同一份全量数据。
+    该断言就是从那次数出来的：**每个 monkeypatch 之后必须验证注入值真的被消费**。
+
+    Returns:
+        (ok, message)。ok=False 时 message 说明期望与实际。
+    """
+    try:
+        ok = bool(expected == actual)
+    except Exception:  # noqa: BLE001
+        ok = False
+    msg = "" if ok else f"打桩未生效[{label}]：期望 {expected!r}，实得 {actual!r}"
+    return ok, msg
+
+
+def check_stub_selfcheck():
+    """G44：每个 monkeypatch 之后必须有生效断言（F32）。
+
+    规则：函数体内出现 `orig* = ...`（打桩+还原的固定写法）时，
+    该函数必须包含一次 `_check_stub(` 调用。用 AST 判定，不靠 grep 字符串。
+    """
+    import ast
+    path = os.path.abspath(__file__)
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    patched, guarded, missing = [], [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        has_patch = any(
+            isinstance(n, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id.startswith("orig")
+                for t in n.targets)
+            for n in ast.walk(node)
+        )
+        if not has_patch:
+            continue
+        patched.append(node.name)
+        has_guard = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "_check_stub"
+            for n in ast.walk(node)
+        )
+        (guarded if has_guard else missing).append(node.name)
+    return {
+        "status": "PASS" if not missing else "FAIL",
+        "reason": "" if not missing else f"以下函数有打桩但没有生效断言: {missing}",
+        "observed": {"patched": sorted(patched), "guarded": sorted(guarded),
+                     "missing": sorted(missing)},
+    }
+
+
 def sh(args, timeout=300):
     t0 = time.time()
     p = subprocess.run(
@@ -818,6 +873,9 @@ def check_degrade_visibility():
             cli.build_strategy_signals = orig_build
             _meta.resolve_and_fetch = orig_resolve
         data = resp.get("data") or {}
+        _ok, _msg = _check_stub("degrade.bars", len(df), data.get("bars"))
+        if not _ok:
+            problems.append(_msg)
         warns = (resp.get("diagnostics") or {}).get("warnings") or []
         obs["cli"] = {"stale": data.get("stale"),
                       "lag_days": data.get("lag_days"),
@@ -939,14 +997,18 @@ def check_walk_forward():
     grid = build_strategy_signals()
     subset = [k for k in grid if k.split('(')[0] in
               ("唐奇安", "均线趋势", "MACD", "KAMA", "布林", "StochRSI")][:12]
-    old = az.MIN_TRADE_COUNT
+    # 打桩约定：保存原值必须用 `orig*` 前缀，否则 G44 静态扫描不到（见 _check_stub）
+    orig_min_trade = az.MIN_TRADE_COUNT
     az.MIN_TRADE_COUNT = 3   # 与 pytest 同口径：验证机制，不受最少交易数地板干扰
     try:
         out = az.walk_forward_optimize(df, {k: grid[k] for k in subset},
                                        config=BacktestConfig(max_position_pct=1.0), n_splits=3)
     finally:
-        az.MIN_TRADE_COUNT = old
+        az.MIN_TRADE_COUNT = orig_min_trade
     bests = [f["best"] for f in out.get("folds") or []]
+    _ok, _msg = _check_stub("walk_forward.folds>=2", True, len(bests) >= 2)
+    if not _ok:
+        return {"status": "FAIL", "reason": _msg, "observed": {"folds": bests}}
     ok = len(bests) >= 2 and len(set(bests)) > 1
     return {"status": "PASS" if ok else "FAIL",
             "reason": "" if ok else f"各折最优: {bests}（应不完全相同）",
@@ -1001,6 +1063,7 @@ def check_fund_cache_guard():
         if orig is not None:
             ak.fund_etf_hist_sina = orig
     created = os.path.exists(cache)
+    _ok, _msg = _check_stub("fund_cache.not_created", False, created)
     size = os.path.getsize(cache) if created else 0
     if created:
         try:
@@ -1058,10 +1121,9 @@ def check_windows(code="600519"):
             one = cli.advise_internal(code, start=None, fast=True)
             got = (one.get("data") or {}).get("bars")
             # 打桩生效自检：只有打桩真的被调用到，bars 才可能等于 expected
-            if got != expected:
-                return {"status": "FAIL",
-                        "reason": (f"{label}: 打桩未生效，期望 bars={expected}，实得 {got}。"
-                                   "取数入口可能又变了，请检查 meta.resolve_and_fetch"),
+            _ok, _msg = _check_stub(f"windows.{label}.bars", expected, got)
+            if not _ok:
+                return {"status": "FAIL", "reason": _msg,
                         "observed": {"label": label, "expected_bars": expected,
                                      "actual_bars": got}}
             rec = one.get("recommendation") or {}
@@ -1197,6 +1259,9 @@ def check_source_failover():
                               preferred=meta._SOURCE_PREFERENCE.get("akshare"))
         obs["used_source"] = used
         obs["rows"] = 0 if df is None else len(df)
+        _ok, _msg = _check_stub("failover.not_eastmoney", True, used != "eastmoney")
+        if not _ok:
+            problems.append(_msg)
         if df is None or len(df) < 100:
             problems.append(
                 f"东财失败后未降级成功（rows={obs['rows']}, used={used}）—— "
@@ -1678,6 +1743,57 @@ def check_horizon_contract(stock_data=None):
             "reason": "; ".join(problems), "observed": obs}
 
 
+def check_corpus(codes=("002415", "300750", "601398", "688981"),
+                          as_of="2026-10-22"):
+    """G48：真实数据上的语义不变式（F34 的轻量版）。
+
+    合成数据太干净，构造不出"死叉后第 2 天"这类真实状态；语义缺陷只在真实行情上出现。
+    本项对 4 只标的取同一历史截面，断言四条不变式：
+      1. flat 时不得出现 near_sell / sell_triggered；
+      2. action=hold 时文案不得含"卖出信号/买入信号"；
+      3. action=sell 必须说明风控类型；
+      4. trigger.current 非空时不得等于 last_close（指标值被价格顶替）。
+    行情末日早于 as_of 的标的记为 skipped（不静默通过）。
+    """
+    problems, obs = [], {}
+    for code in codes:
+        rec = run_cli_json([code, "--json", "--fast", "--as-of", as_of], cache=False)
+        d = rec.get("data") or {}
+        dd = d.get("data") or {}
+        r = d.get("recommendation") or {}
+        sig = r.get("signal") or {}
+        txt = " ".join(r.get("action_reason") or [])
+        trig = (d.get("evidence") or {}).get("triggers") or [{}]
+        end = str(dd.get("end"))[:10]
+        entry = {"exit": rec.get("exit"), "bars": dd.get("bars"), "end": end,
+                 "action": r.get("action"), "state": sig.get("state"),
+                 "position_state": sig.get("position_state")}
+        obs[code] = entry
+        if not dd.get("bars"):
+            problems.append(f"{code}: 无行情（exit={rec.get('exit')}）")
+            continue
+        if end < as_of:
+            entry["skipped"] = f"缓存末日 {end} 早于 {as_of}"
+            continue
+        if sig.get("position_state") == "flat" and sig.get("state") in ("near_sell", "sell_triggered"):
+            problems.append(f"{code}: flat 却 state={sig.get('state')}")
+        if r.get("action") == "hold" and ("卖出信号" in txt or "买入信号" in txt):
+            problems.append(f"{code}: hold 文案含信号字样")
+        if r.get("action") == "sell" and not any(k in txt for k in ("止损", "止盈", "时间止损", "风控")):
+            problems.append(f"{code}: sell 未说明风控类型")
+        cur, lc = trig[0].get("current"), trig[0].get("last_close")
+        if cur is not None and lc:
+            try:
+                if abs(float(cur) - float(lc)) < 1e-9:
+                    problems.append(f"{code}: trigger.current 等于 last_close")
+            except (TypeError, ValueError):
+                problems.append(f"{code}: trigger.current 非数值")
+    if not obs:
+        return {"status": "BLOCKED", "reason": "无输出"}
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems), "observed": obs}
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     out = {}
@@ -1725,6 +1841,9 @@ def main():
     run("replay", lambda: check_replay(stock_data))
     # v3.0：有效期契约
     run("horizon", lambda: check_horizon_contract(stock_data))
+    # F32：打桩自检 / F34：真实数据语义语料
+    run("stub_selfcheck", check_stub_selfcheck)
+    run("corpus", check_corpus)
     run("placeholders", lambda: check_placeholders(stock_data, fund_data))
     run("family_ratio", lambda: check_family_ratio(stock_data, fund_data))
     run("metrics_ci", lambda: check_metrics_ci(stock_data))
