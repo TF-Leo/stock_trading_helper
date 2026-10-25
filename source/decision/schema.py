@@ -234,6 +234,7 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
     且 data.bars 恒 0 与同文档 invalidation="仅 72 根 < 100" 自相矛盾。
     """
     from .instrument import classify_board
+    from .signals import null_signal as _null_signal
 
     fi = dict(fetch_info or {})
     try:
@@ -275,6 +276,8 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'status': status,
             'action': 'insufficient_data' if status in ('insufficient_data', 'data_source_error') else 'avoid',
             'action_reason': [message],
+            # F24: 与成功路径同构（G35 递归比对键集合）；无信号时全部显式 null
+            'signal': _null_signal(),
             'confidence': 0.0,
             'position_fraction': 0.0,
             # 未知持仓时长时给 [null, null] 而不是编造 [1, 5]

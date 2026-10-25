@@ -38,7 +38,10 @@ from decision.scoring import (  # noqa: F401
     stat_profit_factor,
 )
 from decision.consensus import select_consensus
-from decision.triggers import evaluate_triggers, format_trigger_message
+from decision.triggers import evaluate_triggers
+from decision import signals as sig_mod
+from decision import actions as act_mod
+from decision import render as rnd_mod
 
 # ---------------------------------------------------------------------------
 # tests/ 契约入口（source/tests/test_p2_engineering.py::test_cli_offline_import_and_fund_split）
@@ -385,8 +388,18 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
         signals = {'buy': pd.Series(False, index=df.index),
                    'sell': pd.Series(False, index=df.index)}
         warnings.append(f"最优策略 '{best_name}' 不在策略表中，信号已降级为空（触发器不可信）")
-    triggers = evaluate_triggers(df, {best_name: signals})
-    trigger_msg = format_trigger_message(triggers, 'hold')
+    # F24/F25: 信号状态机 —— 事件 / 历史 / 指标值三者分离（契约 v2.0 §6.1）
+    #   旧实现把"近 10 根内出现过卖点"当成 near_sell，且 trigger.current 恒等于收盘价，
+    #   于是 10-20 的死叉会让 10-21~11-03 天天报"卖出信号"，10-23 大涨当天也不例外。
+    _inst = getattr(strategies.get(best_name), '__self__', None)
+    _family = fam_map.get(best_name)
+    _indicator = sig_mod.describe_indicator(_inst, _family, df)
+    signal_block = sig_mod.build(df, signals['buy'], signals['sell'],
+                                 strategy=best_name, indicator=_indicator)
+    triggers = evaluate_triggers(df, {best_name: signals}, signal_block=signal_block)
+    if signal_block['current_value'] is None:
+        warnings.append(
+            f"策略族 '{_family}' 未提供可复算的指标值：trigger.current 为 null（不以收盘价顶替）")
 
     # 计算置信度 - Fast mode: reduce bootstrap iterations
     # B4: 真实 Deflated Sharpe（同频口径）；F03: 分母用真实试验次数
@@ -416,11 +429,18 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     top_valid = (top_score > -100) and not bool(consensus.get('all_invalid'))
     # F04: significant 必须同时满足 DSR>0 与超额收益 CI 上界>0
     significant = bool(dsr > 0 and exc_ci_hi > 0)
-    # 持续条件：最近 15 根 K 线"全部"同向才算强触发，避免瞬时单根信号在三窗口（full/drop60/drop120）间翻转 —— G06 稳定的前提
-    _n_sig = len(signals['buy'])
-    _lookback = min(15, _n_sig)
-    has_buy_trigger = (_n_sig >= 15) and bool(signals['buy'].iloc[-_lookback:].all())
-    has_sell_trigger = (_n_sig >= 15) and bool(signals['sell'].iloc[-_lookback:].all())
+    # F26/F27: 证据等级（契约 §6.3）。判据是"区间下界>0"才算有正优势，
+    # 而不是"上界>0"（后者只说明"不能排除正收益"，002415 曾因此 p=3.5% 仍报显著）。
+    exc_ci_lo = float((exc.get('ci_95') or [0.0, 0.0])[0])
+    if exc_n >= 3 and exc_ci_lo > 0:
+        edge_verdict = 'positive_significant'
+    elif exc_n >= 3 and exc_ci_hi <= 0:
+        edge_verdict = 'negative_significant'
+    else:
+        edge_verdict = 'inconclusive'
+    # F26: 原"最近 15 根全部为真"过滤器已删除。均线交叉是**单根事件**，
+    # 连续 15 根全为真在数学上不可能，该条件只会把事件型策略的 action 钉死为 hold
+    # （002415 在 10-22 的 hold 就是这么来的）。动作改由 decision.actions.decide() 产出。
 
     # F05/A3: 出现"一手也买不起"事件 → untradeable（退出码 40 才可达）
     if getattr(result, 'unaffordable_lot_events', 0) > 0:
@@ -436,14 +456,12 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     else:
         status = 'ok'
 
-    if status in ('no_edge', 'untradeable'):
-        action = 'avoid'          # 契约 status→action 映射：no_edge/untradeable → avoid
-    elif top_valid and significant and confidence > 0 and has_buy_trigger:
-        action = 'buy'
-    elif top_valid and has_sell_trigger:
-        action = 'sell'
-    else:
-        action = 'hold'
+    # F26: 动作 = 决策表（唯一真源，契约 §7）
+    action = act_mod.decide(
+        status, signal_block['state'], edge_verdict, confidence, significant)
+    # F23: 文案必须在 action 之后生成（旧实现在 action 之前写死，导致 hold + "卖出信号"）
+    action_reason = rnd_mod.build_reasons(
+        action, signal_block, {'verdict': edge_verdict}, status=status)
 
     # F12: 止损/止盈/入场区/仓位/horizon 全部由 decision.sizing 推导（cli 不再写字面量）
     atr_val = None
@@ -526,7 +544,9 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
         'recommendation': {
             'status': status,
             'action': action,
-            'action_reason': [trigger_msg],
+            'action_reason': action_reason,
+            # F24/F25: 仓位、信号状态、指标值、信号日期与年龄（契约 §6.1）
+            'signal': signal_block,
             'confidence': round(confidence, 3),
             'position_fraction': round(position_fraction, 3),
             'horizon_days': horizon,
