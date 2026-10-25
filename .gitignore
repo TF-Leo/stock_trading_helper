@@ -26,3 +26,6 @@ gates_run.log
 .claude/
 # Agent 工作区（记忆/日志，本地产物）
 .workbuddy-ai/
+
+# 取证产物（外部验证回传用，不入库）
+evidence/

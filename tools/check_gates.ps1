@@ -23,8 +23,16 @@
 [CmdletBinding()]
 param(
     [switch]$Full,
-    [switch]$Quick
+    [switch]$Quick,
+    # 可选：指定 Python 解释器（默认取 PATH 上的 python）。
+    # 用途：不同机器上 PATH 的 python 可能缺 pandas/numpy，导致所有门禁因
+    # ModuleNotFoundError 集体翻红——那不是代码问题，是解释器选错。
+    # 例：$env:PYTHON_BIN='C:\Python312\python.exe'; pwsh -File tools/check_gates.ps1 -Full
+    [string]$Python = ''
 )
+
+if (-not $Python) { $Python = $env:PYTHON_BIN }
+if (-not $Python) { $Python = 'python' }
 
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
@@ -63,7 +71,7 @@ Write-Host "仓库: $Root`n"
 # --------------------------------------------------------------------------
 $pyTestOut = ''
 Push-Location $Src
-try { $pyTestOut = (& python -m pytest tests/ -q --tb=line 2>&1 | Out-String) } finally { Pop-Location }
+try { $pyTestOut = (& $Python -m pytest tests/ -q --tb=line 2>&1 | Out-String) } finally { Pop-Location }
 $passed = if ($pyTestOut -match '(\d+) passed') { [int]$Matches[1] } else { 0 }
 $failed = if ($pyTestOut -match '(\d+) failed') { [int]$Matches[1] } else { 0 }
 $errored = if ($pyTestOut -match '(\d+) error') { [int]$Matches[1] } else { 0 }
@@ -98,7 +106,7 @@ $badBlocks = 0
 foreach ($b in $jsonBlocks) {
     $tmp = Join-Path $env:TEMP ("readme_block_{0}.json" -f (Get-Random))
     Set-Content -Path $tmp -Value $b.Groups[1].Value -Encoding UTF8
-    & python -c "import json,sys;json.load(open(sys.argv[1],encoding='utf-8-sig'))" $tmp 2>$null
+    & $Python -c "import json,sys;json.load(open(sys.argv[1],encoding='utf-8-sig'))" $tmp 2>$null
     if ($LASTEXITCODE -ne 0) { $badBlocks++ }
     Remove-Item $tmp -ErrorAction SilentlyContinue
 }
@@ -118,7 +126,7 @@ $probeMode = if ($Quick) { 'all-quick' } else { 'all' }
 # 本修复只改捕获方式，不改任何阈值、断言或状态判定 —— 属加强而非弱化。
 $probeOutFile = Join-Path $env:TEMP ("probe_out_{0}.json" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
 $probeErrFile = Join-Path $env:TEMP ("probe_err_{0}.txt" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
-$pyExe = (Get-Command python -ErrorAction Stop).Source
+$pyExe = (Get-Command $Python -ErrorAction Stop).Source
 $probeProc = Start-Process -FilePath $pyExe `
     -ArgumentList @((Join-Path $PSScriptRoot 'probe.py'), $probeMode) `
     -NoNewWindow -Wait -PassThru `
@@ -219,7 +227,7 @@ else {
 if ($Full) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     Push-Location $Src
-    try { & python cli.py 600519 --json --jobs 4 > $null 2> $null } finally { Pop-Location }
+    try { & $Python cli.py 600519 --json --jobs 4 > $null 2> $null } finally { Pop-Location }
     $sw.Stop()
     $fullSec = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
     if ($fullSec -le 300) { Add-Gate 'G14' '全量模式墙钟 ≤ 300s' 'PASS' "$fullSec s" }
