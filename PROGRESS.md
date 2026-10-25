@@ -1,9 +1,9 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
-- **最后更新**：2026-10-25 10:4x（P0 + F27/F28/F29/F31 完成；本轮 **9/13**）
-- **当前 HEAD**：`1b9f567`｜工作树 clean（文档改动待提交）
-- **当前基线**：`pytest` **60 passed / 9.16s**｜probe **37 keys 全 PASS**｜门禁 **44 项**（新增 G40–G43、G45）｜`cli.py` 685 行（上限 700）
-- **本轮状态**：F22–F29、F31 已完成（4 个提交）；F30/F32/F33/F34 待做。**未跑 `check_gates.ps1`（宿主 pwsh 沙箱限制），需用户执行一次 `-Full` 确认 44/44。**
+- **最后更新**：2026-10-25 11:0x（P0 + F27–F31、F33 完成；本轮 **11/13**）
+- **当前 HEAD**：`12fafc0`｜工作树 clean（文档改动待提交）
+- **当前基线**：`pytest` **60 passed / 9.23s**｜probe **38 keys 全 PASS**｜门禁 **45 项**（新增 G40–G43、G45、G46）｜`cli.py` 691 行（上限 700）
+- **本轮状态**：F22–F31、F33 已完成（6 个提交）；**F32（打桩自检通用化）/ F34（9 只标的语料）待做**。**未跑 `check_gates.ps1`（宿主 pwsh 沙箱限制），需用户执行一次 `-Full` 确认 45/45。**
 - **本轮结论（一句话）**：v1.0 解决了"数字可不可信"，没解决"字面意思对不对"。002415 的事故不是模型看错一天，而是**动作、文案、数字、统计标签四者互不一致**，且验证这三者的门禁已经失效。
 - **完成定义不变**：`pwsh -File tools/check_gates.ps1 -Full` 退出码 = 0。任何自我判断的"完成"都不算。
 
@@ -14,10 +14,10 @@
 | 项 | 值 | 备注 |
 |---|---|---|
 | 契约 | `GOAL_CONTRACT.md` **v2.0** | §7 决策表签名、§8 实验设计、§9 验收已按实测修订 |
-| 清单 | `GOAL_FIXLIST.md` **F22–F34** | **9 条完成 / 4 条待做** |
-| 门禁 | **44 项**（probe 37 keys） | 新增 G40 语义同源 / G41 证据等级 / G42 信号级统计 / G43 成交口径 / G45 as-of |
+| 清单 | `GOAL_FIXLIST.md` **F22–F34** | **11 条完成 / 2 条待做**（F32 / F34） |
+| 门禁 | **45 项**（probe 38 keys） | G40 语义同源 / G41 证据等级 / G42 信号统计 / G43 成交口径 / G45 as-of / G46 决策回放 |
 | 测试 | **60 passed**（原 47） | 新增 `tests/test_semantic_actions.py` 13 项 |
-| 待做 | F30 / F32 / F33 / F34 | 见 §2 跟踪表 |
+| 待做 | F32 / F34 | 见 §2 跟踪表 |
 
 ### 0.1 本轮为何开新一轮（不是返工）
 
@@ -130,10 +130,10 @@ actual_end                      = 2026-10-23
 | `[x]` | F27 | P1 | `significant` 收紧 + `edge.verdict` | G41 |
 | `[x]` | F28 | P1 | 信号级统计（卖点后 1/3/5/10/20 日） | G42 |
 | `[x]` | F29 | P1 | 成交时点可配 + 声明 | G43 |
-| `[ ]` | F30 | P1 | 决策回放（评价线上规则） | G42 |
+| `[x]` | F30 | P1 | 决策回放（评价线上规则） | G42 |
 | `[x]` | F31 | P2 | `--as-of` 历史复盘 | G40 |
 | `[ ]` | F32 | P1 | 打桩自检通用化 | G44 |
-| `[ ]` | F33 | P2 | README 契约章节同步 | C2 |
+| `[x]` | F33 | P2 | README 契约章节同步 | C2 |
 | `[ ]` | F34 | P2 | 9 只标的语义回归语料 | G40 |
 
 **每修完一条，必须在本表把 `[ ]` 改 `[x]`，并在 §2.1 追加一行实测证据（命令 + 输出片段 + 退出码 + 时间）。**
@@ -152,6 +152,8 @@ actual_end                      = 2026-10-23
 | F29 | 合成序列 `exec_price` 对照 · `1b9f567` | 同一信号：`next_open` 入场 **10.1707** vs `next_close` **10.3783**；`data.execution.fill=next_open` | 2026-10-25 |
 | F31 | `cli.py 002415 --as-of 2026-10-22 --json --fast` | `bars=3927`、`end=2026-10-22`、`last_close=32.42`、`request.as_of` 回显、`window_note="--as-of 2026-10-22 截取后 3927 根"`；`--as-of 2026-10-23` → 3928 / 33.78 | 同上 |
 | G06 设计更正 | `python tools/probe.py windows` | 固定决策日、从头砍训练窗口：600519 `action=avoid` ×3、`position_drift=true`（唐奇安 30/20→20/10）；002415 `hold/flat/near_buy` ×3 完全一致 | 同上 |
+| F30 | `cli.py 002415 --as-of 2026-10-22 --json --fast` · `12fafc0` | `decision_replay.trade_count=0`、`exposure=0`、`vs_buy_hold=-8.79`、`note="决策表未放行买入（significant=False…）"`、`method=trailing_250_point_estimate`；600519 同类，note 为 `status=no_edge` | 2026-10-25 |
+| F33 | `grep` README + JSON 解析 | 两个 ```json 块均可 `json.loads`；新增「v2.0 语义变更（消费方必读）」与 signal/edge/signal_stats/decision_replay/execution 字段说明 | 同上 |
 
 **关键实测（002415 两日对照，修复前后）**
 
@@ -164,7 +166,9 @@ actual_end                      = 2026-10-23
 
 ## 3. 未验证 / 不得声称
 
-- **F30/F32/F33/F34 未验证**：决策回放、打桩自检通用化、README 同步、9 只标的语料均**尚未实现**。
+- **F32/F34 未验证**：打桩自检通用化、9 只标的语义语料**尚未实现**。
+- **决策回放是近似口径**：`method=trailing_250_point_estimate`，`status`/`confidence`/`significant` 用全样本值，`edge` 用 250 根滚动点估计。**不是 walk-forward**，不得如此宣称。
+- **`action=buy` 当前几乎不可达**：需 `edge.verdict=positive_significant` 且 `significant=True`，实测多数标的为 `inconclusive`，因此 `decision_replay` 常为零交易（已在 `note` 说明）。这是"买入靠证据"的直接后果；若要提高可交易性，需单独提案调整证据门槛，**不得**偷偷放宽。
 - **`check_gates.ps1` 本轮未执行**（宿主 pwsh 沙箱创建失败：`LsSDK_CreateSandbox(ConPTY) 0x6`）。只有 `probe.py` 的 37 keys 全 PASS，**不能据此声称 44/44**；需用户跑一次 `-Full`。
 - **G06 的实验设计本轮被更正**：原实现从**末尾**砍 60/120 根，等于把决策日一起往前挪，测到的是"仓位随时间变化"而非稳定性。改为固定决策日、从头砍训练窗口；判据 L1 改为 `action`。实测 600519 `action` 三窗口一致、`position_state` 因胜出变体变化而漂移（已如实上报 `position_drift=true`）。
 - **`position_state` 在 600519 上不跨训练窗口稳定**：丢最老 120 根后唐奇安参数从 (30/20) 变 (20/10)。这是真实性质，**未修**；因该标的 `status=no_edge`，不影响建议。若将来要让仓位稳定，应做族级共识/滞回，禁止加过滤器。

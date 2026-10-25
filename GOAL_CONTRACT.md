@@ -277,43 +277,43 @@ def decide(status, state, edge_verdict, confidence, significant) -> str:
 
 ## 9. Phase E — 语义（P0，先做）
 
-- [ ] **E1 决策表落地**（F26）。新建 `decision/actions.py`，实现 §7；`cli.py:419-423` 的 15 根过滤器删除；`action` 只由 `decide()` 产生。
+- [x] **E1 决策表落地**（F26）。新建 `decision/actions.py`，实现 §7；`cli.py:419-423` 的 15 根过滤器删除；`action` 只由 `decide()` 产生。
   **验证**：合成"单根金叉 + 后续 15 根无信号"的序列，断言 `action=buy`（旧实现必然 `hold`）；再构造"金叉后一根死叉"，断言 `action=sell`。
-- [ ] **E2 信号状态机**（F24/F25）。新建 `decision/signals.py`，产出 §6.1 全部字段；`position_state=flat` 时禁止 `near_sell`。
+- [x] **E2 信号状态机**（F24/F25）。新建 `decision/signals.py`，产出 §6.1 全部字段；`position_state=flat` 时禁止 `near_sell`。
   **验证**：用 002415 截至 2026-10-22 的数据，断言 `position_state=flat`、`state ∈ {neutral, near_buy}`（实测为 `near_buy`：MA3/MA30=0.9795，距金叉 2%）、`last_sell_date=2026-10-20`、`last_sell_age=2`、`current_value != last_close`。
-- [ ] **E3 文案单出口**（F23）。新建 `decision/render.py`；`format_trigger_message` 的 `action` 死参数删除；`cli.py:389` 的提前生成删除。
+- [x] **E3 文案单出口**（F23）。新建 `decision/render.py`；`format_trigger_message` 的 `action` 死参数删除；`cli.py:389` 的提前生成删除。
   **验证**：`action=hold` 时 `action_reason` 不含 `卖出信号|买入信号`；`action=sell` 时含当日日期；`action_reason` 与 `action` 的一致性对 9 只标的 × 3 窗口全部成立。
-- [ ] **E4 `trigger.current` 改指标值**（F25）。`evidence.triggers[].current` 为指标当前值，新增 `last_close` 字段；`buy_trigger`/`sell_trigger` 文案不得再把收盘价当指标值。
+- [x] **E4 `trigger.current` 改指标值**（F25）。`evidence.triggers[].current` 为指标当前值，新增 `last_close` 字段；`buy_trigger`/`sell_trigger` 文案不得再把收盘价当指标值。
   **验证**：`current != last_close` 至少在 8/9 标的成立（允许极少数恰好相等）；同一标的在两个不同截止日的 `current` 不相等，而 `last_close` 各自等于当日收盘。
-- [ ] **E5 契约与 README 同步**（F33）。§6 全部字段写入 README「给 Agent 的接口契约」，并给出 002415 的真实示例。
+- [x] **E5 契约与 README 同步**（F33）。§6 全部字段写入 README「给 Agent 的接口契约」，并给出 002415 的真实示例。
   **验证**：README 可检索到 `position_state`、`last_sell_age`、`edge.verdict`、`signal_stats`、`execution.fill`；示例 JSON 可被 `json.loads` 解析。
 
 ---
 
 ## 10. Phase F — 评价（P1，E 之后）
 
-- [ ] **F1 信号级统计**（F28）。新建 `decision/evaluate.py::signal_stats()`，产出 §6.4。
+- [x] **F1 信号级统计**（F28）。新建 `decision/evaluate.py::signal_stats()`，产出 §6.4。
   **验证**：对 002415 断言 `n_sell > 0`、`horizons == [1,3,5,10,20]`、`sell.hit_rate["1"]` 与手算一致（容差 1e-9）；`sell_false_alarm_rate_5d ∈ [0,1]`。
-- [ ] **F2 成交时点声明**（F29）。`BacktestConfig` 增 `exec_price: str = "next_open"`；`data.execution.fill` 如实回报。
+- [x] **F2 成交时点声明**（F29）。`BacktestConfig` 增 `exec_price: str = "next_open"`；`data.execution.fill` 如实回报。
   **验证**：同一信号序列在 `next_open` 与 `next_close` 下 `trade_count` 相同但成交价不同；`data.execution.fill` 与配置一致。
-- [ ] **F3 决策回放**（F30）。`decision/evaluate.py::decision_replay()`：用**被选中策略**的日频信号 + §7 决策表 + 250 根滚动超额收益点估计，逐日回放，产出 `evidence.decision_replay`。
+- [x] **F3 决策回放**（F30）。`decision/evaluate.py::decision_replay()`：用**被选中策略**的日频信号 + §7 决策表 + 250 根滚动超额收益点估计，逐日回放，产出 `evidence.decision_replay`。
   **验证**：`method` 字段必须写明近似方式；断言 `trade_count` 与原始信号回测**不同**（证明它真的在跑另一套规则），且 `exposure ∈ [0,1]`。
   > 允许的近似：不逐日重跑 581 组网格。**禁止**把该结果称为 walk-forward。
-- [ ] **F4 `--as-of` 复盘**（F31）。新增参数，把数据截断到指定日期后完整运行，`data.window_note` 注明。
+- [x] **F4 `--as-of` 复盘**（F31）。新增参数，把数据截断到指定日期后完整运行，`data.window_note` 注明。
   **验证**：`002415 --as-of 2026-10-22` 与 `--as-of 2026-10-23` 的 `data.bars` 分别为 3927 / 3928；后者 `last_close=33.78`。
 
 ---
 
 ## 11. Phase G — 验证完整性（G1 最先，必须与 F22 同批完成；G2–G7 随各阶段落地）
 
-- [ ] **G1 修 G06 打桩**（F22）。`probe.py::check_windows` 改为打桩 `meta.resolve_and_fetch`；并断言三窗口 `bars` 互不相同。
+- [x] **G1 修 G06 打桩**（F22）。`probe.py::check_windows` 改为打桩 `meta.resolve_and_fetch`；并断言三窗口 `bars` 互不相同。
   **验证**：`drop120` 下 `bars` 必须等于 `len(full)-120`（002415 应为 3808，当前实测 3928）；三值互不相等。
 - [ ] **G2 打桩自检通用化**（F32）。probe 内所有 monkeypatch 必须紧跟一条"生效断言"；新增 `check_stub_selfcheck()`，任一处缺自检即 FAIL。
   **验证**：临时移除某处自检 → **G44** FAIL（变异测试）；恢复后 PASS。
-- [ ] **G3 语义门禁 G40**（F23/F24）。断言 `action_reason` 与 `action` 一致、`flat` 时无 `near_sell`、日期与 `age` 自洽。
-- [ ] **G4 统计门禁 G41**（F27）。断言 `significant == (ci_lo>0 and dsr>0)`、`verdict` 与 CI 一致、`p_positive` 与 CI 分位数一致。
-- [ ] **G5 统计门禁 G42**（F28）。断言 `signal_stats` 齐备且 `hit_rate ∈ [0,1]`、`n_sell` 与信号序列一致。
-- [ ] **G6 成交声明门禁 G43**（F29）。断言 `data.execution` 五键齐备且 `fill` 与 `BacktestConfig.exec_price` 一致。
+- [x] **G3 语义门禁 G40**（F23/F24）。断言 `action_reason` 与 `action` 一致、`flat` 时无 `near_sell`、日期与 `age` 自洽。
+- [x] **G4 统计门禁 G41**（F27）。断言 `significant == (ci_lo>0 and dsr>0)`、`verdict` 与 CI 一致、`p_positive` 与 CI 分位数一致。
+- [x] **G5 统计门禁 G42**（F28）。断言 `signal_stats` 齐备且 `hit_rate ∈ [0,1]`、`n_sell` 与信号序列一致。
+- [x] **G6 成交声明门禁 G43**（F29）。断言 `data.execution` 四键齐备且 `fill` 与 `BacktestConfig.exec_price` 一致。
 - [ ] **G7 回归语料**（F34）。9 只实盘标的 × 3 窗口的语义不变式固化为测试（断言不变式，不锁死数值）。
   **验证**：`pytest -k semantic_corpus` 全绿；任一标的出现"flat + near_sell"即红。
 
@@ -324,11 +324,11 @@ def decide(status, state, edge_verdict, confidence, significant) -> str:
 在 `source/` 下：
 
 1. `python -m pytest tests/ -q` → `0 failed / 0 error`，通过数 ≥ **60**（2026-10-25 实测 60）。
-2. `python tools/probe.py all` → **37 个 key 全 PASS**（2026-10-25 实测 37/37）。
-3. `pwsh -File tools/check_gates.ps1 -Full` → `FAIL 0 / BLOCKED 0 / SKIP 0`，退出码 **0**，PASS = **44**。
+2. `python tools/probe.py all` → **38 个 key 全 PASS**（2026-10-25 实测 38/38）。
+3. `pwsh -File tools/check_gates.ps1 -Full` → `FAIL 0 / BLOCKED 0 / SKIP 0`，退出码 **0**，PASS = **45**。
 4. `python cli.py 002415 --as-of 2026-10-22 --json --fast` → `data.bars=3927`、`data.end=2026-10-22`、`data.last_close=32.42`；`action=hold`；`signal.position_state=flat`；`action_reason` **不含** `卖出信号`；`trigger.current != last_close`；`request.as_of=2026-10-22`。
 5. `python cli.py 002415 --as-of 2026-10-23 --json --fast` → `bars=3928`、`last_close=33.78`；`signal.last_sell_age` 比上一窗口恰好 +1（决策日推进一天，卖点年龄同步推进）。
-6. `python cli.py 600519 --json --fast` → `evidence.edge.verdict` 与 `significant` 自洽；`evidence.signal_stats.n_sell > 0`；`data.execution.fill` 非空。
+6. `python cli.py 600519 --json --fast` → `evidence.edge.verdict` 与 `significant` 自洽；`evidence.signal_stats.n_sell > 0`；`data.execution.fill` 非空；`evidence.decision_replay.method` 以 `trailing_` 开头且零交易时 `note` 非空。
 7. 三窗口（固定决策日：full / drop_head60 / drop_head120）→ `bars` 三者互不相同、`data.end` 三者相同、`action` 三者一致；`position_state` 若漂移，`position_drift` 必须如实为 `true`。
 8. 连跑两次（剔除 `generated_at`/`elapsed_seconds`）JSON 完全相同。
 9. `(Get-Content cli.py).Count` → ≤ **700**。
