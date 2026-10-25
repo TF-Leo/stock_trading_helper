@@ -64,6 +64,26 @@ python cli.py 600519 --start 20200101 --json
 - **action**: `buy` / `sell` / `hold` / `avoid` / `insufficient_data`
 - **trigger.state**: `buy_triggered` / `near_buy` / `neutral` / `near_sell` / `sell_triggered`
 
+### v2.0 语义变更（**消费方必读**）
+
+2026-10-25 修复了一类"字面意思与内部事实不一致"的事故：`action=hold` 却输出
+`均线趋势(3-30-60): 卖出信号 (32.42)`，而 32.42 是当日收盘价、死叉发生在两天前。
+请按下面两条读：
+
+1. **`action` 是"增量动作"，不是对行情的判断。**
+   `buy` = 相对当前空仓建仓，`sell` = 相对当前持仓清仓，`hold` = 不动作。
+   当前仓位由 `recommendation.signal.position_state`（`flat` / `holding`）单独给出。
+   **不要**从 `action_reason` 里抓关键词反推动作——`hold` 的文案里可能出现"卖点"二字，
+   那是在描述**历史**（带日期），不是当前建议。
+
+2. **`near_buy` / `near_sell` 表示"接近阈值"，不表示"曾经发生过"。**
+   历史信号请看 `signal.last_buy_date` / `last_sell_date` 与 `last_*_age`（交易日数）。
+   硬规则：`position_state=flat` 时不会出现 `near_sell` 或 `sell_triggered`。
+
+3. **`significant` 的语义已收紧**为"统计上可证明有正超额优势"（`edge.verdict ==
+   positive_significant` 且 DSR>0）。旧版只要求"CI 上界>0"，会让 `p_positive=3.5%`
+   的策略也被标成显著。判断证据强弱请直接看 `evidence.edge.verdict` 三档。
+
 ### 完整字段表
 
 ```json
@@ -76,7 +96,8 @@ python cli.py 600519 --start 20200101 --json
     "start": "20200101",
     "opt": "grid",
     "jobs": 1,
-    "fast": false
+    "fast": false,
+    "as_of": null
   },
   "instrument": {
     "code": "600519",
@@ -97,7 +118,13 @@ python cli.py 600519 --start 20200101 --json
     "lag_days": 0,
     "expected_date": "2026-10-16",
     "requested_source": "sina",
-    "window_note": null
+    "window_note": null,
+    "execution": {
+      "signal_bar": "close",
+      "fill": "next_open",
+      "slippage_bps": 10,
+      "commission_bps": 3
+    }
   },
   "market_regime": {
     "label": "Bull",
@@ -107,8 +134,23 @@ python cli.py 600519 --start 20200101 --json
   },
   "recommendation": {
     "status": "ok",
-    "action": "buy",
-    "action_reason": ["MA(5-20): 买入信号 (2.50)"],
+    "action": "hold",
+    "action_reason": ["策略当前空仓（2026-10-21 卖点离场，距今 1 个交易日）；今日无新信号，维持当前仓位；指标已接近买点阈值，但尚未触发"],
+    "signal": {
+      "strategy": "均线趋势(5-30-120)",
+      "indicator": "MA5/MA30",
+      "position_state": "flat",
+      "state": "near_buy",
+      "as_of": "2026-10-22",
+      "last_buy_date": "2026-10-20",
+      "last_buy_age": 2,
+      "last_sell_date": "2026-10-21",
+      "last_sell_age": 1,
+      "current_value": 0.9903,
+      "last_close": 32.42,
+      "threshold": {"buy": 1.0, "sell": 1.0},
+      "conflict": false
+    },
     "confidence": 0.65,
     "position_fraction": 0.20,
     "horizon_days": [5, 20],
@@ -130,15 +172,24 @@ python cli.py 600519 --start 20200101 --json
     },
     "dispersion": 0.15,
     "stability": {
-      "windows_tested": 3,
-      "action_stable": true,
-      "family_stable": true,
-      "top_k_overlap_min": 5
+      "windows_tested": 1,
+      "action_stable": null,
+      "family_stable": null,
+      "top_k_overlap_min": null
     },
     "n_trials": 10,
     "n_survivors": 8,
-    "deflated_sharpe": 0.85,
-    "significant": true,
+    "deflated_sharpe": 0.2434,
+    "significant": false,
+    "edge": {
+      "verdict": "inconclusive",
+      "point": -0.00049,
+      "ci_95": [-0.001215, 0.000181],
+      "p_positive": 0.07,
+      "n_obs": 3926,
+      "dsr": 0.2434,
+      "dsr_ok": true
+    },
     "metrics": {
       "annual_return": {"point": 0.1014, "ci_95": [0.05, 0.15]},
       "max_drawdown": {"point": -0.0678, "ci_95": [-0.10, -0.03]},
@@ -153,6 +204,28 @@ python cli.py 600519 --start 20200101 --json
     "excess_vs_buy_hold": {
       "point": 0.05,
       "ci_95": [0.02, 0.08]
+    },
+    "signal_stats": {
+      "strategy": "均线趋势(5-30-120)",
+      "horizons": [1, 3, 5, 10, 20],
+      "n_buy": 234,
+      "n_sell": 87,
+      "buy": {"mean_fwd": {"1": 0.001469, "3": 0.008705, "5": 0.013653, "10": 0.017301, "20": 0.02874},
+              "hit_rate": {"1": 0.5043, "3": 0.5279, "5": 0.5325, "10": 0.5541, "20": 0.5931}},
+      "sell": {"mean_fwd": {"1": -0.000969, "3": 0.005473, "5": -0.000444, "10": -0.008096, "20": -0.006663},
+               "hit_rate": {"1": 0.5402, "3": 0.5465, "5": 0.5233, "10": 0.593, "20": 0.5581},
+               "missed_rally_mean_5d": 0.038323},
+      "sell_false_alarm_rate_5d": 0.4535,
+      "note": null
+    },
+    "decision_replay": {
+      "method": "trailing_250_point_estimate",
+      "trade_count": 0,
+      "annual_return": 0.0,
+      "max_drawdown": 0.0,
+      "exposure": 0.0,
+      "vs_buy_hold": -8.794562,
+      "note": "决策表未放行买入（significant=False 或 edge 未达 positive_significant），回放全程空仓"
     },
     "buy_hold_baseline": {
       "total_return": 0.58,
@@ -250,7 +323,29 @@ python cli.py 600519 --start 20200101 --json
 - **stop_method**: `"atr"` 或 `"fixed"` —— 明确告诉调用方止损是用哪种口径算的（**与回测引擎同一口径**）；无回测（错误路径）时为 null
 - **distance_to_trigger**: `{buy_pct, sell_pct}`，由"最近一次该向信号所在 bar 的收盘价"与 `last_close` 实算；无该向信号时为 null
 - **invalidation**: 失效条件，模板 `收盘跌破 {stop_loss}，或 {family} 族共识转为看空，或 {n} 个交易日内未触发入场`
+- **signal**: 信号状态块（v2.0 新增）——
+  `strategy`（策略名）、`indicator`（指标口径，如 `MA5/MA30`）、`position_state`（`flat`/`holding`）、
+  `state`（五档，见枚举）、`as_of`、`last_buy_date`/`last_buy_age`、`last_sell_date`/`last_sell_age`、
+  `current_value`（**指标当前值，不是价格**；不可复算的族为 `null`）、`last_close`、
+  `threshold{buy,sell}`、`conflict`（同根买卖同时为真）
 - **no_edge**: 是否无优势（布尔值），恒等于 `status == "no_edge"`
+
+### evidence（v2.0 新增字段）
+
+- **edge**: 证据等级 `{verdict, point, ci_95, p_positive, n_obs, dsr, dsr_ok}`；
+  `verdict ∈ positive_significant / inconclusive / negative_significant`，
+  判据是 CI **下界**>0（正）/ 上界<0（负）/ 其余（不确定）
+- **signal_stats**: 信号级统计 `{strategy, horizons[1,3,5,10,20], n_buy, n_sell, buy{mean_fwd,hit_rate},
+  sell{mean_fwd,hit_rate,missed_rally_mean_5d}, sell_false_alarm_rate_5d, note}`；
+  回答"每次买点/卖点之后实际涨了还是跌了"。样本不足时 `note` 说明原因
+- **decision_replay**: 按线上决策表逐日回放 `{method, trade_count, annual_return, max_drawdown,
+  exposure, vs_buy_hold, note}`。`method` 如实标注近似口径（当前 `trailing_250_point_estimate`），
+  **不是 walk-forward**。`trade_count=0` 时 `note` 必说明原因（如 `status=no_edge`）
+
+### data.execution（v2.0 新增字段）
+
+`{signal_bar, fill, slippage_bps, commission_bps}` —— 本次结论对应的成交假设。
+`fill` 当前为 `next_open`（信号次日开盘成交，可执行）；旧版是次日收盘成交，晚一整天。
 
 ### 错误响应与成功响应同构（C3）
 
@@ -259,6 +354,8 @@ python cli.py 600519 --start 20200101 --json
 
 - `evidence.metrics` 仍有 9 项，每项 `{"point": null, "ci_95": null}`
 - `evidence.n_trials = 0`、`significant = false`、`consensus.family = null`、`triggers = []`
+- `evidence.edge` 七键齐全（值全 `null`）、`evidence.signal_stats` 展开到 5 个 horizon 子键（值 `null`）、
+  `evidence.decision_replay` 七键齐全、`recommendation.signal` 十三键齐全、`data.execution` 四键齐全
 - `recommendation.horizon_days = [null, null]`、`stop_loss/take_profit/stop_method = null`、`position_fraction = 0.0`
 - `data.bars/start/end/last_close` 在"数据太短"时是**已知真实值**（如 `bars=23`），与 `invalidation` 文本一致；拉取彻底失败时才为 `0 / "" / null`
 - `candidates = []`（没有候选才是正确语义，不是缺字段）

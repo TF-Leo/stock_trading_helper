@@ -472,6 +472,10 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     # F23: 文案必须在 action 之后生成（旧实现在 action 之前写死，导致 hold + "卖出信号"）
     action_reason = rnd_mod.build_reasons(
         action, signal_block, {'verdict': edge_verdict}, status=status)
+    # F30: 决策回放 —— 评价 Hermes 实际收到的那条规则（近似口径见 method 字段）
+    replay_block = ev_mod.decision_replay(
+        df, signals['buy'], signals['sell'], status=status, confidence=confidence,
+        significant=significant, exec_price=config.exec_price)
 
     # F12: 止损/止盈/入场区/仓位/horizon 全部由 decision.sizing 推导（cli 不再写字面量）
     atr_val = None
@@ -587,6 +591,8 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'edge': edge_block,
             # F28: 信号级评价（买卖点后的实际走势，回答"这条提示准不准"）
             'signal_stats': stats_block,
+            # F30: 决策回放（按线上决策表执行，近似口径写在 method）
+            'decision_replay': replay_block,
             'metrics': _build_metrics(result, fast),
             'excess_vs_buy_hold': exc,
             'buy_hold_baseline': calc_buy_hold_baseline(df, config),

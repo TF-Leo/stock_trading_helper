@@ -1592,6 +1592,40 @@ def check_as_of(code="002415"):
             "reason": "; ".join(problems), "observed": obs}
 
 
+def check_replay(stock_data=None):
+    """G46：`evidence.decision_replay` 必须真按决策表回放且内部自洽（F30）。"""
+    if stock_data is None:
+        return {"status": "BLOCKED", "reason": "无股票输出"}
+    ev = stock_data.get("evidence") or {}
+    r = ev.get("decision_replay") or {}
+    rec = stock_data.get("recommendation") or {}
+    need = ("method", "trade_count", "annual_return", "max_drawdown",
+            "exposure", "vs_buy_hold", "note")
+    problems = [f"缺 {k}" for k in need if k not in r]
+    if problems:
+        return {"status": "FAIL", "reason": "; ".join(problems), "observed": r}
+
+    if not str(r.get("method") or "").startswith("trailing_"):
+        problems.append(f"method={r.get('method')!r} 未声明近似口径")
+    if "walk" in str(r.get("method") or "").lower():
+        problems.append("method 不得声称 walk-forward（参数仍来自全样本选择）")
+    exp = r.get("exposure")
+    if exp is None or not (0.0 <= float(exp) <= 1.0):
+        problems.append(f"exposure={exp} 越界")
+    if int(r.get("trade_count") or 0) == 0 and not r.get("note"):
+        problems.append("零交易却没有 note 说明原因")
+    # 与决策表一致：不显著时不得有买入
+    if rec.get("status") == "ok" and ev.get("significant") is False:
+        if int(r.get("trade_count") or 0) != 0:
+            problems.append(f"significant=False 但回放成交 {r.get('trade_count')} 笔"
+                            "（决策表不允许买入，二者矛盾）")
+    return {"status": "PASS" if not problems else "FAIL",
+            "reason": "; ".join(problems),
+            "observed": {"method": r.get("method"), "trade_count": r.get("trade_count"),
+                         "exposure": exp, "vs_buy_hold": r.get("vs_buy_hold"),
+                         "note": r.get("note")}}
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     out = {}
@@ -1635,6 +1669,8 @@ def main():
     # 本轮新增：G43 成交口径 / G45 历史复盘
     run("execution", lambda: check_execution(stock_data))
     run("as_of", check_as_of)
+    # F30：决策回放
+    run("replay", lambda: check_replay(stock_data))
     run("placeholders", lambda: check_placeholders(stock_data, fund_data))
     run("family_ratio", lambda: check_family_ratio(stock_data, fund_data))
     run("metrics_ci", lambda: check_metrics_ci(stock_data))

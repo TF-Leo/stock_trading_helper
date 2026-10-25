@@ -262,7 +262,7 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
     """
     from .instrument import classify_board
     from .signals import null_signal as _null_signal
-    from .evaluate import null_stats
+    from .evaluate import null_stats, null_replay
 
     fi = dict(fetch_info or {})
     try:
@@ -335,6 +335,8 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
                      'p_positive': None, 'n_obs': 0, 'dsr': None, 'dsr_ok': None},
             # F28: 信号级统计；无信号时保留键、值为 null
             'signal_stats': null_stats('无可用信号，无法统计'),
+            # F30: 决策回放；无数据时键齐全、值为 null
+            'decision_replay': null_replay('无可用信号，无法回放'),
             'metrics': empty_metrics(),
             'excess_vs_buy_hold': {'point': None, 'ci_95': None,
                                    'p_positive': None, 'n_obs': 0,
