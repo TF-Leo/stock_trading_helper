@@ -1009,37 +1009,84 @@ def _load_cli_and_full_df(code="600519"):
 
 
 def check_windows(code="600519"):
-    """B6：full / drop_last_60 / drop_last_120 三个窗口的 action 与共识族必须一致。"""
+    """B6/G06（F22 修复）：三窗口必须真的不同，且决策输入必须稳定。
+
+    2026-10-25 修复：原实现打桩 `cli.get_stock_daily`，但取数早已改走
+    `meta.resolve_and_fetch`（cli.py:241-242）。`cli.get_stock_daily` 只剩 import、零调用点，
+    于是三个窗口跑的都是同一份全量数据 —— 实测 drop120 应 3808 根、实得 3928 根。
+    G06 的 PASS 当时只证明了"同一份数据跑三次结果相同"，与稳定性无关。
+
+    新判据（契约 v2.0 §8）：
+      L1 `position_state` 与 `consensus.family` 必须一致（决策的真正输入）
+      L2 `action` 允许因窗口变化，但 `stability.action_stable` 必须如实上报
+      L3 三窗口 `bars` 必须互不相同（打桩生效的证据）
+    """
     cli, df = _load_cli_and_full_df(code)
     if df is None or len(df) < 300:
         return {"status": "BLOCKED", "reason": "本地缓存不足，无法切三窗口"}
-    orig = cli.get_stock_daily
+    # 注意：import 必须在 _load_cli_and_full_df() 之后 —— 它会 os.chdir(SRC)，
+    # 否则在仓库根目录跑 probe 时 `stock_analysis` 不可导入。
+    from stock_analysis.data_loader import meta
+    orig = meta.resolve_and_fetch
     results = {}
     try:
         for label, drop in (("full", 0), ("drop60", 60), ("drop120", 120)):
             sub = (df.iloc[: len(df) - drop] if drop else df).copy()
-            cli.get_stock_daily = (lambda d: (lambda *a, **k: d))(sub)
+            expected = len(sub)
+            meta.resolve_and_fetch = (lambda d: (lambda *a, **k: (d, "stock", None)))(sub)
             one = cli.advise_internal(code, start=None, fast=True)
+            got = (one.get("data") or {}).get("bars")
+            # 打桩生效自检：只有打桩真的被调用到，bars 才可能等于 expected
+            if got != expected:
+                return {"status": "FAIL",
+                        "reason": (f"{label}: 打桩未生效，期望 bars={expected}，实得 {got}。"
+                                   "取数入口可能又变了，请检查 meta.resolve_and_fetch"),
+                        "observed": {"label": label, "expected_bars": expected,
+                                     "actual_bars": got}}
+            rec = one.get("recommendation") or {}
             results[label] = {
-                "action": one["recommendation"]["action"],
+                "bars": got,
+                "action": rec.get("action"),
+                "position_state": (rec.get("signal") or {}).get("position_state"),
                 "family": (one.get("evidence") or {}).get("consensus", {}).get("family"),
-                "status": one["recommendation"]["status"],
+                "status": rec.get("status"),
                 "claimed_stability": (one.get("evidence") or {}).get("stability"),
             }
     finally:
-        cli.get_stock_daily = orig
-    actions = {v["action"] for v in results.values()}
+        meta.resolve_and_fetch = orig
+
+    bars = [v["bars"] for v in results.values()]
+    states = {v["position_state"] for v in results.values()}
     families = {v["family"] for v in results.values()}
+    actions = {v["action"] for v in results.values()}
     problems = []
+    if len(set(bars)) != 3:
+        problems.append(f"三窗口 bars 未互不相同 {bars}（打桩未生效）")
+    if len(states) != 1:
+        problems.append(f"position_state 跨窗口不一致: {sorted(map(str, states))}")
+    # family 是 40 个族"评分中位数"的 argmax，窗口小幅变化即可翻转；它只影响
+    # invalidation 文案与 agreement，不参与 action 计算。因此**不**因漂移判 FAIL，
+    # 但要求不得把它声称为稳定（见下）。
     if len(actions) != 1:
-        problems.append(f"action 跨窗口不一致: {actions}")
-    if len(families) != 1:
-        problems.append(f"共识族跨窗口不一致: {families}")
-    claimed = [v["claimed_stability"] for v in results.values() if v["claimed_stability"]]
-    if claimed and problems:
-        problems.append("evidence.stability 声称稳定，但实测不稳定（自评与实际不符）")
+        for v in results.values():
+            st = v.get("claimed_stability") or {}
+            if st.get("action_stable") is True:
+                problems.append("evidence.stability.action_stable=true，但实测 action 跨窗口不一致"
+                                "（自评与实际不符）")
+                break
+    for v in results.values():
+        st = v.get("claimed_stability") or {}
+        if st.get("family_stable") is True and len(families) != 1:
+            problems.append("evidence.stability.family_stable=true，但实测共识族跨窗口不一致"
+                            "（自评与实际不符）")
+            break
     return {"status": "PASS" if not problems else "FAIL",
-            "reason": "; ".join(problems), "observed": results}
+            "reason": "; ".join(problems),
+            "observed": {"windows": results, "bars": bars,
+                         "actions": sorted(map(str, actions)),
+                         "position_state": sorted(map(str, states)),
+                         "families": sorted(map(str, families)),
+                         "family_drift": len(families) != 1}}
 
 
 def check_a1_invariant(code="600519"):

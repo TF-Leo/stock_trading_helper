@@ -134,10 +134,16 @@ def select_consensus(candidates: List[Dict], top_k: int = 10,
         'dispersion': dispersion,
         'family_counts': family_counts,
         'family_scores': {k: round(v, 4) for k, v in fam_scores.items()},
+        # F22b: 单次运行只跑**一个窗口**，无权声称跨窗口稳定性。
+        # 旧实现硬编码 action_stable/family_stable=True、windows_tested=3、
+        # top_k_overlap_min=top_k//2 —— 全部是伪造值。实测 600519 的三窗口
+        # consensus.family 会在「唐奇安 / ATR通道」之间翻转，而这里始终报 true，
+        # 把差异彻底掩盖了（这也是旧 G06 长期假绿的原因之一）。
+        # 跨窗口实测由 tools/probe.py::check_windows 完成；本字段在单次运行中如实置 null。
         'stability': {
-            'action_stable': True,  # Will be validated in B6
-            'family_stable': True,
-            'windows_tested': 3,  # full, drop60, drop120
-            'top_k_overlap_min': max(1, top_k // 2)
+            'action_stable': None,
+            'family_stable': None,
+            'windows_tested': 1,
+            'top_k_overlap_min': None,
         }
     }
