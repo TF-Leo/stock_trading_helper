@@ -71,6 +71,13 @@ class Instrument:
     board: str  # sh_main/sh_star/sz_main/sz_gem/bj/fund/unknown
     price_limit_pct: float
     is_st: bool
+    # P0-3（issue #6）：真实交易状态，additive（schema_version 仍为 1.0）。
+    # 无法获取时显式 None，绝不把"未知"伪装成 False。
+    is_suspended: Optional[bool] = None
+    limit_up: Optional[float] = None
+    limit_down: Optional[float] = None
+    quote_stale: Optional[bool] = None
+    status_source: str = "unavailable"
 
 
 @dataclass
@@ -295,7 +302,11 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
                     # F31: 回显 --as-of，便于 Agent 自证"这条结论基于哪一天"
                     'as_of': requested_as_of},
         'instrument': {'code': code, 'name': '', 'board': board,
-                       'price_limit_pct': price_limit_pct, 'is_st': is_st},
+                       'price_limit_pct': price_limit_pct, 'is_st': is_st,
+                       # P0-3 additive：错误路径与成功路径键同构（G35）。
+                       # 失败发生在取数阶段，交易状态不可得 → 显式 null。
+                       'is_suspended': None, 'limit_up': None, 'limit_down': None,
+                       'quote_stale': None, 'status_source': 'unavailable'},
         'data': {
             # bars/start/end/last_close 在"数据太短"时是**已知的真实值**，
             # 必须如实填（此前恒 0/''/0，与 invalidation 文本互相打脸）

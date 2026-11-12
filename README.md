@@ -107,7 +107,12 @@ python cli.py 600519 --start 20200101 --json
     "name": "贵州茅台",
     "board": "sh_main",
     "price_limit_pct": 0.10,
-    "is_st": false
+    "is_st": false,
+    "is_suspended": false,
+    "limit_up": 1542.53,
+    "limit_down": 1262.07,
+    "quote_stale": false,
+    "status_source": "eastmoney_st_list+tencent_quote"
   },
   "data": {
     "bars": 1643,
@@ -293,8 +298,32 @@ python cli.py 600519 --start 20200101 --json
 - **code**: 标的代码
 - **name**: 标的名称
 - **board**: 板块（"sh_main"/"sh_star"/"sz_main"/"sz_gem"/"bj"/"fund"/"unknown"）
-- **price_limit_pct**: 涨跌停幅度（0.10 表示 10%）
-- **is_st**: 是否 ST 股（布尔值）
+- **price_limit_pct**: 涨跌停幅度（0.10 表示 10%）。有实时报价时以腾讯 `limit_up/last_close` 推算为准；否则按板块静态规则（主板 10%、创业板/科创板 20%、北交所 30%）。**2026-07-06 起沪深主板 ST/*ST 已由 5% 并轨为 10%**（交易所《交易规则（2026 年修订）》），故不再对主板 ST 做 5% 修正；创业板/科创板 ST 仍 20%，北交所 ST 30%
+- **is_st**: 是否 ST/*ST（**真实值**：东财 §6.8 当日名单优先，其次腾讯报价名称前缀；两者都不可用时为 `null`，不再默认 `false`）
+- **is_suspended**: 是否停牌。判据是「交易日 10:00 后 / 已收盘 / 非交易日」腾讯报价定格（`is_stale=true` 且当日成交量为 0）；**盘前（<10:00）返回 `null`**，不把集合竞价前的正常定格误判为停牌
+- **limit_up / limit_down**: 腾讯实时快照给出的当日涨停价 / 跌停价（元）；报价不可用时为 `null`
+- **quote_stale**: 腾讯报价是否定格（`is_stale`）。**它本身不等于停牌**，只是"报价非当日真实成交"的信号
+- **status_source**: 本次状态的数据来源，`+` 分隔的组合值：
+  - `tencent_quote`：实时报价（涨跌停价 / 名称 / is_stale）
+  - `eastmoney_st_list`：东财 §6.8 当日 ST 名单（新鲜）
+  - `st_cache`：ST 名单接口失败后回退的旧缓存（同时 `diagnostics.warnings` 有说明）
+  - `quote_unavailable`：腾讯报价取数失败或字段异常
+  - `offline`：显式离线（`ASTOCK_STATUS_OFFLINE=1` 或 `ASTOCK_DISABLE_NETWORK=1`）
+  - `fund_static`：基金不查询交易状态，仅保留静态板块字段
+  - `unavailable`：错误响应（取数阶段已失败，状态不可得）
+
+> P0-3（issue #6）新增字段全部是 **additive**，`schema_version` 保持 `1.0`：
+> 旧字段含义不变，错误响应与成功响应键集合同构（G35）。无法获取时显式 `null`。
+>
+> **可执行性硬提示**：`is_suspended=true`、疑似退市（报价不可用且行情连续滞后
+> ≥20 个交易日，或报价定格且名称含退市标记）、一字涨停遇买入、一字跌停遇卖出时，
+> `recommendation.status` 升为 `untradeable`（退出码 40）、`action=avoid`，
+> 并在 `diagnostics.warnings` 写明原因。**不修改 `decision/actions.py` 的决策表**——
+> 只拦截"今天这笔成交不了"的场景。
+>
+> ST 名单由东财 §6.8 提供，经上游 `em_get()` 串行限流（最小间隔 1s + 抖动）；
+> 本地短缓存 1 个交易日（`source/stock_analysis/data/status/`，已 gitignore），
+> 接口失败（含 429）回退旧缓存并 warning，不阻断主流程。本项目不引入 baostock。
 
 ### data
 - **bars**: 实际参与回测的 K 线根数（受 `--start` 截取影响）
@@ -463,7 +492,7 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
   "schema_version": "1.0",
   "generated_at": "2026-10-18T10:34:33.471955",
   "request": { "code": "600519", "type": "stock", "type_hint": "auto", "start": null, "opt": "grid", "jobs": 1, "fast": true },
-  "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false },
+  "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false, "is_suspended": false, "limit_up": 1542.53, "limit_down": 1262.07, "quote_stale": false, "status_source": "tencent_quote" },
   "data": { "bars": 1643, "start": "2020-01-02 00:00:00", "end": "2026-10-16 00:00:00", "last_close": 1329.0, "source": "cache", "from_cache": true, "stale": false, "cache_last_date": "2026-10-16", "lag_days": 0, "expected_date": "2026-10-16", "requested_source": "sina", "window_note": null },
   "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility" },
   "recommendation": {

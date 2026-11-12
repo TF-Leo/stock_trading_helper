@@ -1,0 +1,22 @@
+{
+  "name": "无效报价示例",
+  "price": null,
+  "last_close": null,
+  "open": null,
+  "change_amt": null,
+  "change_pct": null,
+  "high": null,
+  "low": null,
+  "amount_wan": 0.0,
+  "turnover_pct": null,
+  "pe_ttm": null,
+  "amplitude_pct": null,
+  "float_mcap_yi": null,
+  "mcap_yi": null,
+  "pb": null,
+  "limit_up": null,
+  "limit_down": null,
+  "vol_ratio": null,
+  "pe_static": null,
+  "is_stale": false
+}

@@ -1,0 +1,22 @@
+{
+  "name": "*ST示例",
+  "price": 5.00,
+  "last_close": 4.95,
+  "open": 4.96,
+  "change_amt": 0.05,
+  "change_pct": 1.01,
+  "high": 5.05,
+  "low": 4.90,
+  "amount_wan": 1200.0,
+  "turnover_pct": 1.10,
+  "pe_ttm": 0.0,
+  "amplitude_pct": 3.03,
+  "float_mcap_yi": 20.0,
+  "mcap_yi": 30.0,
+  "pb": 1.20,
+  "limit_up": 5.45,
+  "limit_down": 4.46,
+  "vol_ratio": 0.80,
+  "pe_static": 0.0,
+  "is_stale": false
+}

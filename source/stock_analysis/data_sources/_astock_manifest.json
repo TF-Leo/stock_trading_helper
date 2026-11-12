@@ -8,225 +8,336 @@
     "skill_sha256": "09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2"
   },
   "generated_file": "source/stock_analysis/data_sources/_astock_generated.py",
-  "generated_sha256": "e40aa9584b5e678132318133b70a131ef057900f1072d1704a6252d1b678d329",
-  "body_sha256": "bcea37d1c8737ffd17be75649d458467b7aa313ac9a43b591849f0bbcbf026ee",
+  "generated_sha256": "9dbc30fea8ed42702bc3e0b5fe5fb2dfc854a9d1c900df407e54627d974214e3",
+  "body_sha256": "bfb2cfe81d2a4be91a02261efb6dad5b84b7a5a45b55f0cacc3899408f10a0c9",
   "selections": [
     {
       "symbol": "SH_INDEX",
       "section": "市场前缀规则（全局通用）",
       "upstream_sha256": "d5826fc1fa7139e45bf665ed81f9b1fa15d47286c7c54af1605d9d504b7b4958",
       "generated_sha256": "d5826fc1fa7139e45bf665ed81f9b1fa15d47286c7c54af1605d9d504b7b4958",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "get_prefix",
       "section": "市场前缀规则（全局通用）",
       "upstream_sha256": "b364c0cc4bf19582c278a8edb480d5e15fda710136f5d989eb33b1d33c92dafa",
       "generated_sha256": "b364c0cc4bf19582c278a8edb480d5e15fda710136f5d989eb33b1d33c92dafa",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_TICKER_RE",
       "section": "Ticker 格式归一化",
       "upstream_sha256": "76aee43cc677b16f5b475f71cd4b62eaab669a06274a937dc33f546a0120adfd",
       "generated_sha256": "76aee43cc677b16f5b475f71cd4b62eaab669a06274a937dc33f546a0120adfd",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_JQ_SUFFIX",
       "section": "Ticker 格式归一化",
       "upstream_sha256": "6215f6df88df10dda2bb621585e95ab35c942d9c1acf8e25833dfaf18b63a683",
       "generated_sha256": "6215f6df88df10dda2bb621585e95ab35c942d9c1acf8e25833dfaf18b63a683",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_natural_market",
       "section": "Ticker 格式归一化",
       "upstream_sha256": "2434fce502e94c5125ee2ba68903a1d361750664b7302838498a2ea6e394c8fe",
       "generated_sha256": "2434fce502e94c5125ee2ba68903a1d361750664b7302838498a2ea6e394c8fe",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "norm_ticker",
       "section": "Ticker 格式归一化",
       "upstream_sha256": "ded6fc39b72cbc16732c63bd7b5d856772c49e9263351652ccb668fa07107a5c",
       "generated_sha256": "ded6fc39b72cbc16732c63bd7b5d856772c49e9263351652ccb668fa07107a5c",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "V39_UA",
       "section": "v39-helpers",
       "upstream_sha256": "3838b70e46b361ac59d3c8145be80cfe0c1a3544b42a0a78be63c1ac217a9955",
       "generated_sha256": "3838b70e46b361ac59d3c8145be80cfe0c1a3544b42a0a78be63c1ac217a9955",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "V39_RETRY_SESSION",
       "section": "v39-helpers",
       "upstream_sha256": "d5f2e4d119975547e4e13135683e411c4bbee04e4adeee0e894a1d2cb72410f6",
       "generated_sha256": "d5f2e4d119975547e4e13135683e411c4bbee04e4adeee0e894a1d2cb72410f6",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_v39_http",
       "section": "v39-helpers",
       "upstream_sha256": "d8c0f0a18ec47b909554bb018ee660b6a8470f1e1bd18d6232f970a9120fb3f2",
       "generated_sha256": "d8c0f0a18ec47b909554bb018ee660b6a8470f1e1bd18d6232f970a9120fb3f2",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_v39_json",
       "section": "v39-helpers",
       "upstream_sha256": "e58b26af25b3c18669add118954ae987214bf746cd6c2b02607182418bc56fa5",
       "generated_sha256": "e58b26af25b3c18669add118954ae987214bf746cd6c2b02607182418bc56fa5",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_v39_date",
       "section": "v39-helpers",
       "upstream_sha256": "6340d5c3fbdc654f113c730a34b3045abf5cd593fe9da40622850b375b3e267a",
       "generated_sha256": "6340d5c3fbdc654f113c730a34b3045abf5cd593fe9da40622850b375b3e267a",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_v39_src_date",
       "section": "v39-helpers",
       "upstream_sha256": "dd47d3bbd1ca3cd12bae9b543c779c2563fd3337e171fd970cbe76c7e7249aac",
       "generated_sha256": "dd47d3bbd1ca3cd12bae9b543c779c2563fd3337e171fd970cbe76c7e7249aac",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_v39_num",
       "section": "v39-helpers",
       "upstream_sha256": "5da4c01453548bfe08ec476b8d358f35eaa35dfb0a44a739e8830fb52f29fa17",
       "generated_sha256": "5da4c01453548bfe08ec476b8d358f35eaa35dfb0a44a739e8830fb52f29fa17",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_v39_req_num",
       "section": "v39-helpers",
       "upstream_sha256": "7b10f60a68fdf7ea8428157554af39ea73a90d34ddf3c54a39d9e7671165a1d7",
       "generated_sha256": "7b10f60a68fdf7ea8428157554af39ea73a90d34ddf3c54a39d9e7671165a1d7",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_v39_contract",
       "section": "v39-helpers",
       "upstream_sha256": "89ddb3d97d4bb628743b96c1ccdfd64d45072b60a5b3494372dad222117cec77",
       "generated_sha256": "89ddb3d97d4bb628743b96c1ccdfd64d45072b60a5b3494372dad222117cec77",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_v39_frame",
       "section": "v39-helpers",
       "upstream_sha256": "98e082821d70842d641f7bf935dfce9518c3eed521c3c276f880a263067a2d94",
       "generated_sha256": "98e082821d70842d641f7bf935dfce9518c3eed521c3c276f880a263067a2d94",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "_v39_rows",
+      "section": "v39-helpers",
+      "upstream_sha256": "7ba4f5b8ebbcf7bab9f7b14c87fb7001702f5097084f468ccd4675ccbdc4e352",
+      "generated_sha256": "7ba4f5b8ebbcf7bab9f7b14c87fb7001702f5097084f468ccd4675ccbdc4e352",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "_v39_count",
+      "section": "v39-helpers",
+      "upstream_sha256": "54415c7813fd8069f9fe7834081768f0a3f268ef6204563ac3fe53a5e7a325f4",
+      "generated_sha256": "54415c7813fd8069f9fe7834081768f0a3f268ef6204563ac3fe53a5e7a325f4",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "TENCENT_KLINE_HOSTS",
       "section": "v39-tencent-kline",
       "upstream_sha256": "22d9a9ab84a40c435a4863b009843fc7d763324c4c1fe603d0464ddebc4b9603",
       "generated_sha256": "22d9a9ab84a40c435a4863b009843fc7d763324c4c1fe603d0464ddebc4b9603",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_TENCENT_HOST_COOLDOWN",
       "section": "v39-tencent-kline",
       "upstream_sha256": "21b533bec19efd7eb49b3e5b29c77d1f5c9ea12acda5093b08db4136d5c8e17d",
       "generated_sha256": "21b533bec19efd7eb49b3e5b29c77d1f5c9ea12acda5093b08db4136d5c8e17d",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_tencent_host_down_until",
       "section": "v39-tencent-kline",
       "upstream_sha256": "d2db9863af05269a1fb65411e235784d7ff3c1d9fcc1fc39c75ae595a700c049",
       "generated_sha256": "d2db9863af05269a1fb65411e235784d7ff3c1d9fcc1fc39c75ae595a700c049",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_TENCENT_MINUTES",
       "section": "v39-tencent-kline",
       "upstream_sha256": "8484c7a071196d56216c8c5a4f8604461304f25f6a436dd047bca588b7ac1faf",
       "generated_sha256": "8484c7a071196d56216c8c5a4f8604461304f25f6a436dd047bca588b7ac1faf",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_TENCENT_SPAN_DAYS",
       "section": "v39-tencent-kline",
       "upstream_sha256": "c45503b999b730a77f8e372e69960a734f162ab932ed97b27a421269ed589245",
       "generated_sha256": "c45503b999b730a77f8e372e69960a734f162ab932ed97b27a421269ed589245",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_tencent_kline_call",
       "section": "v39-tencent-kline",
       "upstream_sha256": "b2c0d6e1effac560f3bd2b6724a49fa7a9ebabb61dfad4282d46f83689c76bc0",
       "generated_sha256": "314267d21c9fe44b8717f82bf723c5df8457d727e1d69382aab4a9f3f819c606",
-      "timeout_injections": 1
+      "timeout_injections": 1,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "tencent_kline",
       "section": "v39-tencent-kline",
       "upstream_sha256": "6498e1fdec00eaf59f29b80e2443db9c95833339cb742a9463894463c3835bef",
       "generated_sha256": "6498e1fdec00eaf59f29b80e2443db9c95833339cb742a9463894463c3835bef",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "sina_adjust_factor",
       "section": "§1.6 新浪复权因子",
       "upstream_sha256": "14873c0a26259b26c8099f773c78e8eb20d3bfa18e4857aeceee7cb989ea5e6d",
       "generated_sha256": "14873c0a26259b26c8099f773c78e8eb20d3bfa18e4857aeceee7cb989ea5e6d",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "apply_adjust",
       "section": "§1.6 新浪复权因子",
       "upstream_sha256": "579e7bf593eca8980596e44fcd6f8080cf54fd8d5999898f0cddca7cf1070af8",
       "generated_sha256": "579e7bf593eca8980596e44fcd6f8080cf54fd8d5999898f0cddca7cf1070af8",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "tencent_quote",
       "section": "§1.1 腾讯财经 API",
       "upstream_sha256": "78adea7968b205dc36d535a150e6cd7df9fe03bb8ec4e596077a31a5b8bf3738",
       "generated_sha256": "78adea7968b205dc36d535a150e6cd7df9fe03bb8ec4e596077a31a5b8bf3738",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "UA",
+      "section": "东财数据中心统一查询（共用 helper）",
+      "upstream_sha256": "1b776eaaba62942f66f067c1910910c739789a18c4e000e4b530779d5e0ea961",
+      "generated_sha256": "1b776eaaba62942f66f067c1910910c739789a18c4e000e4b530779d5e0ea961",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "EM_SESSION",
+      "section": "东财数据中心统一查询（共用 helper）",
+      "upstream_sha256": "a5117a69b23f1c8b4cd4651b61487f8e271e77b41371e84a8fc5b89664b01abc",
+      "generated_sha256": "a5117a69b23f1c8b4cd4651b61487f8e271e77b41371e84a8fc5b89664b01abc",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "EM_MIN_INTERVAL",
+      "section": "东财数据中心统一查询（共用 helper）",
+      "upstream_sha256": "a3713944da1f322faf7711eeff29631c08d8137b6c95b909ff16d7b6dadf820d",
+      "generated_sha256": "a3713944da1f322faf7711eeff29631c08d8137b6c95b909ff16d7b6dadf820d",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "_em_last_call",
+      "section": "东财数据中心统一查询（共用 helper）",
+      "upstream_sha256": "1a69fda4f509476d6a795c9915ff6c914fd3474dd1e6cd77a3bb5afdaec7513a",
+      "generated_sha256": "1a69fda4f509476d6a795c9915ff6c914fd3474dd1e6cd77a3bb5afdaec7513a",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "em_get",
+      "section": "东财数据中心统一查询（共用 helper）",
+      "upstream_sha256": "223142a2ac91701ea78e5cc1baf474061089fcb74051d52d376ab094356ed429",
+      "generated_sha256": "223142a2ac91701ea78e5cc1baf474061089fcb74051d52d376ab094356ed429",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "EM_CLIST_HOSTS",
+      "section": "§6.8 ST / *ST 名单",
+      "upstream_sha256": "7d03250985a21d8d116834b346ef443f7bf9900d68128ab3bd8a2721df42538e",
+      "generated_sha256": "7d03250985a21d8d116834b346ef443f7bf9900d68128ab3bd8a2721df42538e",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "_em_clist_all",
+      "section": "§6.8 ST / *ST 名单",
+      "upstream_sha256": "502f973004f692c29307ffe621756eaf37c06b473acc0f1924d48525b9d1bfb2",
+      "generated_sha256": "502f973004f692c29307ffe621756eaf37c06b473acc0f1924d48525b9d1bfb2",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "st_stock_list",
+      "section": "§6.8 ST / *ST 名单",
+      "upstream_sha256": "6b836d4a686eb7c1b98e81582fc7644bb57dca188261146301274425b2e2ac9f",
+      "generated_sha256": "ab19399e15f56ca5dad5694d5ab2a129d45e313d569990b11eeec70bcab255b1",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 1
     },
     {
       "symbol": "_official_code",
       "section": "official-data-core",
       "upstream_sha256": "ff344bb0c04301ba874d3fd57768c9c30bcf53aaab189a7af437979a5a55ceed",
       "generated_sha256": "ff344bb0c04301ba874d3fd57768c9c30bcf53aaab189a7af437979a5a55ceed",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_official_date",
       "section": "official-data-core",
       "upstream_sha256": "a68b9f7dd30c295e5521499773bf294abf9506e394e8a30f4e38061022b982dd",
       "generated_sha256": "a68b9f7dd30c295e5521499773bf294abf9506e394e8a30f4e38061022b982dd",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_official_get",
       "section": "official-data-core",
       "upstream_sha256": "b23dcf35715832e8e4ed14b252c19ae282c9c3a6e31996494ac89b6a7b14ebfa",
       "generated_sha256": "fa5e9a6c0a771572a1f91f897a81cd325c312387ba5c94cd04f7d7c5007a7903",
-      "timeout_injections": 1
+      "timeout_injections": 1,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "_official_frame",
       "section": "official-data-core",
       "upstream_sha256": "8aa07e82a54d3eca507bbe7fc67fbd20482ae886d4ee0dcebe43e3a722d01b86",
       "generated_sha256": "8aa07e82a54d3eca507bbe7fc67fbd20482ae886d4ee0dcebe43e3a722d01b86",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     },
     {
       "symbol": "trading_calendar",
       "section": "official-data-core",
       "upstream_sha256": "c8379a49b33b87ad1b25bab500e5136226d3e0bd6011cfe3ef84c187b17b84c0",
       "generated_sha256": "c8379a49b33b87ad1b25bab500e5136226d3e0bd6011cfe3ef84c187b17b84c0",
-      "timeout_injections": 0
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
     }
   ],
   "modifications": [
@@ -234,6 +345,16 @@
       "kind": "http_timeout_override",
       "detail": "HTTP timeout literals in extracted call sites replaced by _ASTOCK_HTTP_TIMEOUT (5, 15).",
       "injections": 2
+    },
+    {
+      "kind": "baostock_fallback_disabled",
+      "detail": "§6.8 st_stock_list's baostock fallback return replaced by an explicit RuntimeError; no baostock dependency is added.",
+      "injections": 1
+    },
+    {
+      "kind": "eastmoney_session_ua",
+      "detail": "Re-applied the session User-Agent that upstream sets via an unnamed module-level statement.",
+      "injections": 1
     }
   ]
 }

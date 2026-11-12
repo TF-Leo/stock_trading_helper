@@ -1,0 +1,22 @@
+{
+  "name": "一字涨停示例",
+  "price": 11.00,
+  "last_close": 10.00,
+  "open": 11.00,
+  "change_amt": 1.00,
+  "change_pct": 10.00,
+  "high": 11.00,
+  "low": 11.00,
+  "amount_wan": 5000.0,
+  "turnover_pct": 0.50,
+  "pe_ttm": 15.0,
+  "amplitude_pct": 0.0,
+  "float_mcap_yi": 80.0,
+  "mcap_yi": 100.0,
+  "pb": 2.00,
+  "limit_up": 11.00,
+  "limit_down": 9.00,
+  "vol_ratio": 0.30,
+  "pe_static": 15.0,
+  "is_stale": false
+}
