@@ -53,6 +53,9 @@ SELECTION = [
     ]),
     ("Ticker 格式归一化", "section", "### Ticker 格式归一化", [
         "_TICKER_RE", "_JQ_SUFFIX", "_natural_market", "norm_ticker",
+        # §4.5 资金流用它拼东财 secid（沪=1，深/北=0）。取的是同一代码块里的
+        # 符号，不额外扩大快照面；绝不能用 code.startswith("6") 替代。
+        "em_market_code",
     ]),
     ("v39-helpers", "marker", None, [
         "V39_UA", "V39_RETRY_SESSION",
@@ -81,6 +84,13 @@ SELECTION = [
      "### 东财数据中心统一查询（共用 helper）", [
          "UA", "EM_SESSION", "EM_MIN_INTERVAL", "_em_last_call", "em_get",
     ]),
+    # P1-2（issue #36）：东财 §4.5 个股日级资金流（最近 120 个交易日）。
+    # 只在收盘后的 tools/precompute_flow.py 里调用；CLI 主路径只读缓存，
+    # 绝不在这里发起同步请求（push2his 有 IP 级风控）。
+    ("§4.5 个股资金流（120日，日级）", "section",
+     "### 4.5 个股资金流（120日，日级）", [
+         "stock_fund_flow_120d",
+    ]),
     # §6.8 ST / *ST 当日名单。上游在東财不可达时退到 baostock；本任务明确
     # 不引入新依赖，生成时把该兜底替换为显式 RuntimeError（见 build()）。
     ("§6.8 ST / *ST 名单", "section",
@@ -107,7 +117,7 @@ PREAMBLE = """\
 # snapshot: vendor/a-stock-data/SKILL.md
 # sha256:   {skill_sha}
 # license:  Apache-2.0 (vendor/a-stock-data/LICENSE)
-# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §6.8 ST 名单
+# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §4.5 日级资金流 / §6.8 ST 名单
 # manifest: source/stock_analysis/data_sources/_astock_manifest.json
 # body_sha256: {body_sha}
 #

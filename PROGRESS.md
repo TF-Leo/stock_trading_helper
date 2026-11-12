@@ -386,3 +386,25 @@ PASS 46 | FAIL 0 | BLOCKED 0 | SKIP 0 → 退出码 0     （370.2s）
 不作为下一版主线；维持 v3.0 单标的买点+风控路线。** `lowvol20` 在大池 IC 为正、
 Top-Bottom 为负（符号冲突），同样不可用。
 局限：成分取 2026-10-23 名单（幸存者偏差）、新标的仅 2020+、未扣换手成本、非 walk-forward。
+
+---
+
+## 8. P1-2 日级资金面上下文（issue #36，2026-11-13，分支 `task/p1-flow-context`）
+
+- **目标**：只展示、不改 action。预计算 + 缓存 + 只读展示；CLI / 9:15 cron 主路径**不触网**。
+- **实现**：
+  - `tools/astock_extract.py` 新增上游 §4.5 `stock_fund_flow_120d` 与 `em_market_code`
+    （固定 commit `f215349`），生成物与 manifest 已重生成，`--check` EXIT=0（43 symbols）。
+  - `tools/precompute_flow.py`：逐票串行、相邻请求 ≥1s、失败重试后继续，写
+    `source/stock_analysis/data/flow/<code>.json`（gitignore）。
+  - `source/stock_analysis/data_loader/flow.py`：只读缓存；摘要 `main_net_5d/20d`（元）、
+    `direction`、`as_of`、`source`、`pub_lag_days=1`、`stale`（只读磁盘日历）；缺失返回 None。
+  - CLI `evidence.flow` additive（15 键），错误路径同构；`recommendation` A/B 逐键一致。
+  - README 新增 `evidence.flow` 字段表。
+- **测试**：`pytest` **203 passed**（基线 181 + 新增 22）；新增、修改的实现文件均离线可测。
+- **真实预计算（本机）**：东财 `push2his` 被出口 IP RST —
+  `curl` HTTP 000 / `SSL routines::unexpected eof`；`precompute_flow.py 600519 002415`
+  6 次请求、墙钟 10.19s、0 成功 2 失败（`RemoteDisconnected`）。**降级行为已按设计生效**：
+  CLI 输出 `evidence.flow.available=false, reason="cache_missing"` + warning，`action/status` 不变。
+  换可达网络后重跑同一条命令即可生成缓存，无需改代码。
+

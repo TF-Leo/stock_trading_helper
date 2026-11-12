@@ -43,6 +43,7 @@ __all__ = [
     "get_month_calendar",
     "is_trading_day",
     "latest_trading_day_at",
+    "calendar_days_from_disk",
     "calendar_source",
     "calendar_last_error",
     "OFFLINE_ENV",
@@ -380,6 +381,15 @@ def _read_disk_calendar(year: int, month: int):
     except Exception:
         return None
     return None
+
+
+def calendar_days_from_disk(year: int, month: int):
+    """**只读**磁盘交易日历；不触网，缺失时返回 ``None``。
+
+    给「绝不触网」的调用方（如 ``data_loader.flow`` 的缓存陈旧判定）使用：
+    ``get_month_calendar`` 在磁盘缺失时会去请求深交所，不适用于盘前/离线路径。
+    """
+    return _read_disk_calendar(int(year), int(month))
 
 
 def _write_disk_calendar(year: int, month: int, days: dict[str, bool]) -> None:

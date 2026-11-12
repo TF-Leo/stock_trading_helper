@@ -8,8 +8,8 @@
     "skill_sha256": "09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2"
   },
   "generated_file": "source/stock_analysis/data_sources/_astock_generated.py",
-  "generated_sha256": "9dbc30fea8ed42702bc3e0b5fe5fb2dfc854a9d1c900df407e54627d974214e3",
-  "body_sha256": "bfb2cfe81d2a4be91a02261efb6dad5b84b7a5a45b55f0cacc3899408f10a0c9",
+  "generated_sha256": "5109abbe075b87dbefa4d0588f71c00062c51d1ec5f80c79593e5e7ac427a46a",
+  "body_sha256": "52fe2eb7c6910d5fcbe2023920ae73514cdff4426981dfab4bd17a6980820eaa",
   "selections": [
     {
       "symbol": "SH_INDEX",
@@ -56,6 +56,14 @@
       "section": "Ticker 格式归一化",
       "upstream_sha256": "ded6fc39b72cbc16732c63bd7b5d856772c49e9263351652ccb668fa07107a5c",
       "generated_sha256": "ded6fc39b72cbc16732c63bd7b5d856772c49e9263351652ccb668fa07107a5c",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "em_market_code",
+      "section": "Ticker 格式归一化",
+      "upstream_sha256": "945844e3f20b480b93fce78156c0b839b0b971f7d0ac40c5624cb97b8c29e048",
+      "generated_sha256": "945844e3f20b480b93fce78156c0b839b0b971f7d0ac40c5624cb97b8c29e048",
       "timeout_injections": 0,
       "baostock_fallback_disabled": 0
     },
@@ -272,6 +280,14 @@
       "section": "东财数据中心统一查询（共用 helper）",
       "upstream_sha256": "223142a2ac91701ea78e5cc1baf474061089fcb74051d52d376ab094356ed429",
       "generated_sha256": "223142a2ac91701ea78e5cc1baf474061089fcb74051d52d376ab094356ed429",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "stock_fund_flow_120d",
+      "section": "§4.5 个股资金流（120日，日级）",
+      "upstream_sha256": "3c40d57078719e38ddeaec9856b566f94d5d9ed094eb9889a069a4affc3a5f6d",
+      "generated_sha256": "3c40d57078719e38ddeaec9856b566f94d5d9ed094eb9889a069a4affc3a5f6d",
       "timeout_injections": 0,
       "baostock_fallback_disabled": 0
     },

@@ -13,6 +13,7 @@ from stock_analysis.data_loader import get_stock_daily, get_fund_daily, get_stoc
 from stock_analysis.data_loader.meta import last_fetch_info
 from stock_analysis.data_loader.bars import format_attempt_warnings
 from stock_analysis.data_loader.status import resolve_trading_status
+from stock_analysis.data_loader.flow import flow_evidence
 from stock_analysis.backtest.analyzer import run_strategy_tournament, calc_buy_hold_baseline
 from stock_analysis.backtest.engine import BacktestConfig
 from stock_analysis.strategy.registry import (
@@ -507,6 +508,9 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     if n_trials <= 1:
         warnings.append("n_trials<=1，Deflated Sharpe 未做多重检验校正")
 
+    flow_block, flow_notes = flow_evidence(code, data_type, as_of)  # P1-2，只读缓存
+    warnings.extend(flow_notes)
+
     # 构建响应
     response = {
         'schema_version': '1.0',
@@ -603,7 +607,8 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
                 'Bear': round(float(getattr(result, 'bear_win_rate', 0) or 0), 4),
                 'Shock': round(float(getattr(result, 'shock_win_rate', 0) or 0), 4),
             },
-            'triggers': triggers[:5]
+            'triggers': triggers[:5],
+            'flow': flow_block,  # P1-2 additive：只展示，绝不改 action
         },
         'candidates': final_candidates,
         'diagnostics': {

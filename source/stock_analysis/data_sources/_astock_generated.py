@@ -9,9 +9,9 @@
 # snapshot: vendor/a-stock-data/SKILL.md
 # sha256:   09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2
 # license:  Apache-2.0 (vendor/a-stock-data/LICENSE)
-# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §6.8 ST 名单
+# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §4.5 日级资金流 / §6.8 ST 名单
 # manifest: source/stock_analysis/data_sources/_astock_manifest.json
-# body_sha256: bfb2cfe81d2a4be91a02261efb6dad5b84b7a5a45b55f0cacc3899408f10a0c9
+# body_sha256: 52fe2eb7c6910d5fcbe2023920ae73514cdff4426981dfab4bd17a6980820eaa
 #
 # Regenerate: python tools/astock_extract.py
 # Verify:     python tools/astock_extract.py --check
@@ -97,6 +97,16 @@ def norm_ticker(code: str, stock_only: bool=False) -> str:
             if market != nat:
                 raise ValueError(f'{code!r} 的市场标识与号段矛盾：{digits} 属 {nat} 市，而不是 {market} 市。（改用 {nat}{digits} 或去掉市场标识）')
     return digits
+
+def em_market_code(code: str) -> int:
+    """东财 secid 的市场号：**沪=1，深/北=0**（V3.7.0 新增 · #46）。
+
+    ⚠️ 绝不要用 `code.startswith("6")` 判市场 —— 那会把**沪市 ETF（51x）**、
+    **科创板 ETF（588x）**、**沪 B 股（900x）** 全部错判成深市，接口返回 `data: null`。
+    2026-08-19 实测：510300 / 588000 / 600519 / 688112 / 900901 → m=1；
+    300750 / 159915 / 920982 / 832982 → m=0（北交所与深市共用 m=0）。
+    """
+    return 1 if get_prefix(code) == 'sh' else 0
 
 V39_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
 
@@ -519,6 +529,30 @@ def em_get(url: str, params: Optional[dict]=None, headers: Optional[dict]=None, 
         return EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
     finally:
         _em_last_call[0] = time.time()
+
+def stock_fund_flow_120d(code: str) -> list[dict]:
+    """
+    个股资金流（日级，最近120个交易日）。
+    返回: [{date, main_net(主力净流入), small_net, mid_net, large_net, super_net}]
+    单位: 元
+    """
+    market_code = em_market_code(code)
+    url = 'https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get'
+    params = {'secid': f'{market_code}.{code}', 'fields1': 'f1,f2,f3,f7', 'fields2': 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65', 'lmt': '120'}
+    headers = {'User-Agent': UA, 'Referer': 'https://quote.eastmoney.com/', 'Origin': 'https://quote.eastmoney.com'}
+    try:
+        r = em_get(url, params=params, headers=headers, timeout=15)
+        d = r.json()
+    except Exception as e:
+        print(f'[WARN] push2 资金流请求失败: {e}')
+        return []
+    klines = (d.get('data') or {}).get('klines') or []
+    rows = []
+    for line in klines:
+        parts = line.split(',')
+        if len(parts) >= 7:
+            rows.append({'date': parts[0], 'main_net': float(parts[1]) if parts[1] != '-' else 0, 'small_net': float(parts[2]) if parts[2] != '-' else 0, 'mid_net': float(parts[3]) if parts[3] != '-' else 0, 'large_net': float(parts[4]) if parts[4] != '-' else 0, 'super_net': float(parts[5]) if parts[5] != '-' else 0})
+    return rows
 
 EM_CLIST_HOSTS = ['https://push2.eastmoney.com', 'https://push2delay.eastmoney.com']
 
