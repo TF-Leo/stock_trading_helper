@@ -593,6 +593,13 @@ python tools/p1_evidence.py replay --panel evidence/p1/panel.parquet \
 | 依赖 | 日级资金流/两融/户数无新依赖；**筹码依赖 baostock 换手率** |
 | 风险 | 东财 IP 封禁；字段口径变化；20 日尺度衰减；筹码是推演；ETF 无个股资金流 |
 
+> **数据源备胎（issue #39）**：A5500 等出口对东财整域 TLS RST 时，
+> `tools/precompute_flow.py` 首票单次探测失败即改走新浪 `fund_flow_backup`
+> （120 日 `netamount`），缓存标注 `source=sina_fund_flow_backup` /
+> `caliber=sina_total_net`。新浪只有**总净流入**、没有主力/大单拆分，因此
+> `main_net_5d/20d` 必须为 `null`，不得与东财 `eastmoney_main_net` 口径混用或
+> 直接比较；两种口径各自只用本口径的字段做证据。
+
 **降级方案（不引入 baostock 时）**：换手率用 `volume / 流通股本` 近似，其中
 流通股本由腾讯 §1.1 的流通市值 ÷ 现价反推。该近似会因送转/增发/解禁而漂移，
 必须标记为 `chip_source=approx_float_shares`，且不得用于「改 action」的证据。

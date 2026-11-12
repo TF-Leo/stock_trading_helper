@@ -9,9 +9,9 @@
 # snapshot: vendor/a-stock-data/SKILL.md
 # sha256:   09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2
 # license:  Apache-2.0 (vendor/a-stock-data/LICENSE)
-# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §4.5 日级资金流 / §6.8 ST 名单
+# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §4.5 日级资金流 / 备用源速查 fund_flow_backup / §6.8 ST 名单
 # manifest: source/stock_analysis/data_sources/_astock_manifest.json
-# body_sha256: 52fe2eb7c6910d5fcbe2023920ae73514cdff4426981dfab4bd17a6980820eaa
+# body_sha256: ba914924a3e6df6db07a2b090ea23cb7b40f8bec10ffd2373c526f9a668e390e
 #
 # Regenerate: python tools/astock_extract.py
 # Verify:     python tools/astock_extract.py --check
@@ -553,6 +553,16 @@ def stock_fund_flow_120d(code: str) -> list[dict]:
         if len(parts) >= 7:
             rows.append({'date': parts[0], 'main_net': float(parts[1]) if parts[1] != '-' else 0, 'small_net': float(parts[2]) if parts[2] != '-' else 0, 'mid_net': float(parts[3]) if parts[3] != '-' else 0, 'large_net': float(parts[4]) if parts[4] != '-' else 0, 'super_net': float(parts[5]) if parts[5] != '-' else 0})
     return rows
+
+def fund_flow_backup(code: str, days: int=60) -> list:
+    """个股资金流备用源（东财被封时用）：新浪，日度四档单净额。"""
+    pre = ('bj' if code.startswith(('92', '8')) else 'sh' if code.startswith(('6', '9')) else 'sz') + code
+    u = f'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num={days}&sort=opendate&asc=0&daima={pre}'
+    req = urllib.request.Request(u, headers={'User-Agent': UA, 'Referer': 'https://finance.sina.com.cn/'})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        t = r.read().decode('utf-8', 'ignore')
+    arr = json.loads(t[t.index('['):t.rindex(']') + 1])
+    return [{'date': x.get('opendate'), 'close': x.get('trade'), 'net_amount': x.get('netamount'), 'turnover': x.get('turnover')} for x in arr]
 
 EM_CLIST_HOSTS = ['https://push2.eastmoney.com', 'https://push2delay.eastmoney.com']
 

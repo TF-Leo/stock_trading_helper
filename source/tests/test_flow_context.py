@@ -49,20 +49,45 @@ def _full_row(day: date, main_net: float) -> dict:
             "mid_net": 0.0, "large_net": 0.0, "super_net": 0.0}
 
 
-def _write_cache(directory: Path, code: str, rows, fetched_at="2026-11-12T16:30:00"):
+def _sina_row(day: date, net_amount: float) -> dict:
+    """上游 ``fund_flow_backup`` 的真实返回形状（数值是字符串）。"""
+    return {"date": day.isoformat(), "close": "100.0000",
+            "net_amount": f"{net_amount:.4f}", "turnover": "1.0000"}
+
+
+def _write_cache(directory: Path, code: str, rows, fetched_at="2026-11-12T16:30:00",
+                 source="eastmoney_push2his", caliber=None, attempts=None):
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": "1.0",
         "code": code,
-        "source": "eastmoney_push2his",
+        "source": source,
         "upstream": "a-stock-data v3.10.4 §4.5 stock_fund_flow_120d",
         "fetched_at": fetched_at,
         "as_of": rows[-1]["date"],
         "rows": rows,
     }
+    if caliber is not None:
+        payload["caliber"] = caliber
+    if attempts is not None:
+        payload["attempts"] = attempts
     path = directory / f"{code}.json"
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def _write_sina_cache(directory: Path, code: str, rows,
+                      fetched_at="2026-11-12T16:30:00"):
+    """写入新浪口径缓存；source/caliber 与预计算工具完全一致。"""
+    return _write_cache(directory, code, rows, fetched_at=fetched_at,
+                        source=flow_mod.SOURCE_SINA,
+                        caliber=flow_mod.CALIBER_SINA,
+                        attempts={"eastmoney": 1, "sina": 1})
+
+
+def _sina_summary_rows(n=20, end=date(2026, 11, 12)):
+    """net_amount = 1..n（按日期升序）；便于手算 5/20 日窗口。"""
+    return [_sina_row(d, float(i + 1)) for i, d in enumerate(_bdays(end, n))]
 
 
 def _fix_expected(monkeypatch, day=date(2026, 11, 12), source="calendar_cache"):
@@ -94,9 +119,71 @@ def test_summary_hand_computed(monkeypatch, tmp_path):
     assert block["rows"] == 20
     assert block["as_of"] == "2026-11-12"
     assert block["source"] == "eastmoney_push2his"
+    assert block["caliber"] == "eastmoney_main_net"
+    assert block["net_5d"] is None and block["net_20d"] is None
     assert block["pub_lag_days"] == 1
     assert block["stale"] is False
     assert set(block) == set(flow_mod.FLOW_KEYS)
+
+
+def test_sina_summary_uses_net_amount_and_nulls_main_net(monkeypatch, tmp_path):
+    """新浪口径：net_5d/20d 来自 netamount；main_net_* 必须为 null。"""
+    _fix_expected(monkeypatch)
+    rows = _sina_summary_rows(20)
+    for row in rows:
+        row["main_net"] = -999999.0      # 即使缓存里混入该字段也必须忽略
+    _write_sina_cache(tmp_path, "600519", rows)
+
+    block = flow_mod.build_flow_block("600519", flow_dir=str(tmp_path))
+
+    assert block["available"] is True
+    assert block["source"] == "sina_fund_flow_backup"
+    assert block["caliber"] == "sina_total_net"
+    assert block["net_5d"] == pytest.approx(90.0)
+    assert block["net_20d"] == pytest.approx(210.0)
+    assert block["main_net_5d"] is None
+    assert block["main_net_20d"] is None
+    assert block["direction"] == "inflow"
+    assert block["direction_basis"] == "net_5d_sign"
+    assert set(block) == set(flow_mod.FLOW_KEYS)
+
+
+def test_eastmoney_summary_ignores_net_amount(monkeypatch, tmp_path):
+    """东财口径：即使缓存里混入 net_amount 也不得被读取。"""
+    _fix_expected(monkeypatch)
+    rows = _summary_rows(20)
+    for row in rows:
+        row["net_amount"] = 777.0
+    _write_cache(tmp_path, "600519", rows, caliber="eastmoney_main_net")
+
+    block = flow_mod.build_flow_block("600519", flow_dir=str(tmp_path))
+    assert block["caliber"] == "eastmoney_main_net"
+    assert block["main_net_5d"] == pytest.approx(90.0)
+    assert block["main_net_20d"] == pytest.approx(210.0)
+    assert block["net_5d"] is None and block["net_20d"] is None
+
+
+def test_legacy_cache_without_caliber_defaults_to_eastmoney(monkeypatch, tmp_path):
+    """P1-2 旧缓存没有 caliber 字段：按东财口径读取（向后兼容）。"""
+    _fix_expected(monkeypatch)
+    _write_cache(tmp_path, "600519", _summary_rows(20))       # 不写 caliber
+    block = flow_mod.build_flow_block("600519", flow_dir=str(tmp_path))
+    assert block["available"] is True
+    assert block["caliber"] == "eastmoney_main_net"
+    assert block["main_net_5d"] == pytest.approx(90.0)
+
+
+def test_unknown_or_conflicting_caliber_is_invalid(tmp_path):
+    _write_cache(tmp_path / "unknown", "600519", _summary_rows(20),
+                 caliber="mystery_caliber")
+    assert flow_mod.read_cache("600519", flow_dir=str(tmp_path / "unknown")) is None
+    block = flow_mod.build_flow_block("600519", flow_dir=str(tmp_path / "unknown"))
+    assert block["reason"] == "cache_invalid"
+
+    # 声称新浪源却标东财口径 → 自相矛盾，不得猜测
+    _write_cache(tmp_path / "conflict", "600519", _summary_rows(20),
+                 source="sina_fund_flow_backup", caliber="eastmoney_main_net")
+    assert flow_mod.read_cache("600519", flow_dir=str(tmp_path / "conflict")) is None
 
 
 def test_summary_short_cache_does_not_fake_20d(monkeypatch, tmp_path):
@@ -159,7 +246,8 @@ def test_missing_cache_returns_none_and_null_block(monkeypatch, tmp_path):
     assert block["reason"] == "cache_missing"
     assert set(block) == set(flow_mod.FLOW_KEYS)
     assert all(block[k] is None for k in
-               ("source", "as_of", "fetched_at", "main_net_5d", "main_net_20d",
+               ("source", "caliber", "as_of", "fetched_at", "main_net_5d",
+                "main_net_20d", "net_5d", "net_20d",
                 "direction", "direction_basis", "stale"))
 
 
@@ -254,34 +342,132 @@ class _Clock:
 
 
 def test_precompute_serial_interval_and_failure_continues(tmp_path):
+    """首票东财探测失败 → 本轮走新浪；两个源都失败才不写缓存。"""
     import precompute_flow as tool
 
     clock = _Clock()
     calls = []
+    rows = [_sina_row(d, 1.0) for d in _bdays(date(2026, 11, 12), 20)]
 
     def fake_fetch(code):
-        calls.append((code, clock.now()))
+        calls.append(("eastmoney", code, clock.now()))
+        raise RuntimeError("模拟东财空响应")
+
+    def fake_sina(code):
+        calls.append(("sina", code, clock.now()))
         if code == "600519":
-            raise RuntimeError("模拟东财空响应")
-        return [_full_row(d, 1.0) for d in _bdays(date(2026, 11, 12), 20)]
+            raise RuntimeError("模拟新浪空响应")
+        return list(rows)
 
     stats = tool.precompute(["600519", "002415"], out_dir=str(tmp_path),
                             interval=1.0, retries=1, retry_wait=2.0,
-                            fetch_fn=fake_fetch, sleep_fn=clock.sleep,
-                            now_fn=clock.now)
+                            fetch_fn=fake_fetch, sina_fetch_fn=fake_sina,
+                            sleep_fn=clock.sleep, now_fn=clock.now)
 
-    assert [c for c, _ in calls] == ["600519", "600519", "002415"]
-    gaps = [(calls[i + 1][1] - calls[i][1]).total_seconds()
+    # 600519：东财探测 1 次（不重试）+ 新浪 2 次（1 次重试）；002415：仅新浪 1 次
+    assert [(kind, code) for kind, code, _ in calls] == [
+        ("eastmoney", "600519"), ("sina", "600519"), ("sina", "600519"),
+        ("sina", "002415")]
+    gaps = [(calls[i + 1][2] - calls[i][2]).total_seconds()
             for i in range(len(calls) - 1)]
     assert all(g >= 1.0 for g in gaps), f"相邻请求间隔必须 ≥1s：{gaps}"
-    assert stats["requests"] == 3
+    assert stats["requests"] == 4
+    assert stats["eastmoney_down"] is True
+    assert stats["eastmoney_probe"] == {"code": "600519", "ok": False,
+                                        "attempts": 1,
+                                        "reason": "RuntimeError: 模拟东财空响应"}
     assert [item["code"] for item in stats["ok"]] == ["002415"]
     assert stats["failed"][0]["code"] == "600519"
-    assert stats["failed"][0]["attempts"] == 2
-    # 失败票不落缓存；成功票落缓存且可被 flow 读取
+    assert stats["failed"][0]["attempts"] == {"eastmoney": 1, "sina": 2}
+    # 失败票不落缓存；成功票落缓存且可被 flow 按新浪口径读取
     assert not (tmp_path / "600519.json").exists()
     assert (tmp_path / "002415.json").exists()
-    assert flow_mod.summarize_flow("002415", flow_dir=str(tmp_path)) is not None
+    summary = flow_mod.summarize_flow("002415", flow_dir=str(tmp_path))
+    assert summary["source"] == "sina_fund_flow_backup"
+    assert summary["caliber"] == "sina_total_net"
+    assert summary["main_net_5d"] is None
+    assert summary["net_5d"] == pytest.approx(5.0)
+
+
+def test_precompute_eastmoney_success_never_calls_sina(tmp_path):
+    import precompute_flow as tool
+
+    calls = []
+
+    def fake_fetch(code):
+        calls.append(("eastmoney", code))
+        return [_full_row(d, 1.0) for d in _bdays(date(2026, 11, 12), 20)]
+
+    def fake_sina(code):
+        calls.append(("sina", code))
+        return [_sina_row(d, 1.0) for d in _bdays(date(2026, 11, 12), 20)]
+
+    stats = tool.precompute(["600519", "002415"], out_dir=str(tmp_path),
+                            interval=1.0, retries=2,
+                            fetch_fn=fake_fetch, sina_fetch_fn=fake_sina,
+                            sleep_fn=lambda seconds: None, now_fn=_Clock().now)
+
+    assert calls == [("eastmoney", "600519"), ("eastmoney", "002415")]
+    assert stats["eastmoney_down"] is False
+    assert stats["ok_sources"][tool.SOURCE_EASTMONEY] == 2
+    payload = json.loads((tmp_path / "600519.json").read_text(encoding="utf-8"))
+    assert payload["source"] == "eastmoney_push2his"
+    assert payload["caliber"] == "eastmoney_main_net"
+    assert payload["attempts"] == {"eastmoney": 1, "sina": 0}
+    assert "§4.5" in payload["upstream"]
+
+
+def test_precompute_probe_skips_eastmoney_for_rest_of_run(tmp_path):
+    """整域失败只探测一次：后续票不再请求东财（不逐票轰炸）。"""
+    import precompute_flow as tool
+
+    calls = []
+    rows = [_sina_row(d, 2.0) for d in _bdays(date(2026, 11, 12), 20)]
+
+    def fake_fetch(code):
+        calls.append(("eastmoney", code))
+        raise ValueError("空响应（上游 §4.5 在请求失败时也返回空列表）")
+
+    def fake_sina(code):
+        calls.append(("sina", code))
+        return list(rows)
+
+    stats = tool.precompute(["600519", "002415", "300750"],
+                            out_dir=str(tmp_path), interval=1.0, retries=2,
+                            fetch_fn=fake_fetch, sina_fetch_fn=fake_sina,
+                            sleep_fn=lambda seconds: None, now_fn=_Clock().now)
+
+    assert sum(1 for kind, _ in calls if kind == "eastmoney") == 1
+    assert [code for kind, code in calls if kind == "sina"] == \
+        ["600519", "002415", "300750"]
+    assert stats["requests"] == 4
+    assert len(stats["ok"]) == 3
+    assert stats["ok_sources"][tool.SOURCE_SINA] == 3
+    first = json.loads((tmp_path / "600519.json").read_text(encoding="utf-8"))
+    later = json.loads((tmp_path / "002415.json").read_text(encoding="utf-8"))
+    assert first["attempts"] == {"eastmoney": 1, "sina": 1}
+    assert later["attempts"] == {"eastmoney": 0, "sina": 1}
+    assert first["caliber"] == later["caliber"] == "sina_total_net"
+
+
+def test_precompute_both_sources_fail_preserves_old_cache(tmp_path):
+    import precompute_flow as tool
+
+    old = _write_cache(tmp_path, "600519", _summary_rows(20),
+                       fetched_at="2026-11-11T16:30:00")
+
+    def fail(code):
+        raise RuntimeError("网络不可达")
+
+    stats = tool.precompute(["600519"], out_dir=str(tmp_path), interval=1.0,
+                            retries=0, fetch_fn=fail, sina_fetch_fn=fail,
+                            sleep_fn=lambda seconds: None, now_fn=_Clock().now)
+
+    assert stats["requests"] == 2          # 东财探测 1 + 新浪 1
+    assert stats["failed"][0]["attempts"] == {"eastmoney": 1, "sina": 1}
+    payload = json.loads(old.read_text(encoding="utf-8"))
+    assert payload["fetched_at"] == "2026-11-11T16:30:00", "失败不得覆盖旧缓存"
+    assert payload["source"] == "eastmoney_push2his"
 
 
 def test_precompute_rejects_below_one_second(tmp_path):
@@ -299,6 +485,12 @@ def test_precompute_rejects_empty_response_and_short_rows(tmp_path):
         tool.validate_rows([])
     with pytest.raises(ValueError, match="< 20"):
         tool.validate_rows([_full_row(date(2026, 11, 12), 1.0)] * 5)
+    with pytest.raises(ValueError, match="空响应"):
+        tool.validate_sina_rows([])
+    with pytest.raises(ValueError, match="< 20"):
+        tool.validate_sina_rows([_sina_row(date(2026, 11, 12), 1.0)] * 5)
+    with pytest.raises(ValueError, match="缺字段 net_amount"):
+        tool.validate_sina_rows([{"date": date(2026, 11, 12).isoformat()}] * 20)
 
 
 def test_precompute_cli_merges_positional_and_codes_option(monkeypatch):
@@ -322,8 +514,26 @@ def test_precompute_cache_payload_shape(tmp_path):
     assert payload["code"] == "600519"
     assert payload["as_of"] == rows[-1]["date"]
     assert payload["source"] == "eastmoney_push2his"
+    assert payload["caliber"] == "eastmoney_main_net"
+    assert payload["attempts"] == {}
     assert "§4.5" in payload["upstream"]
     assert len(payload["rows"]) == 20
+
+
+def test_precompute_sina_cache_payload_shape(tmp_path):
+    import precompute_flow as tool
+
+    rows = tool.validate_sina_rows(
+        [_sina_row(d, float(i)) for i, d in enumerate(_bdays(date(2026, 11, 12), 20))])
+    path = tool.write_cache("600519", rows, out_dir=str(tmp_path),
+                            source=tool.SOURCE_SINA, caliber=tool.CALIBER_SINA,
+                            attempts={"eastmoney": 1, "sina": 1})
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert payload["source"] == "sina_fund_flow_backup"
+    assert payload["caliber"] == "sina_total_net"
+    assert payload["attempts"] == {"eastmoney": 1, "sina": 1}
+    assert "fund_flow_backup" in payload["upstream"]
+    assert set(payload["rows"][0]) == {"date", "net_amount"}
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +610,37 @@ def test_cli_flow_respects_as_of(monkeypatch, tmp_path):
     assert block["main_net_5d"] == pytest.approx(85.0)
 
 
+def test_cli_sina_caliber_is_additive_and_offline(monkeypatch, tmp_path):
+    """新浪备胎缓存：CLI 展示 net_* / caliber，main_net_* 为 null，决策不变。"""
+    _write_sina_cache(tmp_path / "with", "600519", _sina_summary_rows(20))
+
+    def boom(*args, **kwargs):
+        raise AssertionError("CLI 主路径不得触网")
+
+    monkeypatch.setattr(socket, "socket", boom)
+    monkeypatch.setattr(socket, "create_connection", boom)
+
+    out_flow = _run_cli(monkeypatch, tmp_path / "with")
+    out_none = _run_cli(monkeypatch, tmp_path / "without")
+
+    block = out_flow["evidence"]["flow"]
+    assert block["available"] is True
+    assert block["source"] == "sina_fund_flow_backup"
+    assert block["caliber"] == "sina_total_net"
+    assert block["net_5d"] == pytest.approx(90.0)
+    assert block["net_20d"] == pytest.approx(210.0)
+    assert block["main_net_5d"] is None
+    assert block["main_net_20d"] is None
+    assert block["direction_basis"] == "net_5d_sign"
+    assert set(block) == set(flow_mod.FLOW_KEYS)
+
+    # A/B：recommendation 逐键一致；evidence 除 flow 外一致
+    assert out_flow["recommendation"] == out_none["recommendation"]
+    assert {k: v for k, v in out_flow["evidence"].items() if k != "flow"} == \
+        {k: v for k, v in out_none["evidence"].items() if k != "flow"}
+    assert out_none["evidence"]["flow"]["available"] is False
+
+
 def test_error_response_flow_isomorphic():
     import cli
 
@@ -418,7 +659,9 @@ def test_generated_artifact_contains_flow_function():
 
     assert hasattr(generated, "stock_fund_flow_120d")
     assert hasattr(generated, "em_market_code")
+    assert hasattr(generated, "fund_flow_backup")
     manifest = json.loads((SRC / "stock_analysis" / "data_sources" /
                            "_astock_manifest.json").read_text(encoding="utf-8"))
     names = {item["symbol"] for item in manifest["selections"]}
-    assert {"stock_fund_flow_120d", "em_market_code"} <= names
+    assert {"stock_fund_flow_120d", "em_market_code",
+            "fund_flow_backup"} <= names

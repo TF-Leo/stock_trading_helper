@@ -408,3 +408,38 @@ Top-Bottom 为负（符号冲突），同样不可用。
   CLI 输出 `evidence.flow.available=false, reason="cache_missing"` + warning，`action/status` 不变。
   换可达网络后重跑同一条命令即可生成缓存，无需改代码。
 
+---
+
+## 9. P1-2 新浪资金流备胎 + 口径隔离（issue #39，2026-11-13，分支 `task/p1-flow-sina-backup`）
+
+- **目标**：东财整域不可达时仍展示资金面，但**两种口径绝不混字段**；CLI 仍只读缓存、不触网。
+- **实现**：
+  - `tools/astock_extract.py` 新增上游「备用源速查」`fund_flow_backup`（固定 commit `f215349`），
+    生成物/manifest 重生成，`--check` EXIT=0（44 symbols）。
+  - `tools/precompute_flow.py`：东财优先；**首票单次探测**失败即 `eastmoney_down=True`，
+    后续票不再请求东财（不逐票轰炸）→ 新浪备胎；缓存 JSON 增加 `source` / `caliber` /
+    `attempts`；所有请求（含重试与备胎）仍强制相邻 ≥1s；失败不覆盖旧缓存。
+  - `flow.py`：按 `source/caliber` 分支。东财只写 `main_net_5d/20d`（`net_*` 为 null）；
+    新浪只写 `net_5d/20d`（总净流入，`main_net_*` 为 null），`direction_basis` 标
+    `net_5d_sign` / `net_20d_sign`；缺 `caliber` 的 P1-2 旧缓存按东财口径兼容；
+    未知/自相矛盾口径判 `cache_invalid`。`FLOW_KEYS` 15 → 18 键，三条路径保持同构。
+  - CLI `evidence.flow` 新增 `caliber` / `net_5d` / `net_20d`；README 增加口径对照表并写明
+    **两种口径不可直接比较**；`docs/P1_EVIDENCE_PLAN.md` §3.3 补充同一条约束。
+- **测试**：`pytest source/tests -q` → **212 passed**（基线 203 + 新增 9）；新增/修改测试全部离线。
+- **真实预计算（本机，默认 14 只）**：东财首票探测即 `ValueError: 空响应`（底层
+  `RemoteDisconnected` / TLS RST）→ 自动新浪；
+  `requests=15`（东财探测 1 + 新浪 14）、`ok=14 failed=0`、`wall=14.27s`、`interval=1.0s`，
+  `eastmoney_ok=0 sina_ok=14`。缓存 600519：`source=sina_fund_flow_backup`、
+  `caliber=sina_total_net`、`attempts={eastmoney:0,sina:1}`、120 行、
+  `2026-05-20..2026-11-12`。
+- **CLI 验收（600519）**：`available=true`、`source=sina_fund_flow_backup`、
+  `caliber=sina_total_net`、`net_5d=-100186129.18`、`net_20d=12707604317.54`
+  （与独立手算原始 `netamount` 逐位一致）、`main_net_5d/20d=null`、
+  `direction=outflow/direction_basis=net_5d_sign`；全网封禁（socket 101）下同样出值，
+  stderr 中东财请求 **0** 次。`--as-of 2026-11-12` → `as_of=2026-11-11`、
+  `net_5d=841858947.53`、`net_20d=14105076066.16`（只用 `date < as-of` 的行，与手算一致）。
+- **A/B**：同行情缓存、同 venv 下对比基线 `b189389`，`recommendation` / `market_regime` /
+  `instrument` / `data` / `candidates` / `evidence`（除 flow）逐键一致，`action=hold` 不变。
+- **门禁**：`pwsh` 本机未安装，`check_gates.ps1` 未运行（如实记录）；`pytest` 与
+  `astock_extract.py --check` 为真实执行证据。
+

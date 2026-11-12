@@ -8,8 +8,8 @@
     "skill_sha256": "09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2"
   },
   "generated_file": "source/stock_analysis/data_sources/_astock_generated.py",
-  "generated_sha256": "5109abbe075b87dbefa4d0588f71c00062c51d1ec5f80c79593e5e7ac427a46a",
-  "body_sha256": "52fe2eb7c6910d5fcbe2023920ae73514cdff4426981dfab4bd17a6980820eaa",
+  "generated_sha256": "c017ca48d5f5cec005cb30f213f7cbd990037845ca9a460beb27dd61ab2181e0",
+  "body_sha256": "ba914924a3e6df6db07a2b090ea23cb7b40f8bec10ffd2373c526f9a668e390e",
   "selections": [
     {
       "symbol": "SH_INDEX",
@@ -288,6 +288,14 @@
       "section": "§4.5 个股资金流（120日，日级）",
       "upstream_sha256": "3c40d57078719e38ddeaec9856b566f94d5d9ed094eb9889a069a4affc3a5f6d",
       "generated_sha256": "3c40d57078719e38ddeaec9856b566f94d5d9ed094eb9889a069a4affc3a5f6d",
+      "timeout_injections": 0,
+      "baostock_fallback_disabled": 0
+    },
+    {
+      "symbol": "fund_flow_backup",
+      "section": "备用源速查：新浪日度资金流",
+      "upstream_sha256": "185a705cdb1c8ac5a8958d010f65b35f928cb0e8661d57962889d02a4cd9819e",
+      "generated_sha256": "185a705cdb1c8ac5a8958d010f65b35f928cb0e8661d57962889d02a4cd9819e",
       "timeout_injections": 0,
       "baostock_fallback_disabled": 0
     },

@@ -440,15 +440,32 @@ python cli.py 600519 --start 20200101 --json
   exposure, vs_buy_hold, note}`。`method` 如实标注近似口径（当前 `trailing_250_point_estimate`），
   **不是 walk-forward**。`trade_count=0` 时 `note` 必说明原因（如 `status=no_edge`）
 
-### evidence.flow（P1-2，issue #36）
+### evidence.flow（P1-2，issue #36；#39 增加新浪备胎）
 
-日级主力资金流**上下文**，`schema_version` 仍为 `1.0`（additive）。
-数据来自东财 §4.5（最近 120 个交易日），但 **CLI 主路径绝不触网**：
+日级资金流**上下文**，`schema_version` 仍为 `1.0`（additive）。
+**CLI 主路径绝不触网**，只读预计算缓存：
 
-1. 收盘后运行 `python tools/precompute_flow.py`（逐票串行、相邻请求 ≥1s、失败重试后继续），
-   写入 `source/stock_analysis/data/flow/<code>.json`（`data/` 已在 `.gitignore`）；
+1. 收盘后运行 `python tools/precompute_flow.py`（逐票串行、相邻请求 ≥1s、失败重试后继续）：
+   - **东财优先**（§4.5，`source=eastmoney_push2his`）；首票只发一次探测请求，
+     整域 TLS RST / 空响应时立即标记本轮东财不可用，后续票不再请求东财
+     （不逐票重试轰炸），改走新浪「备用源速查」`fund_flow_backup`
+     （`source=sina_fund_flow_backup`）；
+   - 两个源都失败才记失败，**不覆盖**旧缓存；缓存 JSON 记录
+     `source` / `caliber` / `attempts`（各源实际请求次数）。
+   写入 `source/stock_analysis/data/flow/<code>.json`（`data/` 已在 `.gitignore`）。
 2. CLI / 盘前 cron 只读这份缓存。缓存缺失或过期时 `flow.available=false` + warning，
    CLI 正常返回，**不会为了资金流多发一个请求**。
+
+**两种口径不可直接比较（#39 硬约束）**：
+
+| `caliber` | `source` | 可用字段 | 显式 `null` 的字段 |
+|---|---|---|---|
+| `eastmoney_main_net` | `eastmoney_push2his` | `main_net_5d/20d`（主力净流入 = 超大单 + 大单） | `net_5d/20d` |
+| `sina_total_net` | `sina_fund_flow_backup` | `net_5d/20d`（**总净流入**，新浪 `netamount`） | `main_net_5d/20d` |
+
+新浪没有「大单/主力」拆分，因此**绝不会**把总净流入写进 `main_net`；两种口径
+不是同一个量，不能直接相减、排序或跨票比较，调用方必须先看 `caliber`。
+没有 `caliber` 的 P1-2 旧缓存按东财口径读取（向后兼容）。
 
 **只展示、不改决策**：`evidence.flow` 不参与 `action`、`status`、`position_fraction`、
 `entry_zone`、`target_position` 的任何计算；A/B 对照中 `recommendation` 逐键一致。
@@ -457,15 +474,18 @@ python cli.py 600519 --start 20200101 --json
 |---|---|
 | `available` | 缓存可用且至少有一行；不可用时其余数值键为 `null` |
 | `code` | 6 位纯数字代码 |
-| `source` | 当前为 `eastmoney_push2his` |
+| `source` | `eastmoney_push2his` 或 `sina_fund_flow_backup` |
+| `caliber` | `eastmoney_main_net` 或 `sina_total_net`；不同口径不可直接比较 |
 | `as_of` | 摘要实际用到的**最后一根资金流日期**（不是文件时间） |
 | `fetched_at` | 预计算写入缓存的时间 |
 | `rows` | 本次摘要用到的行数（`--as-of` 时可能小于缓存总行数） |
 | `pub_lag_days` | 恒为 `1`：当日资金流收盘后发布；`--as-of d` 只使用 `date < d` 的行 |
-| `main_net_5d` | 最近 5 个交易日主力净流入之和，**单位元**（东财原始口径） |
-| `main_net_20d` | 最近 20 个交易日主力净流入之和；不足 20 行时为 `null`，不缩短窗口冒充 |
-| `direction` | `inflow` / `outflow` / `flat`（由 5 日净额符号判定） |
-| `direction_basis` | `main_net_5d_sign`；5 日不可用时退回 `main_net_20d_sign` |
+| `main_net_5d` | 最近 5 个交易日**主力**净流入之和，**单位元**（仅东财口径；新浪口径为 `null`） |
+| `main_net_20d` | 最近 20 个交易日主力净流入之和；仅东财口径，不足 20 行时为 `null` |
+| `net_5d` | 最近 5 个交易日**总**净流入之和，单位元（仅新浪口径；东财口径为 `null`） |
+| `net_20d` | 最近 20 个交易日总净流入之和；仅新浪口径，不足 20 行时为 `null` |
+| `direction` | `inflow` / `outflow` / `flat`（由当前口径可用窗口的净额符号判定） |
+| `direction_basis` | `main_net_5d_sign` / `main_net_20d_sign` / `net_5d_sign` / `net_20d_sign` |
 | `stale` | 缓存末日早于「期望最新交易日」；判定只读本地磁盘交易日历，缺失时退回周末推算 |
 | `expected_date` / `expected_source` | 期望交易日及其口径（`calendar_cache` / `estimate`） |
 | `reason` | 不可用原因：`cache_missing` / `cache_invalid` / `no_rows_as_of` / `fund_not_supported` / `data_source_error` |
@@ -488,7 +508,7 @@ python cli.py 600519 --start 20200101 --json
 - `evidence.n_trials = 0`、`significant = false`、`consensus.family = null`、`triggers = []`
 - `evidence.edge` 七键齐全（值全 `null`）、`evidence.signal_stats` 展开到 5 个 horizon 子键（值 `null`）、
   `evidence.decision_replay` 七键齐全、`recommendation.signal` 十三键齐全、`data.execution` 四键齐全
-- `evidence.flow` 十五键齐全（`available=false, reason="data_source_error"`，数值键全 `null`）
+- `evidence.flow` 十八键齐全（`available=false, reason="data_source_error"`，数值键全 `null`）
 - `recommendation.horizon_days = [null, null]`、`stop_loss/take_profit/stop_method = null`、`position_fraction = 0.0`
 - `data.bars/start/end/last_close` 在"数据太短"时是**已知真实值**（如 `bars=23`），与 `invalidation` 文本一致；拉取彻底失败时才为 `0 / "" / null`
 - `candidates = []`（没有候选才是正确语义，不是缺字段）
