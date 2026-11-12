@@ -198,6 +198,10 @@ def fetch_price(code, start, attempts=3, backoff=5.0, min_last=None):
     # 在第 73 只后整段失败，隔几分钟重试即恢复 —— 因此这里对单票做退避重试，
     # 避免把限流当成「该票无数据」。（v2 扩池到 300 只时，cmd_fetch 还会在
     # 批次之间暂停、对整轮失败做冷却，见 ``--batch-size/--batch-pause/--cooldown``。）
+    #
+    # issue #13：**整域冷却中不再逐票退避**。跨进程冷却文件（三个入口全冷却）
+    # 生效时一个请求都不发，直接抛 TencentThrottled 给调用方切备胎；否则
+    # ``attempts × 三入口 × 分页窗口`` 会在限流期间把请求量再放大 3 倍。
     for attempt in range(int(attempts)):
         try:
             frame = astock.fetch_daily(code, start_date=start, adjust="qfq")
@@ -207,8 +211,11 @@ def fetch_price(code, start, attempts=3, backoff=5.0, min_last=None):
             frame.index.name = "date"
             frame.to_csv(path)
             return {"code": code, "rows": int(len(frame)), "cached": False,
+                    "source": "tencent_qfq",
                     "first": str(frame.index[0].date()),
                     "last": str(frame.index[-1].date())}
+        except astock.TencentThrottled:
+            raise
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < int(attempts) - 1:
@@ -312,16 +319,42 @@ def _load_price_sources():
         return {}
 
 
+def _count_sources(price_ok):
+    """按日线来源计数（issue #13 第 4 条：报告必须区分来源）。"""
+    counts = {}
+    for item in price_ok or []:
+        source = str(item.get("source") or "unknown")
+        counts[source] = counts.get(source, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def _fetch_prices(codes, args, min_as_of):
     """分批抓日线：每批暂停 ``--batch-pause``；连续 3 只失败即冷却 ``--cooldown``。
 
     腾讯失败时按 ``--price-fallback`` 降级到 baostock（单会话、逐票串行）。
     返回 ``(ok, failed)``，二者都是 dict 列表。失败票由调用方在下一轮重试，
     **绝不**把限流静默当成「该票无数据」。
+
+    issue #13（P0）三处收紧，全部针对 R5 实测的「300 只 → 5700 次请求 → 整域限流」：
+
+    1. **预算夹取**：``--batch-size`` ≤ 20、``--batch-pause`` ≥ 20s。超限只夹不静默，
+       夹了必打印（``normalize_batch_args`` 返回 notes）。
+    2. **主源连败即切备胎**：连续 3 只腾讯失败后，本轮剩余票**一次也不试腾讯**，
+       直接 baostock。旧实现是每票都重试三入口 + 每票退避，等于把一次限流放大 3 倍。
+    3. **单票时间预算**：单票全通道失败的总耗时 ≤ ``--ticker-budget``（默认 20s），
+       超时立即记为失败并让调用方回退缓存（本轮无缓存即标 degraded）。
     """
+    from stock_analysis.data_sources import tencent_throttle as throttle
+
     ok, failed = [], []
     streak = 0
     sources = _load_price_sources()
+    batch_size, batch_pause, batch_notes = throttle.normalize_batch_args(
+        args.batch_size, args.batch_pause)
+    for note in batch_notes:
+        _log(f"[budget] {note}")
+    budget = throttle.FailureBudget(args.primary_block_after)
+    budget_seconds = float(args.ticker_budget)
     bs_session = None
     if args.price_fallback == "baostock":
         import precompute_valuation as pv
@@ -337,26 +370,46 @@ def _fetch_prices(codes, args, min_as_of):
         else:
             bs_session = bs
             _log("日线备胎已就绪：baostock 前复权（单会话串行）")
+    if throttle.all_hosts_cooling():
+        # 跨进程冷却文件显示三入口全在冷却：本轮开跑就切备胎，别先撞一遍。
+        budget.block(f"腾讯三入口冷却中（{throttle.cooling_summary()}），本轮直接走备胎")
+        _log(f"[cool] {budget.blocked_reason}")
     try:
         for i, code in enumerate(codes, 1):
             info = None
             reason = None
-            try:
-                info = fetch_price(code, args.start, attempts=args.attempts,
-                                   backoff=args.backoff, min_last=min_as_of)
-            except Exception as exc:  # noqa: BLE001
-                reason = f"{type(exc).__name__}: {exc}"
-            if info is None and bs_session is not None:
+            started = time.monotonic()
+            if budget.primary_blocked:
+                reason = budget.blocked_reason or "主源本轮已停用"
+            else:
                 try:
-                    info = fetch_price_baostock(code, args.start, bs_session)
+                    info = throttle.run_with_deadline(
+                        fetch_price, budget_seconds, code, args.start,
+                        attempts=args.attempts, backoff=args.backoff,
+                        min_last=min_as_of)
+                except throttle.TencentBudgetExceeded as exc:
+                    reason = f"超时预算：{exc}"
+                except Exception as exc:  # noqa: BLE001
+                    reason = f"{type(exc).__name__}: {exc}"
+            if info is None and bs_session is not None:
+                remaining = budget_seconds - (time.monotonic() - started)
+                try:
+                    info = throttle.run_with_deadline(
+                        fetch_price_baostock, max(1.0, remaining),
+                        code, args.start, bs_session)
                     _log(f"[price {i}/{len(codes)}] {code} 腾讯失败 → baostock 补齐 "
                          f"{info['rows']} 根")
+                except throttle.TencentBudgetExceeded as exc:
+                    reason = f"tencent: {reason}; baostock 超时：{exc}"
                 except Exception as exc:  # noqa: BLE001
                     reason = f"tencent: {reason}; baostock: {type(exc).__name__}: {exc}"
             if info is None:
                 failed.append({"code": code, "reason": reason})
                 streak += 1
                 _log(f"[price {i}/{len(codes)}] {code} FAIL {reason}")
+                if not budget.primary_blocked:
+                    if budget.record_failure(reason):
+                        _log(f"[budget] {budget.blocked_reason}")
                 if streak >= 3:
                     _log(f"  [backoff] 连续 {streak} 只失败，冷却 "
                          f"{args.cooldown}s（疑似腾讯限流）")
@@ -366,12 +419,13 @@ def _fetch_prices(codes, args, min_as_of):
             ok.append(info)
             sources[code] = info["source"]
             streak = 0
+            budget.record_success()
             _log(f"[price {i}/{len(codes)}] {code} {info['rows']} 根 "
                  f"{info['first']}~{info['last']} [{info['source']}]"
                  f"{' (cache)' if info['cached'] else ''}")
-            if i % max(1, args.batch_size) == 0 and i < len(codes):
-                _log(f"  [batch] {i}/{len(codes)} 完成，暂停 {args.batch_pause}s")
-                time.sleep(args.batch_pause)
+            if i % max(1, batch_size) == 0 and i < len(codes):
+                _log(f"  [batch] {i}/{len(codes)} 完成，暂停 {batch_pause:g}s")
+                time.sleep(batch_pause)
     finally:
         if bs_session is not None:
             import contextlib
@@ -388,6 +442,7 @@ def cmd_fetch(args):
     _ensure_dirs()
     import precompute_valuation as pv      # tools/ 下的既有预计算入口
     import precompute_flow as pf
+    from stock_analysis.data_sources import tencent_throttle as throttle
 
     min_as_of = args.min_as_of or (datetime.now() - timedelta(days=4)).date().isoformat()
     codes, provenance = build_pool(args.limit, use_csi300=not args.no_csi300)
@@ -407,6 +462,9 @@ def cmd_fetch(args):
         price_fail = lost
         pending = [item["code"] for item in lost]
         if pending and round_no < max(1, args.rounds):
+            # issue #13：重试轮前等**更久**。R5 实测腾讯整域限流在 120s 冷却后
+            # 仍可能没恢复，所以这里按 2×cooldown 起步；冷却状态文件本身会
+            # 保证「没恢复就不发请求」，等待只是给它恢复的机会。
             wait = args.cooldown * 2
             _log(f"  仍有 {len(pending)} 只失败，{wait}s 后进入重试轮："
                  f"{', '.join(pending[:12])}{' ...' if len(pending) > 12 else ''}")
@@ -483,6 +541,25 @@ def cmd_fetch(args):
         "price_batch": {"size": args.batch_size, "pause_seconds": args.batch_pause,
                         "cooldown_seconds": args.cooldown,
                         "attempts_per_code": args.attempts},
+        # issue #13：备胎必须显式化。混源不得用于绝对价位比较（R5 §7 已有约束）：
+        # 腾讯 qfq 与 baostock qfq 的**价格水平不同**（复权基准不同），只在收益率
+        # 口径等价（实测日收益最大绝对差 3.5e-6）。所有跨票的绝对价位比较
+        # （如「同价位区间」分组）都必须先按本字段分源，不得混算。
+        "price_sources": _load_price_sources(),
+        "price_source_counts": _count_sources(price_ok),
+        "price_budget": {
+            "ticker_seconds": float(args.ticker_budget),
+            "primary_block_after": int(args.primary_block_after),
+            "batch_size_effective": throttle.normalize_batch_args(
+                args.batch_size, args.batch_pause)[0],
+            "batch_pause_effective": throttle.normalize_batch_args(
+                args.batch_size, args.batch_pause)[1],
+        },
+        "tencent_cooldown": {
+            "state_file": throttle.state_path(),
+            "active": throttle.active_hosts(),
+            "summary": throttle.cooling_summary(),
+        },
         "valuation": {"fresh_skipped": len(fresh_val),
                       "ok": len(val_stats["ok"]), "failed": val_stats["failed"],
                       "login": val_stats["login"],
@@ -2255,9 +2332,9 @@ def build_parser():
     fetch.add_argument("--min-as-of", default=None,
                        help="缓存新鲜线（默认 今天-4 天）；早于它的缓存会重取")
     fetch.add_argument("--batch-size", type=int, default=20,
-                       help="日线每抓 N 只暂停一次（默认 20）")
+                       help="日线每抓 N 只暂停一次（默认 20；上限 20，见 issue #13）")
     fetch.add_argument("--batch-pause", type=float, default=20.0,
-                       help="批次间隔秒数（默认 20）")
+                       help="批次间隔秒数（默认 20；下限 20s，见 issue #13）")
     fetch.add_argument("--cooldown", type=float, default=120.0,
                        help="连续失败/整轮重试前的冷却秒数（默认 120）")
     fetch.add_argument("--attempts", type=int, default=3,
@@ -2266,6 +2343,10 @@ def build_parser():
                        help="单票退避基数秒（5/10/15…）")
     fetch.add_argument("--rounds", type=int, default=2,
                        help="日线抓取轮数（失败票每轮重试；默认 2）")
+    fetch.add_argument("--ticker-budget", type=float, default=20.0,
+                       help="单票全通道失败的总耗时上限秒数（默认 20，见 issue #13）")
+    fetch.add_argument("--primary-block-after", type=int, default=3,
+                       help="腾讯连续失败 N 只后，本轮剩余票直接走备胎（默认 3）")
     fetch.add_argument("--skip-price", action="store_true",
                        help="跳过日线抓取（腾讯整域限流时先跑其它源）")
     fetch.add_argument("--skip-valuation", action="store_true",

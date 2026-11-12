@@ -28,6 +28,11 @@ def _astock_offline(monkeypatch, tmp_path):
     # P0-3：默认禁止交易状态层触网（ST 名单 + 腾讯报价）。需要联网语义的
     # 测试在用例内显式覆盖该环境变量，并注入 quote / st_snapshot。
     monkeypatch.setenv("ASTOCK_STATUS_OFFLINE", "1")
+    # issue #13：腾讯跨进程冷却状态默认落在 source/stock_analysis/data/state/。
+    # 测试必须指向临时目录 —— 否则一个用例触发的冷却会写进开发者本机状态文件，
+    # 并让后续用例「整域冷却中」而跳过所有请求（实测 10 个用例因此误红）。
+    monkeypatch.setenv("TENCENT_COOLDOWN_PATH",
+                       str(tmp_path / "tencent_cooldown.json"))
     try:
         from stock_analysis.data_sources import astock, _astock_generated
         from stock_analysis.data_loader import status as trading_status

@@ -34,6 +34,7 @@ import sys
 import pandas as pd
 
 from . import _astock_generated as _g
+from . import tencent_throttle as _throttle
 
 __all__ = [
     "AstockError",
@@ -47,6 +48,7 @@ __all__ = [
     "calendar_source",
     "calendar_last_error",
     "OFFLINE_ENV",
+    "TencentThrottled",
 ]
 
 OFFLINE_ENV = "ASTOCK_CALENDAR_OFFLINE"
@@ -71,6 +73,14 @@ _CALENDAR_INFO = {"source": None, "last_error": None, "last_month": None}
 
 class AstockError(RuntimeError):
     """a-stock-data 取数失败（网络 / 格式 / 限流 / 空数据）。"""
+
+
+class TencentThrottled(AstockError):
+    """腾讯 K 线**整域冷却中**（跨进程状态文件未过期）—— 本次一个请求都没发。
+
+    与普通 :class:`AstockError` 的区别对调用方很重要：这不是「这只票取不到」，
+    而是「现在整个腾讯都别碰」。渠道池据此立刻切备胎，不必再付三次 HTTP 超时。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +142,13 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq") -> pd.DataFrame:
     needs_factor = adjust_value in ("qfq", "hfq")
     fetch_adjust = "" if needs_factor else adjust_value
 
+    _throttle.sync_process_state()
+    if _throttle.all_hosts_cooling():
+        # issue #13 第 1 条：跨进程冷却文件显示三个入口都在冷却 → 一个请求都不发。
+        # 抛专门的 TencentThrottled，让渠道池立刻切备胎（而不是再付三次超时）。
+        raise TencentThrottled(
+            f"腾讯 K 线整域冷却中（{_throttle.cooling_summary()}），本次未发起请求")
+
     try:
         frame = _g.tencent_kline(digits, period="day", adjust=fetch_adjust, start=start)
     except ValueError as exc:
@@ -139,6 +156,10 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq") -> pd.DataFrame:
         raise AstockError(f"腾讯K线参数错误({digits}): {exc}") from exc
     except Exception as exc:  # RuntimeError / requests 异常等
         raise AstockError(f"腾讯K线拉取失败({digits}): {exc}") from exc
+    finally:
+        # 生成物把失败入口写进进程内 `_tencent_host_down_until`；这里立刻镜像到
+        # 磁盘，下一个进程（或同一进程的下一次运行）启动即可见，不必重复撞墙。
+        _throttle.flush_process_state(reason=f"fetch_daily {digits}")
 
     if frame is None or frame.empty:
         raise AstockError(f"腾讯K线返回空数据({digits})")
@@ -274,6 +295,19 @@ def fetch_index_daily(symbol="sh000300", start_date=None) -> pd.DataFrame:
     code = _index_symbol(symbol)
     start = _format_start(start_date)
 
+    _throttle.sync_process_state()
+    if _throttle.all_hosts_cooling():
+        raise TencentThrottled(
+            f"腾讯 K 线整域冷却中（{_throttle.cooling_summary()}），本次未发起请求")
+
+    try:
+        return _fetch_index_rows(code, start)
+    finally:
+        _throttle.flush_process_state(reason=f"fetch_index_daily {code}")
+
+
+def _fetch_index_rows(code: str, start: str) -> pd.DataFrame:
+    """``fetch_index_daily`` 的取数主体（分页循环）；冷却镜像由调用方负责。"""
     rows_by_date: dict[str, dict] = {}
     end = ""
     for _ in range(_INDEX_MAX_PAGES):
