@@ -430,3 +430,172 @@ def test_cache_roundtrip_and_degraded(tmp_path, monkeypatch):
     assert info3["source"] == "cache" and info3["degraded"] is True
     assert info3["cache_last_date"] == "2020-02-11"
     assert info3["lag_days"] and info3["lag_days"] > 0
+
+
+# ---------------------------------------------------------------------------
+# PR #9 阻断回归：None=全量 / 旧缓存不被缩短 / 增量合并
+# ---------------------------------------------------------------------------
+def _ohlcv_frame(dates, base=100.0, step=1.0):
+    index = pd.DatetimeIndex(dates, name="date")
+    close = [base + step * i for i in range(len(index))]
+    return pd.DataFrame({
+        "open": close, "high": [c + 1.0 for c in close],
+        "low": [c - 1.0 for c in close], "close": close,
+        "volume": [1000.0 + i for i in range(len(index))],
+    }, index=index)
+
+
+def _write_cache(tmp_path, dates, base=100.0):
+    frame = _ohlcv_frame(dates, base=base)
+    frame.to_csv(tmp_path / "stock_600519_qfq.csv")
+    return frame
+
+
+class _RecordingPool:
+    """记录渠道池收到的 start_date；responder(start) → (df, source_name)。"""
+
+    def __init__(self, responder):
+        self.calls = []
+        self._responder = responder
+
+    def fetch(self, symbol, start_date, adjust, preferred=None):
+        self.calls.append(start_date)
+        return self._responder(start_date)
+
+
+def test_none_start_requests_full_history(monkeypatch):
+    """start_date=None/空 → 传给 tencent_kline 的下限必须是 1990 年，不是 2020。"""
+    from stock_analysis.data_sources import astock, _astock_generated
+
+    starts = []
+
+    def fake_kline(code, period="day", adjust=None, start=None, end=None, count=320):
+        starts.append(start)
+        return pd.DataFrame({
+            "date": ["2026-11-11", "2026-11-12"],
+            "open": [1.0, 1.0], "high": [2.0, 2.0], "low": [0.5, 0.5],
+            "close": [1.5, 1.5], "volume": [10.0, 10.0],
+        })
+
+    monkeypatch.setattr(_astock_generated, "tencent_kline", fake_kline)
+    for value in (None, "", "   "):
+        df = astock.fetch_daily("600519", start_date=value, adjust="")
+        assert len(df) == 2
+    astock.fetch_daily("600519", adjust="")  # 默认参数同样视为全量
+    assert len(starts) == 4
+    assert all(s is not None and s <= "1991-01-01" for s in starts)
+
+
+def test_cold_start_fetches_full_history(tmp_path, monkeypatch):
+    """无缓存时渠道池收到的下限是 1990；--start 只截断返回值，不截断缓存。"""
+    from stock_analysis.data_loader import meta
+
+    monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
+    dates = pd.bdate_range("2019-01-01", periods=500)  # 覆盖 2019–2020
+    pool = _RecordingPool(lambda start: (_ohlcv_frame(dates), "astock_tencent"))
+    monkeypatch.setattr(meta, "_STOCK_DATA_SOURCE_POOL", pool)
+    monkeypatch.setattr(meta, "_expected_latest_trade_date",
+                        lambda now=None: dates[-1].date())
+
+    df = meta.get_stock_daily("600519", start_date="20200101", source="akshare")
+    assert pool.calls == [meta.FULL_HISTORY_START]
+    assert meta.FULL_HISTORY_START <= "19910101"
+    assert 0 < len(df) < len(dates)  # 返回值按 --start 截断
+    cached = pd.read_csv(tmp_path / "stock_600519_qfq.csv",
+                         index_col="date", parse_dates=True)
+    assert len(cached) == len(dates)  # 缓存仍是全量
+
+
+def test_stale_cache_merged_not_shortened(tmp_path, monkeypatch):
+    """6000 行旧缓存 + 近端 20 行（重叠一致）→ 合并后历史一根不丢。"""
+    from stock_analysis.data_loader import meta
+
+    monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
+    dates = pd.bdate_range("2000-01-03", periods=6000)
+    cached = _write_cache(tmp_path, dates)
+    last = dates[-1]
+
+    extra_idx = pd.bdate_range(last + pd.Timedelta(days=1), periods=2)
+    extra = _ohlcv_frame(extra_idx, base=float(cached["close"].iloc[-1]) + 10.0)
+    fresh = pd.concat([cached.iloc[-20:].copy(), extra])  # 重叠段数值完全一致
+
+    monkeypatch.setattr(meta, "_expected_latest_trade_date",
+                        lambda now=None: extra_idx[-1].date())
+    pool = _RecordingPool(lambda start: (fresh.copy(), "astock_tencent"))
+    monkeypatch.setattr(meta, "_STOCK_DATA_SOURCE_POOL", pool)
+
+    out = meta.get_stock_daily("600519", start_date=None, source="akshare")
+    info = meta.last_fetch_info()
+    near = (last - pd.Timedelta(days=meta.CACHE_OVERLAP_DAYS)).strftime("%Y%m%d")
+    assert pool.calls == [near]  # 只拉近端窗口，不是全量
+    assert len(out) == len(dates) + 2
+    assert out.index[0] == dates[0]  # 2000 年的历史仍在
+    written = pd.read_csv(tmp_path / "stock_600519_qfq.csv",
+                          index_col="date", parse_dates=True)
+    assert len(written) == len(dates) + 2
+    assert info["source"] == "astock_tencent" and info["from_cache"] is False
+    assert info["degraded"] is False
+
+
+def test_overlap_mismatch_triggers_full_refetch(tmp_path, monkeypatch):
+    """重叠段不一致（除权/复权基准变化）→ 从缓存首日全量重取并整体替换。"""
+    from stock_analysis.data_loader import meta
+
+    monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
+    dates = pd.bdate_range("2000-01-03", periods=6000)
+    cached = _write_cache(tmp_path, dates)
+    last = dates[-1]
+    near_start = (last - pd.Timedelta(days=meta.CACHE_OVERLAP_DAYS)).strftime("%Y%m%d")
+
+    near = cached.iloc[-20:].copy()
+    near[["open", "high", "low", "close"]] += 5.0  # 复权基准已变
+    full_dates = dates.append(pd.bdate_range(last + pd.Timedelta(days=1), periods=2))
+    replacement = _ohlcv_frame(full_dates, base=200.0)  # 从缓存首日起的全量替换
+
+    def responder(start):
+        if start == near_start:
+            return near, "astock_tencent"
+        return replacement, "astock_tencent"
+
+    monkeypatch.setattr(meta, "_expected_latest_trade_date",
+                        lambda now=None: full_dates[-1].date())
+    pool = _RecordingPool(responder)
+    monkeypatch.setattr(meta, "_STOCK_DATA_SOURCE_POOL", pool)
+
+    out = meta.get_stock_daily("600519", start_date=None, source="akshare")
+    assert pool.calls == [near_start, dates[0].strftime("%Y%m%d")]
+    assert pool.calls[1] != meta.FULL_HISTORY_START  # 从缓存首日，不是 1990
+    assert len(out) == len(full_dates)
+    assert out["close"].iloc[0] == pytest.approx(200.0)  # 整体替换，不是拼接
+
+
+def test_shorter_fetch_does_not_overwrite_cache(tmp_path, monkeypatch):
+    """重取结果比旧缓存短 → 保留原缓存、报 degraded，绝不覆盖。"""
+    from stock_analysis.data_loader import meta
+
+    monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
+    dates = pd.bdate_range("2000-01-03", periods=6000)
+    cached = _write_cache(tmp_path, dates)
+    cache_file = tmp_path / "stock_600519_qfq.csv"
+    original = cache_file.read_bytes()
+    last = dates[-1]
+    near_start = (last - pd.Timedelta(days=meta.CACHE_OVERLAP_DAYS)).strftime("%Y%m%d")
+
+    near = cached.iloc[-20:].copy()
+    near[["close"]] += 5.0  # 触发重叠不一致
+    short = cached.iloc[-100:].copy()  # 全量重取却只有 100 行
+
+    def responder(start):
+        return (near, "astock_tencent") if start == near_start else (short, "astock_tencent")
+
+    monkeypatch.setattr(meta, "_expected_latest_trade_date",
+                        lambda now=None: (last + pd.offsets.BDay(1)).date())
+    monkeypatch.setattr(meta, "_STOCK_DATA_SOURCE_POOL", _RecordingPool(responder))
+
+    out = meta.get_stock_daily("600519", start_date=None, source="akshare")
+    info = meta.last_fetch_info()
+    assert cache_file.read_bytes() == original  # 一字节未改
+    assert len(out) == len(dates)
+    assert info["source"] == "cache" and info["from_cache"] is True
+    assert info["degraded"] is True
+    assert "比本地缓存短" in (info["degraded_reason"] or "")

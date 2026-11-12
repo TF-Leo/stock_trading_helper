@@ -51,6 +51,16 @@ OFFLINE_ENV = "ASTOCK_CALENDAR_OFFLINE"
 # 断源演练开关（issue #3 验收 3）：置 1 时腾讯通道必失败，用于验证渠道池降级。
 FORCE_FAIL_ENV = "ASTOCK_FORCE_FAIL"
 
+# 未指定 start_date 时的拉取下限。既有的 eastmoney / sina_stock 通道在
+# start_date=None 时返回**全量历史**，本适配器必须保持同一语义：1990-01-01
+# 早于 A 股任一标的的上市日，作为「全量」的哨兵值。
+#
+# 成本提示：``tencent_kline`` 按 ``_TENCENT_SPAN_DAYS['day'] = 700`` 天/窗口
+# 分页，1990→今约 37 年 ≈ 19 个日线窗口 = 19 次 HTTP 请求。因此**只有冷启动
+# （本地无缓存）才应走全量**；日常过期缓存由 ``data_loader.meta.get_stock_daily``
+# 先取「缓存末日 - 40 天」的近端窗口，与旧缓存重叠比对后合并（通常 1 个窗口）。
+FULL_HISTORY_START = "1990-01-01"
+
 # 进程内日历缓存：{(year, month): {"YYYY-MM-DD": bool} | None}
 # None 表示该月已判定不可用，用于避免同一次运行里反复重试超时。
 _CALENDAR_MEMO: dict[tuple[int, int], dict[str, bool] | None] = {}
@@ -71,7 +81,7 @@ def _is_star_market(digits: str) -> bool:
 
 def _format_start(start_date) -> str:
     if start_date is None or str(start_date).strip() == "":
-        return "2020-01-01"
+        return FULL_HISTORY_START
     try:
         return _g._v39_date(start_date)
     except ValueError as exc:
@@ -87,8 +97,13 @@ def _normalize_adjust(adjust) -> str:
     return value
 
 
-def fetch_daily(symbol: str, start_date="20200101", adjust="qfq") -> pd.DataFrame:
+def fetch_daily(symbol: str, start_date=None, adjust="qfq") -> pd.DataFrame:
     """拉取腾讯日线，按**比例口径**做前/后复权。
+
+    ``start_date`` 为 ``None`` / 空字符串时返回**全量历史**（下限
+    :data:`FULL_HISTORY_START` = 1990-01-01），与既有 eastmoney / sina_stock
+    通道的 ``start_date=None`` 语义一致。注意全量分页成本：日线每窗口 700 天，
+    1990→今约 19 次 HTTP 请求；日常增量更新请只传近端窗口。
 
     为什么不用腾讯自带的 ``qfq``：上游 §1.2 明确说明腾讯 qfq 是「逐次减去每股
     分红」的**等差**口径，高分红老股的长区间收益会被扭曲（实测 600519 2021-02

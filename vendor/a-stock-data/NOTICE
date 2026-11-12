@@ -17,11 +17,20 @@ The upstream SKILL.md is stored verbatim. Code is not vendored wholesale:
 `source/stock_analysis/data_sources/_astock_generated.py`.
 
 The extractor applies exactly one mechanical modification to the extracted
-source: upstream HTTP timeout literals are replaced by the module constant
-`_ASTOCK_HTTP_TIMEOUT` (see the manifest's "modifications" section). This is
-needed so a calendar lookup can fail fast and fall back to the local weekday
-estimate instead of blocking a CLI call for up to 50 seconds. No algorithmic
-logic is changed.
+source, and only at **two of the four** upstream HTTP call sites:
+
+* `_tencent_kline_call` — timeout replaced by the module constant
+  `_ASTOCK_HTTP_TIMEOUT` (5, 15);
+* `_official_get` — same replacement; this is what lets a calendar lookup fail
+  fast and fall back to the local weekday estimate instead of blocking a CLI
+  call for up to 50 seconds.
+
+The other call sites intentionally keep their upstream literals:
+`sina_adjust_factor` and `tencent_quote` still pass `timeout=10`, and the
+`_v39_http` signature default remains the upstream `(10, 40)`. Consequently a
+single adjustment-factor request can still block for up to 10 seconds; the
+(5, 15) constant does not cover it. No algorithmic logic is changed. See the
+manifest's "modifications" section (`injections: 2`).
 
 Sections used
 -------------

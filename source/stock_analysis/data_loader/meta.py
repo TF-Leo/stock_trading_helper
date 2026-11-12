@@ -162,6 +162,78 @@ def _write_cache(df, cache_file, label):
         return False
 
 
+# ---------------------------------------------------------------------------
+# 旧缓存增量更新（2026-11-12，修复 PR #9 阻断回归）
+#
+# 事故：新主通道 astock_tencent 把「未指定 start」解释成 2020-01-01，冷/热跑都把
+# 600519 的 6041 根缓存覆盖成 1662 根，回测结论从 no_edge/唐奇安 变成 ok/配对交易。
+#
+# 修复后的不变量：
+#   1. 冷启动（无缓存）→ 从 FULL_HISTORY_START 拉全量；
+#   2. 过期缓存 → 只拉「缓存末日 - CACHE_OVERLAP_DAYS」的近端窗口（通常 1 个
+#      腾讯分页窗口），与旧缓存的重叠交易日比对后合并（新值覆盖旧值）；
+#   3. 重叠不一致（除权/复权基准变化）或完全无重叠 → 从**缓存首日**全量重取并
+#      整体替换（不是从 1990，避免无谓的 19 次分页）；
+#   4. 任何情况下写盘长度不得小于原缓存；更短则保留原缓存并报 degraded。
+# ---------------------------------------------------------------------------
+CACHE_OVERLAP_DAYS = 40       # 近端回看天数（覆盖春节等长假，保证有重叠交易日）
+OVERLAP_PRICE_TOL = 0.01      # 重叠段价格容差（元；4 位小数舍入）
+OVERLAP_VOLUME_TOL = 100.0    # 重叠段成交量容差（股；腾讯按整手取整，上游 #57）
+# 冷启动下限：1990-01-01 早于 A 股任一标的上市日，等价「全量」。
+# 用 YYYYMMDD 是因为 eastmoney/sina 通道收这个格式（astock 侧会转成 1990-01-01）。
+FULL_HISTORY_START = '19900101'
+
+
+def _prepare_indexed_frame(raw):
+    """渠道原始 DataFrame → DatetimeIndex + 数值列（写盘与合并共用）。"""
+    full = raw
+    if 'date' not in full.columns:
+        full = _normalize_daily_df(full)
+    full = full.copy()
+    full['date'] = pd.to_datetime(full['date'])
+    full = full.set_index('date').sort_index()
+    for col in ('open', 'high', 'low', 'close', 'volume'):
+        if col in full.columns:
+            full[col] = pd.to_numeric(full[col], errors='coerce')
+    return full[~full.index.duplicated(keep='last')]
+
+
+def _overlap_matches(cached, fresh):
+    """重叠交易日上的价格/成交量是否一致。
+
+    返回 True / False / None（无重叠，无法判定）。None 与 False 在调用方都按
+    「不能安全拼接」处理：前复权因子会在除权/分红后整体重算，把两段不同基准的
+    序列直接拼接会让历史收益静默失真。
+    """
+    common = cached.index.intersection(fresh.index)
+    if len(common) == 0:
+        return None
+    for col in ('open', 'high', 'low', 'close'):
+        if col not in cached.columns or col not in fresh.columns:
+            continue
+        a = pd.to_numeric(cached.loc[common, col], errors='coerce')
+        b = pd.to_numeric(fresh.loc[common, col], errors='coerce')
+        if a.isna().any() or b.isna().any():
+            return False
+        if float((a - b).abs().max()) > OVERLAP_PRICE_TOL:
+            return False
+    if 'volume' in cached.columns and 'volume' in fresh.columns:
+        a = pd.to_numeric(cached.loc[common, 'volume'], errors='coerce')
+        b = pd.to_numeric(fresh.loc[common, 'volume'], errors='coerce')
+        if a.isna().any() or b.isna().any():
+            return False
+        if float((a - b).abs().max()) > OVERLAP_VOLUME_TOL:
+            return False
+    return True
+
+
+def _merge_incremental(cached, fresh):
+    """旧缓存 + 近端增量：按日期去重保留新值，升序；旧历史一根不丢。"""
+    merged = pd.concat([cached, fresh])
+    merged = merged[~merged.index.duplicated(keep='last')]
+    return merged.sort_index()
+
+
 def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare'):
     """获取股票日线数据（前复权）。
 
@@ -170,7 +242,10 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
       非交易日不再无谓触网（原实现用 today-1，周日在周六→必然触网失败再回退）；
     * 缓存命中时**仍按 start_date 截取**（原实现完全忽略该参数）；
     * 写盘一律写**未截断的全量**（原实现把 start 过滤后的子集写回，
-      一次 `--start 2024` 就会把 2020–2023 的缓存永久削掉）。
+      一次 `--start 2024` 就会把 2020–2023 的缓存永久削掉）；
+    * 未指定 start_date 时按**全量历史**取数（FULL_HISTORY_START），不再被
+      适配器默认的 2020-01-01 截断；过期缓存走近端增量 + 合并，绝不写回更短的
+      缓存（详见上面 CACHE_OVERLAP_DAYS 一节的不变量）。
     """
     cache_file = os.path.join(DATA_DIR, f'stock_{symbol}_{adjust}.csv')
     _reset_fetch_info(source)
@@ -206,27 +281,59 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
     # 后果：东财节点一封 IP，整条取数链就死掉，尽管新浪通道完全可用
     # （实测 Hermes 环境：ak.stock_zh_a_daily 返回正常，东财 TCP 层被拒）。
     # 现改为走渠道池，任一通道成功即返回，全部失败才回退旧缓存。
-    print(f"正在拉取 {symbol} 历史数据 (渠道池) ...", file=sys.stderr)
+    # 取数窗口：冷启动拉全量；过期缓存只拉近端窗口，拿回后再与旧缓存比对/合并。
+    incremental = _stale_cache is not None and not _stale_cache.empty
+    if incremental:
+        last_cached = pd.Timestamp(_stale_cache.index[-1])
+        fetch_start = (last_cached - pd.Timedelta(days=CACHE_OVERLAP_DAYS)).strftime('%Y%m%d')
+    else:
+        fetch_start = FULL_HISTORY_START
+
+    print(f"正在拉取 {symbol} 历史数据 (渠道池，起 {fetch_start}) ...", file=sys.stderr)
     raw = None
     used_source = None
     try:
         raw, used_source = _STOCK_DATA_SOURCE_POOL.fetch(
-            symbol, start_date, adjust, preferred=_SOURCE_PREFERENCE.get(source)
+            symbol, fetch_start, adjust, preferred=_SOURCE_PREFERENCE.get(source)
         )
     except Exception as e:
         print(f"渠道池调用异常：{e}", file=sys.stderr)
 
     if raw is not None and not raw.empty:
         try:
-            full = raw
-            if 'date' not in full.columns:
-                full = _normalize_daily_df(full)
-            full = full.copy()
-            full['date'] = pd.to_datetime(full['date'])
-            full = full.set_index('date').sort_index()
-            for col in ('open', 'high', 'low', 'close', 'volume'):
-                if col in full.columns:
-                    full[col] = pd.to_numeric(full[col], errors='coerce')
+            full = _prepare_indexed_frame(raw)
+            if incremental:
+                consistent = _overlap_matches(_stale_cache, full)
+                if consistent is True:
+                    full = _merge_incremental(_stale_cache, full)
+                else:
+                    # 无法确认与旧缓存同一复权基准 → 从缓存首日全量重取、整体替换。
+                    reason = '重叠段不一致' if consistent is False else '与旧缓存无重叠'
+                    print(f"[WARN] {symbol} 增量{reason}，改为从缓存首日 "
+                          f"{pd.Timestamp(_stale_cache.index[0]).date()} 全量重取", file=sys.stderr)
+                    raw2, used2 = None, None
+                    try:
+                        raw2, used2 = _STOCK_DATA_SOURCE_POOL.fetch(
+                            symbol, pd.Timestamp(_stale_cache.index[0]).strftime('%Y%m%d'),
+                            adjust, preferred=_SOURCE_PREFERENCE.get(source))
+                    except Exception as e:
+                        print(f"渠道池全量重取异常：{e}", file=sys.stderr)
+                    if raw2 is not None and not raw2.empty:
+                        full = _prepare_indexed_frame(raw2)
+                        used_source = used2 or used_source
+                    else:
+                        print(f"全量重取失败，回退到本地旧缓存", file=sys.stderr)
+                        _mark_degraded(f"{symbol} 增量{reason}且全量重取失败，回退到本地旧缓存",
+                                       _stale_cache)
+                        return _apply_start(_stale_cache, start_date)
+
+            # 硬不变量：写盘不得比原缓存短（历史丢失不可逆，宁可保留旧缓存）
+            if incremental and _stale_cache is not None and len(full) < len(_stale_cache):
+                _mark_degraded(f"{symbol} 拉取结果比本地缓存短"
+                               f"（{len(full)} < {len(_stale_cache)} 行），保留原缓存",
+                               _stale_cache)
+                return _apply_start(_stale_cache, start_date)
+
             # 写盘用全量，返回用截断窗口
             _write_cache(full, cache_file, f'stock_{symbol}')
             _record_fetch(used_source or 'unknown', False,
