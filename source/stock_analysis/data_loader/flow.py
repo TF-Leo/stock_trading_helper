@@ -17,12 +17,24 @@
 
 摘要口径（写死在这里，供 README 与测试共用）
 --------------------------------------------
-* ``main_net_5d`` / ``main_net_20d``：最近 5 / 20 个**交易日**的主力净流入
-  之和，单位**元**（东财原始单位，不做亿元换算，避免调用方二次乘错）。
-  行数不足 5 / 20 时该项为 ``None``（不拿更短的窗口冒充 20 日）。
-* ``direction``：``main_net_5d`` 的符号 —— ``inflow`` / ``outflow`` / ``flat``；
-  5 日不可用时退回 ``main_net_20d`` 的符号，``direction_basis`` 如实标注
-  用的是哪一个（``main_net_5d_sign`` / ``main_net_20d_sign``）。
+缓存里必须带 ``source`` / ``caliber``，摘要按口径分支，**两种口径绝不混用**：
+
+* ``caliber=eastmoney_main_net``（``source=eastmoney_push2his``）：
+  ``main_net_5d`` / ``main_net_20d`` 是最近 5 / 20 个**交易日**的主力净流入
+  之和（超大单 + 大单），单位**元**；``net_5d`` / ``net_20d`` 恒为 ``None``。
+* ``caliber=sina_total_net``（``source=sina_fund_flow_backup``，东财整域不可达
+  时的备胎）：新浪只有 ``netamount``（**当日总净流入**，没有主力/大单拆分），
+  因此 ``net_5d`` / ``net_20d`` 是总净流入之和，``main_net_5d`` /
+  ``main_net_20d`` **恒为 ``None``**，绝不把总净流入冒充成主力净流入。
+* 两种口径不可直接比较（字段、窗口、含义都不同）；调用方必须先看 ``caliber``。
+
+其余语义
+--------
+* 行数不足 5 / 20 时对应窗口为 ``None``（不拿更短的窗口冒充 20 日）。
+* ``direction``：可用窗口的符号 —— ``inflow`` / ``outflow`` / ``flat``；
+  ``direction_basis`` 如实标注用的是哪个字段与窗口
+  （``main_net_5d_sign`` / ``main_net_20d_sign`` /
+  ``net_5d_sign`` / ``net_20d_sign``）。
 * ``as_of``：本次摘要实际用到的**最后一根资金流日期**（不是文件 mtime，
   也不是运行日期）。
 * ``pub_lag_days=1``：与 ``docs/P1_EVIDENCE_PLAN.md`` §3.3 一致 —— 当日资金流
@@ -44,6 +56,9 @@ FLOW_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
                         "data", "flow")
 
 FLOW_SOURCE = "eastmoney_push2his"
+SOURCE_SINA = "sina_fund_flow_backup"
+CALIBER_EASTMONEY = "eastmoney_main_net"
+CALIBER_SINA = "sina_total_net"
 FLOW_SCHEMA_VERSION = "1.0"
 PUB_LAG_DAYS = 1
 
@@ -54,9 +69,10 @@ SUMMARY_WINDOWS = (5, 20)
 #: ``evidence.flow`` 的键集合。成功 / 不可用 / 错误路径必须完全一致，
 #: 保证 G35 的「错误路径与成功路径键同构」在新增子块上继续成立。
 FLOW_KEYS = (
-    "available", "code", "source", "as_of", "fetched_at", "rows",
-    "pub_lag_days", "main_net_5d", "main_net_20d", "direction",
-    "direction_basis", "stale", "expected_date", "expected_source", "reason",
+    "available", "code", "source", "caliber", "as_of", "fetched_at", "rows",
+    "pub_lag_days", "main_net_5d", "main_net_20d", "net_5d", "net_20d",
+    "direction", "direction_basis", "stale", "expected_date",
+    "expected_source", "reason",
 )
 
 REASON_TEXT = {
@@ -129,6 +145,26 @@ def _expected_trade_date(now=None, as_of=None):
     return candidate, "estimate"
 
 
+def _resolve_caliber(payload):
+    """返回 ``(source, caliber)``；口径未知或自相矛盾时返回 ``(None, None)``。
+
+    P1-2 旧缓存没有 ``caliber`` 字段：``source`` 为新浪备胎则按新浪口径，
+    其余按东财口径（旧版只会写东财缓存）。显式口径优先；**绝不**根据
+    「行里恰好有哪个字段」去猜口径。
+    """
+    source = str(payload.get("source") or FLOW_SOURCE)
+    caliber = payload.get("caliber")
+    if caliber in (None, ""):
+        return source, (CALIBER_SINA if source == SOURCE_SINA
+                        else CALIBER_EASTMONEY)
+    caliber = str(caliber)
+    if caliber == CALIBER_SINA and source == SOURCE_SINA:
+        return source, CALIBER_SINA
+    if caliber == CALIBER_EASTMONEY and source != SOURCE_SINA:
+        return source, CALIBER_EASTMONEY
+    return None, None
+
+
 def read_cache(code, flow_dir=None):
     """读取并校验 ``flow/<code>.json``；不可用时返回 ``None``（不抛异常）。"""
     path = _cache_path(_normalize_code(code), flow_dir)
@@ -139,23 +175,28 @@ def read_cache(code, flow_dir=None):
         return None
     if not isinstance(payload, dict):
         return None
+    source, caliber = _resolve_caliber(payload)
+    if source is None:
+        return None
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
         return None
+    field = "net_amount" if caliber == CALIBER_SINA else "main_net"
     clean = []
     for row in rows:
         if not isinstance(row, dict):
             return None
-        day, main_net = row.get("date"), row.get("main_net")
+        day = row.get("date")
         try:
             day = _dt.date.fromisoformat(str(day)[:10]).isoformat()
-            main_net = float(main_net)
+            value = float(row.get(field))
         except Exception:
             return None
-        item = {"date": day, "main_net": main_net}
-        clean.append(item)
+        clean.append({"date": day, field: value})
     clean.sort(key=lambda r: r["date"])
     payload["rows"] = clean
+    payload["source"] = source
+    payload["caliber"] = caliber
     return payload
 
 
@@ -166,12 +207,15 @@ def empty_flow_block(code=None, reason="cache_missing", expected_date=None,
         "available": False,
         "code": None if code is None else str(code),
         "source": None,
+        "caliber": None,
         "as_of": None,
         "fetched_at": None,
         "rows": 0,
         "pub_lag_days": PUB_LAG_DAYS,
         "main_net_5d": None,
         "main_net_20d": None,
+        "net_5d": None,
+        "net_20d": None,
         "direction": None,
         "direction_basis": None,
         "stale": None,
@@ -181,11 +225,17 @@ def empty_flow_block(code=None, reason="cache_missing", expected_date=None,
     }
 
 
-def _sum(rows, window):
-    """窗口内主力净流入之和；行数不足时返回 ``None``（不缩短窗口冒充）。"""
+def _sum(rows, window, field="main_net"):
+    """窗口内净流入之和；行数不足时返回 ``None``（不缩短窗口冒充）。"""
     if len(rows) < window:
         return None
-    return round(sum(r["main_net"] for r in rows[-window:]), 2)
+    return round(sum(r[field] for r in rows[-window:]), 2)
+
+
+def _direction(value, basis):
+    if value is None:
+        return None, None
+    return ("flat" if value == 0 else ("inflow" if value > 0 else "outflow")), basis
 
 
 def summarize_flow(code, as_of=None, flow_dir=None, now=None):
@@ -210,15 +260,25 @@ def summarize_flow(code, as_of=None, flow_dir=None, now=None):
             return None
 
     last_date = rows[-1]["date"]
-    sums = {w: _sum(rows, w) for w in SUMMARY_WINDOWS}
-    if sums[5] is not None:
-        direction_basis = "main_net_5d_sign"
-        direction = "flat" if sums[5] == 0 else ("inflow" if sums[5] > 0 else "outflow")
-    elif sums[20] is not None:
-        direction_basis = "main_net_20d_sign"
-        direction = "flat" if sums[20] == 0 else ("inflow" if sums[20] > 0 else "outflow")
+    caliber = payload["caliber"]
+    if caliber == CALIBER_SINA:
+        # 新浪只有总净流入：只写 net_*，main_net_* 显式 null（绝不冒充）。
+        sums = {w: _sum(rows, w, "net_amount") for w in SUMMARY_WINDOWS}
+        main_5d = main_20d = None
+        net_5d, net_20d = sums[5], sums[20]
+        if net_5d is not None:
+            direction, direction_basis = _direction(net_5d, "net_5d_sign")
+        else:
+            direction, direction_basis = _direction(net_20d, "net_20d_sign")
     else:
-        direction_basis, direction = None, None
+        # 东财主力口径：仍只写 main_net_*，net_* 显式 null。
+        sums = {w: _sum(rows, w, "main_net") for w in SUMMARY_WINDOWS}
+        net_5d = net_20d = None
+        main_5d, main_20d = sums[5], sums[20]
+        if main_5d is not None:
+            direction, direction_basis = _direction(main_5d, "main_net_5d_sign")
+        else:
+            direction, direction_basis = _direction(main_20d, "main_net_20d_sign")
 
     if as_of is not None:
         try:
@@ -238,12 +298,15 @@ def summarize_flow(code, as_of=None, flow_dir=None, now=None):
         "available": True,
         "code": _normalize_code(code),
         "source": str(payload.get("source") or FLOW_SOURCE),
+        "caliber": caliber,
         "as_of": last_date,
         "fetched_at": payload.get("fetched_at"),
         "rows": len(rows),
         "pub_lag_days": PUB_LAG_DAYS,
-        "main_net_5d": sums[5],
-        "main_net_20d": sums[20],
+        "main_net_5d": main_5d,
+        "main_net_20d": main_20d,
+        "net_5d": net_5d,
+        "net_20d": net_20d,
         "direction": direction,
         "direction_basis": direction_basis,
         "stale": stale,

@@ -91,6 +91,13 @@ SELECTION = [
      "### 4.5 个股资金流（120日，日级）", [
          "stock_fund_flow_120d",
     ]),
+    # P1-2 备胎（issue #39）：东财整域 RST 时改走新浪日度资金流。
+    # 该函数只有 netamount（总净流入），没有主力/大单拆分 —— 口径必须隔离
+    # （source=sina_fund_flow_backup / caliber=sina_total_net），不得混入 main_net。
+    ("备用源速查：新浪日度资金流", "section",
+     "## 备用源速查 & 降级策略（东财/主源被封时用）", [
+         "fund_flow_backup",
+    ]),
     # §6.8 ST / *ST 当日名单。上游在東财不可达时退到 baostock；本任务明确
     # 不引入新依赖，生成时把该兜底替换为显式 RuntimeError（见 build()）。
     ("§6.8 ST / *ST 名单", "section",
@@ -117,7 +124,7 @@ PREAMBLE = """\
 # snapshot: vendor/a-stock-data/SKILL.md
 # sha256:   {skill_sha}
 # license:  Apache-2.0 (vendor/a-stock-data/LICENSE)
-# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §4.5 日级资金流 / §6.8 ST 名单
+# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §4.5 日级资金流 / 备用源速查 fund_flow_backup / §6.8 ST 名单
 # manifest: source/stock_analysis/data_sources/_astock_manifest.json
 # body_sha256: {body_sha}
 #
