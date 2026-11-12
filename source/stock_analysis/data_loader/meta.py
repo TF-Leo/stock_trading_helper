@@ -177,19 +177,37 @@ def _write_cache(df, cache_file, label):
 # 修复后的不变量：
 #   1. 冷启动（无缓存）→ 从 FULL_HISTORY_START 拉全量；
 #   2. 过期缓存 → 只拉「缓存末日 - CACHE_OVERLAP_DAYS」的近端窗口（通常 1 个
-#      腾讯分页窗口），与旧缓存的重叠交易日比对后合并（新值覆盖旧值）；
-#   3. 重叠不一致（除权/复权基准变化）或完全无重叠 → 从**缓存首日**全量重取
-#      （不是从 1990，避免无谓的 19 次分页）；
+#      腾讯分页窗口），按 _classify_overlap 分类后合并；
+#   3. 分类为 basis_changed / no_overlap → 从**缓存首日**全量重取（不是从 1990，
+#      避免无谓的 19 次分页）；
 #   4. 全量重取后按**覆盖范围**而非行数决定是否接受：
-#      * 起始日 <= 缓存起始日（覆盖起点）→ 接受。重叠一致则与旧缓存取并集
-#        （保留源端缺失的历史根，如腾讯缺 2007-09-04）；重叠不一致说明复权
-#        基准已变，则以新基准整体替换并 warning；无重叠但覆盖起点则直接用新结果。
+#      * 起始日 <= 缓存起始日（覆盖起点）→ 接受。
+#        - consistent / source_noise → 与旧缓存取并集，**重叠日保留旧缓存值**，
+#          只追加缓存末日之后的新行（保留源端缺失的历史根，如腾讯缺 2007-09-04；
+#          源间噪声不污染旧基准）；
+#        - basis_changed（系统性平移）→ 以新基准整体替换并 warning；
+#        - no_overlap（但覆盖起点）→ 直接用新结果。
 #      * 起始日 >  缓存起始日（真正的历史截断）→ 保留原缓存并报 degraded。
 #      行数变少本身不再是拒绝理由：少 1 根可能只是源端缺点，缓存必须能前进。
 # ---------------------------------------------------------------------------
 CACHE_OVERLAP_DAYS = 40       # 近端回看天数（覆盖春节等长假，保证有重叠交易日）
 OVERLAP_PRICE_TOL = 0.01      # 重叠段价格容差（元；4 位小数舍入）
 OVERLAP_VOLUME_TOL = 100.0    # 重叠段成交量容差（股；腾讯按整手取整，上游 #57）
+# 源间噪声 vs 复权基准变化（2026-11-12，PR #9 最后一次逻辑修正）
+#
+# 判据不再是「任一重叠日超差 = 基准已变」。实盘 600519 缓存历史来自新浪，腾讯
+# 全量重取在 6041 个重叠交易日里有 12 天（0.2%）价格差 0.1–0.72 元 —— 这是两个
+# 数据源的舍入/口径噪声，不是除权导致的 qfq 整体重算。旧布尔判定把这种缓存整体
+# 替换成腾讯 6040 根，丢掉新浪独有的 2007-09-04（策略由唐奇安变 CMF）。
+#
+#   consistent   : 所有重叠日价格差 <= OVERLAP_PRICE_TOL 且成交量差 <= OVERLAP_VOLUME_TOL
+#   source_noise : 超差日期占比 <= OVERLAP_NOISE_MAX_EXCEED_PCT（1%）且
+#                  超差日最大相对差 |Δ|/|缓存价| <= OVERLAP_NOISE_MAX_REL（0.5%）
+#                  —— 少数日子的源间差异，旧历史仍属同一基准，取并集并保留旧值
+#   basis_changed: 超差占比 >1% 或最大相对差 >0.5%（系统性平移，如除权后整体 ×0.98）
+#   no_overlap   : 无共同交易日
+OVERLAP_NOISE_MAX_EXCEED_PCT = 1.0   # 超差日期占比上限（百分数）
+OVERLAP_NOISE_MAX_REL = 0.005        # 超差日最大相对价格差上限（0.5%）
 # 冷启动下限：1990-01-01 早于 A 股任一标的上市日，等价「全量」。
 # 用 YYYYMMDD 是因为 eastmoney/sina 通道收这个格式（astock 侧会转成 1990-01-01）。
 FULL_HISTORY_START = '19900101'
@@ -209,53 +227,95 @@ def _prepare_indexed_frame(raw):
     return full[~full.index.duplicated(keep='last')]
 
 
-def _overlap_matches(cached, fresh):
-    """重叠交易日上的价格/成交量是否一致。
+def _overlap_stats(cached, fresh):
+    """重叠交易日的超差统计（向量化）。
 
-    返回 True / False / None（无重叠，无法判定）。None 与 False 在调用方都按
-    「不能安全拼接」处理：前复权因子会在除权/分红后整体重算，把两段不同基准的
-    序列直接拼接会让历史收益静默失真。
+    返回 dict：
+      * ``common``  —— 重叠交易日数；
+      * ``exceed``  —— 价格（任一 OHLC）或成交量超差的日数；
+      * ``max_rel`` —— 超差日的最大相对价格差 ``|Δ| / |cache 价|``（无超差为 0）。
+
+    相对差只在超过**绝对**容差的日子上计算：未超容差的日子不参与，避免低价股
+    因为 0.005 元的正常舍入就被判成「相对差 1%」。
+    任一侧 NaN 视为超差且相对差 = inf（无法验证的基准不能并入旧序列）。
     """
     common = cached.index.intersection(fresh.index)
     if len(common) == 0:
-        return None
+        return {'common': 0, 'exceed': 0, 'max_rel': 0.0}
+
+    a = cached.loc[common]
+    b = fresh.loc[common]
+    bad = pd.Series(False, index=common)
+    rel = pd.Series(0.0, index=common)
+
     for col in ('open', 'high', 'low', 'close'):
         if col not in cached.columns or col not in fresh.columns:
             continue
-        a = pd.to_numeric(cached.loc[common, col], errors='coerce')
-        b = pd.to_numeric(fresh.loc[common, col], errors='coerce')
-        if a.isna().any() or b.isna().any():
-            return False
-        if float((a - b).abs().max()) > OVERLAP_PRICE_TOL:
-            return False
+        ca = pd.to_numeric(a[col], errors='coerce').astype(float)
+        cb = pd.to_numeric(b[col], errors='coerce').astype(float)
+        diff = (ca - cb).abs()
+        nan = ca.isna() | cb.isna()
+        over = diff > OVERLAP_PRICE_TOL
+        bad = bad | nan | over
+        with np.errstate(divide='ignore', invalid='ignore'):
+            day_rel = diff / ca.abs()
+        day_rel = day_rel.where(over & ~nan, 0.0)
+        day_rel = day_rel.mask(nan | ((ca.abs() == 0) & over), np.inf)
+        rel = np.maximum(rel, day_rel.fillna(0.0))
+
     if 'volume' in cached.columns and 'volume' in fresh.columns:
-        a = pd.to_numeric(cached.loc[common, 'volume'], errors='coerce')
-        b = pd.to_numeric(fresh.loc[common, 'volume'], errors='coerce')
-        if a.isna().any() or b.isna().any():
-            return False
-        if float((a - b).abs().max()) > OVERLAP_VOLUME_TOL:
-            return False
-    return True
+        va = pd.to_numeric(a['volume'], errors='coerce').astype(float)
+        vb = pd.to_numeric(b['volume'], errors='coerce').astype(float)
+        bad = bad | va.isna() | vb.isna() | ((va - vb).abs() > OVERLAP_VOLUME_TOL)
+
+    exceed = int(bad.sum())
+    return {
+        'common': int(len(common)),
+        'exceed': exceed,
+        'max_rel': float(rel.max()) if exceed else 0.0,
+    }
 
 
-def _merge_incremental(cached, fresh):
-    """旧缓存 + 近端增量：按日期去重保留新值，升序；旧历史一根不丢。"""
-    merged = pd.concat([cached, fresh])
-    merged = merged[~merged.index.duplicated(keep='last')]
-    return merged.sort_index()
+def _classify_overlap(cached, fresh, stats=None):
+    """重叠段分类：'consistent' / 'source_noise' / 'basis_changed' / 'no_overlap'。
+
+    旧实现是布尔 ``_overlap_matches``：只要有一天差 >0.01 就判「基准已变」，
+    把两个数据源之间 0.2% 的噪声误当成除权重算，导致旧缓存被整体替换、独有
+    历史根丢失。现按**超差占比 + 最大相对差**区分源间噪声与系统性基准平移。
+
+    ``stats``（可选 dict）会被填入 ``_overlap_stats`` 的统计，供调用方打日志。
+    """
+    s = _overlap_stats(cached, fresh)
+    if stats is not None:
+        stats.update(s)
+    if s['common'] == 0:
+        return 'no_overlap'
+    if s['exceed'] == 0:
+        return 'consistent'
+    # 用整数百分比比较，避开 1/100 这类浮点边界误差（恰好 1% 应判 source_noise）
+    within_ratio = (s['exceed'] * 100.0
+                    <= OVERLAP_NOISE_MAX_EXCEED_PCT * s['common'])
+    if within_ratio and s['max_rel'] <= OVERLAP_NOISE_MAX_REL:
+        return 'source_noise'
+    return 'basis_changed'
 
 
-def _merge_with_cache(cached, fresh, label):
+def _merge_with_cache(cached, fresh, label, cls='consistent'):
     """旧缓存与本次结果取并集，返回 (merged, 只存在于旧缓存的行数)。
 
-    并集语义：fresh 覆盖同一天的用新值，fresh 缺失而 cached 有的历史根保留
-    （腾讯不复权日线缺 2007-09-04 这类单点缺口不因刷新增量而丢失）。
+    并集语义（2026-11-12 修正）：**重叠日保留旧缓存值**，只追加缓存末日之后
+    的新行；旧缓存独有的历史根保留（腾讯不复权日线缺 2007-09-04 这类单点缺口
+    不因刷新增量而丢失）。不用新值覆盖重叠日，是因为本次来源可能与旧缓存历史
+    来自不同渠道（新浪历史 + 腾讯刷新），两套基准存在 0.01–0.72 元的源间噪声；
+    保留旧值可让既有序列维持单一基准，也满足「源噪声不污染旧历史」的要求。
     """
-    merged = _merge_incremental(cached, fresh)
+    new_tail = fresh[fresh.index > cached.index[-1]]
+    merged = pd.concat([cached, new_tail])
+    merged = merged[~merged.index.duplicated(keep='first')].sort_index()
     kept = int(len(cached.index.difference(fresh.index)))
-    if kept > 0:
-        print(f"[WARN] {label} 增量合并：保留旧缓存 {kept} 行"
-              f"（本次源端 {len(fresh)} 行，合并后 {len(merged)} 行）", file=sys.stderr)
+    print(f"[WARN] {label} 增量合并：保留旧缓存 {kept} 行"
+          f"（本次源端 {len(fresh)} 行，合并后 {len(merged)} 行；重叠分类={cls}）",
+          file=sys.stderr)
     return merged, kept
 
 
@@ -331,18 +391,22 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
             merged_from_cache = False
             cache_rows_kept = 0
             if incremental:
-                consistent = _overlap_matches(_stale_cache, full)
-                if consistent is True:
+                cls_stats = {}
+                cls = _classify_overlap(_stale_cache, full, cls_stats)
+                if cls in ('consistent', 'source_noise'):
                     full, cache_rows_kept = _merge_with_cache(
-                        _stale_cache, full, f'stock_{symbol}')
+                        _stale_cache, full, f'stock_{symbol}', cls)
                     merged_from_cache = True
                 else:
                     # 近端窗口无法与旧缓存直接拼接 → 从缓存首日全量重取。
                     # 是否接受这份全量结果，取决于它**是否覆盖缓存起始日**
                     # （覆盖范围不变量），而不是行数多少：行数更少可能只是
                     # 源端少一根（如腾讯缺 2007-09-04），不代表历史被截断。
-                    reason = '重叠段不一致' if consistent is False else '与旧缓存无重叠'
-                    print(f"[WARN] {symbol} 增量{reason}，改为从缓存首日 "
+                    reason = ('重叠段复权基准已变' if cls == 'basis_changed'
+                              else '与旧缓存无重叠')
+                    print(f"[WARN] {symbol} 增量{reason}（分类={cls}，"
+                          f"重叠 {cls_stats['common']} 日、超差 {cls_stats['exceed']} 日），"
+                          f"改为从缓存首日 "
                           f"{pd.Timestamp(_stale_cache.index[0]).date()} 全量重取", file=sys.stderr)
                     raw2, used2 = None, None
                     try:
@@ -364,21 +428,28 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
                                 f"（比本地缓存短或缺根），保留原缓存",
                                 _stale_cache)
                             return _apply_start(_stale_cache, start_date)
-                        recon = _overlap_matches(_stale_cache, fresh_full)
-                        if recon is False:
-                            # 复权基准已变（除权/分红后整体重算）：新基准才是正确
+                        recon_stats = {}
+                        recon = _classify_overlap(_stale_cache, fresh_full, recon_stats)
+                        if recon == 'basis_changed':
+                            # 系统性平移（除权/分红后 qfq 整体重算）：新基准才是正确
                             # 基准，整体采用新结果，绝不把旧基准混进序列。
                             print(f"[WARN] {symbol} 全量重取与旧缓存重叠段不一致"
-                                  f"（复权基准已变），采用新基准并整体替换旧缓存",
+                                  f"（复权基准已变，分类={recon}，重叠 "
+                                  f"{recon_stats['common']} 日、超差 {recon_stats['exceed']} 日、"
+                                  f"最大相对差 {recon_stats['max_rel']:.4%}），"
+                                  f"采用新基准并整体替换旧缓存",
                                   file=sys.stderr)
                             full = fresh_full
-                        elif recon is True:
-                            # 覆盖缓存起始日且重叠一致 → 取并集，保留源端缺失的历史根
+                        elif recon in ('consistent', 'source_noise'):
+                            # 覆盖缓存起始日，且差异只是源间噪声（或完全一致）
+                            # → 取并集，保留源端缺失的历史根与旧值。
                             full, cache_rows_kept = _merge_with_cache(
-                                _stale_cache, fresh_full, f'stock_{symbol}')
+                                _stale_cache, fresh_full, f'stock_{symbol}', recon)
                             merged_from_cache = True
                         else:
                             # 无重叠但已确认覆盖缓存起始日（理论边界）→ 用新结果
+                            print(f"[INFO] {symbol} 全量重取与旧缓存无重叠"
+                                  f"（分类={recon}），采用新结果", file=sys.stderr)
                             full = fresh_full
                     else:
                         print(f"全量重取失败，回退到本地旧缓存", file=sys.stderr)

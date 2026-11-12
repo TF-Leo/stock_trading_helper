@@ -746,3 +746,198 @@ def test_basis_change_adopts_new_full_and_warns(tmp_path, monkeypatch, capsys):
     assert "复权基准已变" in capsys.readouterr().err
     written = pd.read_csv(cache_file, index_col="date", parse_dates=True)
     assert written["close"].iloc[0] == pytest.approx(200.0)
+
+
+# ---------------------------------------------------------------------------
+# 源间噪声 vs 复权基准变化（2026-11-12，PR #9 最后一次逻辑修正）
+#
+# 事故：实盘 600519 缓存历史来自新浪，腾讯全量重取在 6041 个重叠交易日里只有
+# 12 天（0.2%）价格差 0.1–0.72 元（最大相对差远小于 1%）。旧布尔判定把这种
+# **源间噪声**当成除权后的基准重算，整体替换缓存，丢掉新浪独有的 2007-09-04，
+# 策略由唐奇安(30/20) 变成 CMF。正确判据是「超差日期占比 + 最大相对差」。
+# ---------------------------------------------------------------------------
+_PX = ["open", "high", "low", "close"]
+
+
+def _shift_days(frame, days, delta):
+    out = frame.copy()
+    for day in days:
+        out.loc[day, _PX] = out.loc[day, _PX] + delta
+    return out
+
+
+def test_classify_overlap_four_way_and_percentage_boundary():
+    """三分类 + 百分比边界：恰好 1% 是源噪声，略超 1% 是基准变化。"""
+    from stock_analysis.data_loader import meta
+
+    dates = pd.bdate_range("2020-01-01", periods=100)
+    cached = _ohlcv_frame(dates, base=1000.0, step=0.0)  # 恒价 1000，相对差好算
+
+    # 全部一致
+    assert meta._classify_overlap(cached, cached.copy()) == "consistent"
+
+    # 无共同日期
+    other = _ohlcv_frame(pd.bdate_range("2021-01-01", periods=50),
+                         base=1000.0, step=0.0)
+    assert meta._classify_overlap(cached, other) == "no_overlap"
+
+    # 恰好 1%（1/100）、相对差 0.1%（1.0/1000）→ source_noise
+    one = _shift_days(cached, [dates[10]], 1.0)
+    stats = {}
+    assert meta._classify_overlap(cached, one, stats) == "source_noise"
+    assert stats["common"] == 100 and stats["exceed"] == 1
+    assert stats["max_rel"] == pytest.approx(1.0 / 999.0)  # low 列基数 999
+
+    # 略超 1%（2/100）→ basis_changed
+    two = _shift_days(cached, [dates[10], dates[20]], 1.0)
+    assert meta._classify_overlap(cached, two) == "basis_changed"
+
+    # 占比恰好 1%，但相对差 10%（>0.5%）→ 系统性平移，basis_changed
+    big = _shift_days(cached, [dates[10]], 100.0)
+    assert meta._classify_overlap(cached, big) == "basis_changed"
+
+
+def test_source_noise_full_refetch_merges_union_and_keeps_old_values(
+        tmp_path, monkeypatch, capsys):
+    """12/6040 源间噪声 + 源端缺 2007-09-04 → source_noise 并集，旧值不回写。"""
+    from stock_analysis.data_loader import meta
+
+    monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
+    cache_dates = pd.bdate_range("2001-08-27", periods=6041)
+    cached = _write_cache(tmp_path, cache_dates)
+    cache_file = tmp_path / "stock_600519_qfq.csv"
+
+    drop_day = pd.Timestamp("2007-09-04")  # 腾讯缺失、新浪独有
+    assert drop_day in cache_dates
+    fresh_dates = cache_dates.drop(drop_day)                 # 全量重取 6040 行
+    fresh = cached.loc[fresh_dates].copy()
+    noise_days = fresh_dates[[100, 600, 1100, 1600, 2100, 2600,
+                             3100, 3600, 4100, 4600, 5100, 5600]]
+    deltas = [0.10, 0.12, 0.15, 0.18, 0.20, 0.24,
+              0.30, 0.36, 0.42, 0.50, 0.60, 0.72]
+    for day, delta in zip(noise_days, deltas):
+        fresh.loc[day, _PX] = fresh.loc[day, _PX] + delta
+
+    stats = {}
+    assert meta._classify_overlap(cached, fresh, stats) == "source_noise"
+    assert stats["common"] == 6040 and stats["exceed"] == 12
+    assert stats["max_rel"] <= meta.OVERLAP_NOISE_MAX_REL
+
+    new_day = pd.bdate_range(cache_dates[-1] + pd.Timedelta(days=1), periods=1)[0]
+    near = _ohlcv_frame([new_day])  # 近端窗口与旧缓存无重叠 → 触发全量重取
+    cache_first = cache_dates[0].strftime("%Y%m%d")
+    near_start = (cache_dates[-1] - pd.Timedelta(days=meta.CACHE_OVERLAP_DAYS)
+                  ).strftime("%Y%m%d")
+
+    def responder(start):
+        if start == cache_first:
+            return fresh, "astock_tencent"
+        return near, "astock_tencent"
+
+    monkeypatch.setattr(meta, "_expected_latest_trade_date",
+                        lambda now=None: new_day.date())
+    pool = _RecordingPool(responder)
+    monkeypatch.setattr(meta, "_STOCK_DATA_SOURCE_POOL", pool)
+
+    out = meta.get_stock_daily("600519", start_date=None, source="akshare")
+    info = meta.last_fetch_info()
+    err = capsys.readouterr().err
+
+    assert pool.calls == [near_start, cache_first]  # 增量 + 全量重取各一次
+    assert len(out) == 6041                          # 并集，不是腾讯的 6040
+    assert drop_day in out.index                     # 2007-09-04 保留
+    assert info["degraded"] is False
+    assert info["merged_from_cache"] is True
+    assert info["cache_rows_kept"] == 1              # 只有 2007-09-04 旧缓存独有
+    assert "重叠分类=source_noise" in err
+    assert "保留旧缓存 1 行" in err
+
+    # 重叠日保留旧缓存值（源噪声不混进新浪基准），不是源端的新值
+    noise_day = noise_days[0]
+    assert out.loc[noise_day, "close"] == pytest.approx(cached.loc[noise_day, "close"])
+    assert abs(out.loc[noise_day, "close"] - fresh.loc[noise_day, "close"]) > 0.01
+
+    written = pd.read_csv(cache_file, index_col="date", parse_dates=True)
+    assert len(written) == 6041
+    assert drop_day in written.index
+    assert written.loc[noise_day, "close"] == pytest.approx(cached.loc[noise_day, "close"])
+
+
+def test_basis_changed_systematic_shift_replaces_full(tmp_path, monkeypatch, capsys):
+    """重叠段历史价 ×0.98（>50% 日期超差、相对差 2%）→ basis_changed 整体替换。"""
+    from stock_analysis.data_loader import meta
+
+    monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
+    cache_dates = pd.bdate_range("2000-01-03", periods=6000)
+    cached = _write_cache(tmp_path, cache_dates)
+    cache_file = tmp_path / "stock_600519_qfq.csv"
+
+    new_day = pd.bdate_range(cache_dates[-1] + pd.Timedelta(days=1), periods=1)[0]
+    replacement = cached.copy()
+    replacement[_PX] = replacement[_PX] * 0.98       # 除权/复权后整体平移
+    replacement = pd.concat(
+        [replacement, _ohlcv_frame([new_day], base=float(replacement["close"].iloc[-1]) * 0.98)])
+
+    near = _ohlcv_frame([new_day])
+    cache_first = cache_dates[0].strftime("%Y%m%d")
+    near_start = (cache_dates[-1] - pd.Timedelta(days=meta.CACHE_OVERLAP_DAYS)
+                  ).strftime("%Y%m%d")
+
+    def responder(start):
+        if start == cache_first:
+            return replacement, "astock_tencent"
+        return near, "astock_tencent"
+
+    monkeypatch.setattr(meta, "_expected_latest_trade_date",
+                        lambda now=None: new_day.date())
+    monkeypatch.setattr(meta, "_STOCK_DATA_SOURCE_POOL", _RecordingPool(responder))
+
+    stats = {}
+    assert meta._classify_overlap(cached, replacement, stats) == "basis_changed"
+    assert stats["exceed"] > stats["common"] * 0.5
+    assert stats["max_rel"] > meta.OVERLAP_NOISE_MAX_REL
+
+    out = meta.get_stock_daily("600519", start_date=None, source="akshare")
+    info = meta.last_fetch_info()
+    err = capsys.readouterr().err
+
+    assert len(out) == len(replacement)
+    assert out["close"].iloc[0] == pytest.approx(cached["close"].iloc[0] * 0.98)
+    assert info["degraded"] is False
+    assert info["merged_from_cache"] is False        # 不把旧基准混进新序列
+    assert info["cache_rows_kept"] == 0
+    assert "复权基准已变" in err and "分类=basis_changed" in err
+    written = pd.read_csv(cache_file, index_col="date", parse_dates=True)
+    assert len(written) == len(replacement)
+    assert written["close"].iloc[0] == pytest.approx(cached["close"].iloc[0] * 0.98)
+
+
+def test_consistent_overlap_union_keeps_behavior(tmp_path, monkeypatch, capsys):
+    """全部在容差内 → 并集（行为不变），stderr 报分类与保留行数。"""
+    from stock_analysis.data_loader import meta
+
+    monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
+    cache_dates = pd.bdate_range("2000-01-03", periods=600)
+    cached = _write_cache(tmp_path, cache_dates)
+    last = cache_dates[-1]
+    extra = pd.bdate_range(last + pd.Timedelta(days=1), periods=2)
+    fresh = pd.concat([cached.iloc[-20:].copy(), _ohlcv_frame(extra, base=999.0)])
+
+    monkeypatch.setattr(meta, "_expected_latest_trade_date",
+                        lambda now=None: extra[-1].date())
+    pool = _RecordingPool(lambda start: (fresh.copy(), "astock_tencent"))
+    monkeypatch.setattr(meta, "_STOCK_DATA_SOURCE_POOL", pool)
+
+    out = meta.get_stock_daily("600519", start_date=None, source="akshare")
+    info = meta.last_fetch_info()
+    err = capsys.readouterr().err
+
+    assert pool.calls == [(last - pd.Timedelta(days=meta.CACHE_OVERLAP_DAYS)
+                           ).strftime("%Y%m%d")]  # 只拉近端，不触发全量重取
+    assert len(out) == len(cache_dates) + 2
+    assert out.index[0] == cache_dates[0]
+    assert info["degraded"] is False
+    assert info["merged_from_cache"] is True
+    # 近端窗口只有最后 20 行，其余 580 行只存在于旧缓存（全部保留）
+    assert info["cache_rows_kept"] == 580
+    assert "重叠分类=consistent" in err and "保留旧缓存 580 行" in err
