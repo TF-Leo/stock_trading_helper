@@ -70,7 +70,7 @@ class Instrument:
     name: str
     board: str  # sh_main/sh_star/sz_main/sz_gem/bj/fund/unknown
     price_limit_pct: float
-    is_st: bool
+    is_st: Optional[bool]
     # P0-3（issue #6）：真实交易状态，additive（schema_version 仍为 1.0）。
     # 无法获取时显式 None，绝不把"未知"伪装成 False。
     is_suspended: Optional[bool] = None
@@ -291,6 +291,10 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
         board, price_limit_pct, is_st = classify_board(code)
     except Exception:
         board, price_limit_pct, is_st = 'unknown', None, None
+    # P0-3（issue #17）：取数失败/数据不足发生在交易状态解析之前，is_st 未知
+    # → 显式 null（README 契约：「两者都不可用时为 null，不再默认 false」）。
+    if status in ('data_source_error', 'insufficient_data'):
+        is_st = None
     notes = list(warnings or [])
     if message not in notes:
         notes.insert(0, message)

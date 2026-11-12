@@ -265,8 +265,9 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             code, board, name=name, data_lag_days=fetch_info.get('lag_days'))
         if trading.price_limit_pct is not None:
             price_limit_pct = trading.price_limit_pct
-        if trading.is_st is not None:
-            is_st = trading.is_st
+        # is_st 可能为 None（ST 名单 / 腾讯报价 / 本地名称都不可用）：
+        # 直接透传未知态，绝不保留 classify_board 的静态 False 伪装成"非 ST"。
+        is_st = trading.is_st
         warnings.extend(trading.warnings)
 
     # 运行回测

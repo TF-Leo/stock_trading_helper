@@ -53,7 +53,7 @@ def _resolve(quote, board="sh_main", now=None, snapshot=None, **kwargs):
     from stock_analysis.data_loader import status
 
     return status.resolve_trading_status(
-        kwargs.pop("code", "600519"), board, name="示例",
+        kwargs.pop("code", "600519"), board, name=kwargs.pop("name", "示例"),
         now=now or dt.datetime(2026, 11, 12, 14, 0),
         st_snapshot=snapshot if snapshot is not None else _snapshot(),
         quote=quote, **kwargs)
@@ -290,6 +290,60 @@ def test_st_from_quote_name_when_list_unavailable():
     assert any("ST 标的" in w for w in out.warnings)
 
 
+# --- issue #17：ST 解析四条分支 -------------------------------------------
+def test_st_list_is_authoritative():
+    """① 名单可用：以名单为准，True/False 都是确定值。"""
+    snapshot = _snapshot(codes={"600001"})
+    assert _resolve(_quote("quote_st_main.json"), code="600001",
+                    snapshot=snapshot).is_st is True
+    assert _resolve(_quote("quote_normal.json"), code="600519",
+                    snapshot=snapshot).is_st is False
+    assert _resolve(None, quote_error="AstockError: no quote", code="600519",
+                    snapshot=snapshot).is_st is False
+
+
+def test_st_list_available_but_name_conflict_still_true():
+    """① 名单未含、名称带 ST → True + 冲突 warning（保守处理）。"""
+    out = _resolve(None, quote_error="AstockError: no quote", code="600568",
+                   snapshot=_snapshot(), name="ST中珠")
+    assert out.is_st is True
+    assert any("不一致" in w for w in out.warnings)
+
+
+def test_quote_name_decides_when_list_unavailable():
+    """② 报价可用：名称带 ST → True，否则 False（即使名单不可用）。"""
+    snapshot = _snapshot(available=False)
+    assert _resolve(_quote("quote_st_main.json"), code="600001",
+                    snapshot=snapshot).is_st is True
+    assert _resolve(_quote("quote_normal.json"), code="600519",
+                    snapshot=snapshot).is_st is False
+
+
+def test_name_only_st_marks_true_with_warning():
+    """③ 报价不可用、名称含 ST → True +「仅依据名称」warning。"""
+    out = _resolve(None, quote_error="AstockError: no quote", code="600568",
+                   snapshot=_snapshot(available=False), name="ST中珠")
+    assert out.is_st is True
+    assert any("仅依据名称" in w for w in out.warnings)
+    assert any("ST 标的" in w for w in out.warnings)
+
+
+def test_name_only_non_st_is_unknown_not_false():
+    """③ 报价不可用、名称不含 ST → None（不能确认非 ST）+「is_st 未知」warning。"""
+    out = _resolve(None, quote_error="AstockError: no quote", code="600519",
+                   snapshot=_snapshot(available=False), name="贵州茅台")
+    assert out.is_st is None
+    assert any("is_st 未知" in w for w in out.warnings)
+
+
+def test_all_sources_unavailable_is_st_none():
+    """④ 名单/报价/名称全不可用（名称退化成代码）→ None + warning。"""
+    out = _resolve(None, quote_error="AstockError: no quote", code="999999",
+                   snapshot=_snapshot(available=False), name="999999")
+    assert out.is_st is None
+    assert any("is_st 未知" in w for w in out.warnings)
+
+
 def test_gem_st_keeps_20pct_limit():
     quote = _quote("quote_st_main.json")
     quote["limit_up"] = 5.94
@@ -381,7 +435,7 @@ def _toy(n=150, seed=7, drift=0.001, vol=0.02, start=100.0):
     }, index=idx)
 
 
-def _run_cli(monkeypatch, trading):
+def _run_cli(monkeypatch, trading, stock_name="示例", code="600519"):
     import cli
     import stock_analysis.data_loader.meta as meta
     from stock_analysis.backtest.engine import BacktestResult
@@ -391,8 +445,9 @@ def _run_cli(monkeypatch, trading):
     monkeypatch.setattr(cli, "last_fetch_info",
                         lambda: {"source": "cache", "from_cache": True,
                                  "degraded": None, "lag_days": None})
-    monkeypatch.setattr(cli, "get_stock_name", lambda c: "示例")
-    monkeypatch.setattr(cli, "resolve_trading_status", lambda *a, **k: trading)
+    monkeypatch.setattr(cli, "get_stock_name", lambda c: stock_name)
+    if trading is not None:
+        monkeypatch.setattr(cli, "resolve_trading_status", lambda *a, **k: trading)
 
     names = list(cli.build_strategy_signals().keys())[:3]
     comp = pd.DataFrame(
@@ -406,7 +461,7 @@ def _run_cli(monkeypatch, trading):
     res.equity_curve = [100000.0] * 50
     monkeypatch.setattr(cli, "run_strategy_tournament",
                         lambda *a, **k: (names[0], res, comp))
-    return cli.advise_internal("600519", fast=True, no_regime=True)
+    return cli.advise_internal(code, fast=True, no_regime=True)
 
 
 def test_cli_instrument_additive_fields(monkeypatch):
@@ -488,3 +543,57 @@ def test_schema_instrument_declares_additive_fields():
     for name in ("is_suspended", "limit_up", "limit_down", "quote_stale",
                  "status_source"):
         assert name in fields
+
+
+# --- issue #17：CLI 边界不再把未知 is_st 伪装成 false ----------------------
+def test_cli_offline_st_name_passes_through_true(monkeypatch):
+    """端到端：ASTOCK_STATUS_OFFLINE=1 + 600568（本地名称 ST中珠）→ 不为 false。"""
+    out = _run_cli(monkeypatch, trading=None, stock_name="ST中珠", code="600568")
+    inst = out["instrument"]
+    assert inst["is_st"] is True, "离线时名称带 ST 必须判 true，不能伪装成 false"
+    assert inst["is_st"] is not False
+    assert inst["status_source"] == "offline"
+    assert any("仅依据名称" in w for w in out["diagnostics"]["warnings"])
+
+
+def test_cli_offline_without_name_is_st_null(monkeypatch):
+    """端到端：离线且名称退化成代码 → is_st=null + warning（不默认 false）。"""
+    out = _run_cli(monkeypatch, trading=None, stock_name="600568", code="600568")
+    assert out["instrument"]["is_st"] is None
+    assert out["diagnostics"]["warnings"], "状态不可得时必须有 warning"
+
+
+def _run_cli_error(monkeypatch, code="999999", df=None, start=None):
+    import cli
+    import stock_analysis.data_loader.meta as meta
+
+    type_err = "行情拉取失败（渠道池全失败且无可用缓存）" if df is None else None
+    monkeypatch.setattr(meta, "resolve_and_fetch",
+                        lambda *a, **k: (df, "stock", type_err))
+    monkeypatch.setattr(cli, "last_fetch_info",
+                        lambda: {"source": None, "from_cache": None,
+                                 "degraded": None, "lag_days": None})
+    return cli.advise_internal(code, start=start, fast=True, no_regime=True)
+
+
+def test_cli_data_source_error_is_st_null(monkeypatch):
+    out = _run_cli_error(monkeypatch, code="999999")
+    assert out["recommendation"]["status"] == "data_source_error"
+    assert out["instrument"]["is_st"] is None
+    assert out["diagnostics"]["warnings"]
+
+
+def test_cli_insufficient_data_is_st_null(monkeypatch):
+    """--start 近 10 天 → insufficient_data，is_st 显式 null。"""
+    out = _run_cli_error(monkeypatch, code="600519", df=_toy(n=10), start="20261103")
+    assert out["recommendation"]["status"] == "insufficient_data"
+    assert out["instrument"]["is_st"] is None
+
+
+def test_error_response_is_st_null_for_failure_statuses():
+    import cli
+
+    for status in ("data_source_error", "insufficient_data"):
+        doc = cli.create_error_response(status, "失败", "600519", "stock")
+        assert doc["instrument"]["is_st"] is None, status
+        assert doc["instrument"]["status_source"] == "unavailable"

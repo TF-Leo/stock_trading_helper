@@ -389,21 +389,44 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
     status_source_parts.extend(sources)
 
     # ---- ST ---------------------------------------------------------------
+    # 解析优先级（issue #17 验收退回）：
+    #   ① ST 名单可用 → 权威 True/False；名称带 ST 而名单未含 → True + 冲突 warning
+    #   ② 腾讯报价可用 → 按报价名称前缀判断（ST → True，否则 False）
+    #   ③ 报价不可用、传入 name 可用 → 名称含 ST → True + 「仅依据名称」warning；
+    #      否则 → None + 「is_st 未知」warning（绝不把未知伪装成 False）
+    #   ④ 全部不可用 → None + warning
     is_st: Optional[bool] = None
-    quote_name = str(quote.get("name") or "") if quote_ok else ""
-    effective_name = quote_name or str(name or "")
+    quote_name = str(quote.get("name") or "").strip() if quote_ok else ""
+    provided_name = str(name or "").strip()
+    # get_stock_name 取数失败时会把代码本身当名称返回；代码不是可用名称。
+    name_usable = bool(provided_name) and provided_name != str(code).strip()
+    effective_name = quote_name or (provided_name if name_usable else "")
+    echo_name = quote_name or provided_name
+
     if snapshot.available:
         is_st = code in snapshot.codes
-    if quote_ok:
-        if _looks_st(quote_name):
-            if snapshot.available and not is_st:
-                warnings.append("ST 名单与实时报价名称不一致（名单未含该代码，名称带 ST 前缀）：按 ST 处理")
+        if not is_st and _looks_st(effective_name):
+            warnings.append(
+                "ST 名单与名称不一致（名单未含该代码，名称带 ST 前缀）：按 ST 处理")
             is_st = True
-        elif is_st is None:
-            is_st = False
+    elif quote_ok:
+        is_st = _looks_st(effective_name)
+    elif name_usable:
+        if _looks_st(provided_name):
+            is_st = True
+            warnings.append(
+                f"仅依据名称判断 ST（ST 名单与实时报价均不可用）：{provided_name}，"
+                "无法交叉复核")
+        else:
+            warnings.append(
+                f"is_st 未知（名称 {provided_name} 不含 ST 标记，但 ST 名单与"
+                "实时报价均不可用，不能据此确认非 ST）")
+    else:
+        warnings.append(
+            "is_st 未知：ST 名单、实时报价与本地名称均不可用，无法判断是否 ST")
     if is_st:
         warnings.append(
-            f"ST 标的（{effective_name}）：风险警示股，退市与流动性风险显著高于普通股")
+            f"ST 标的（{echo_name or code}）：风险警示股，退市与流动性风险显著高于普通股")
 
     # ---- 涨跌停价与幅度 ---------------------------------------------------
     limit_up = limit_down = None
