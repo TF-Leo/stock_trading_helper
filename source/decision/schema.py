@@ -279,6 +279,12 @@ def _null_flow(code):
     return empty_flow_block(code=code, reason="data_source_error")
 
 
+def _null_valuation(code):
+    """P1-1（issue #46）：错误路径的 ``evidence.valuation`` —— 键与成功路径一致。"""
+    from stock_analysis.data_loader.valuation import empty_valuation_block
+    return empty_valuation_block(code=code, reason="data_source_error")
+
+
 def create_error_response(status, message, code, data_type, type_hint='auto',
                           bars=0, start=None, end=None, last_close=None,
                           fetch_info=None, elapsed=0.0, warnings=None,
@@ -405,6 +411,8 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             # P1-2（issue #36）additive：错误路径与成功路径键同构（G35）。
             # 取数阶段失败，资金流上下文不可得 → 显式 null，不读缓存。
             'flow': _null_flow(code),
+            # P1-1（issue #46）additive：错误路径与成功路径键同构（G35）。
+            'valuation': _null_valuation(code),
         },
         'candidates': [],
         'diagnostics': {
