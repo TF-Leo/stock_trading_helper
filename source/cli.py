@@ -2,6 +2,7 @@
 """Hermes Decision Engine CLI - Unified trigger-based output"""
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -629,13 +630,63 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     return _jsonable(response)
 
 
+_DATE_FORMATS = ("YYYYMMDD", "YYYY-MM-DD")
+
+
+_DATE_SHAPES = (re.compile(r'^\d{8}$'), re.compile(r'^\d{4}-\d{2}-\d{2}$'))
+
+
+def _parse_cli_date(value, option):
+    """把 ``--start`` / ``--as-of`` 的入参校验成日期。
+
+    P2（issue #18）：旧实现把非法值**静默忽略** —— ``--start 2026-13-99`` 会被
+    ``_apply_start`` 里的 ``except: return df`` 吞掉，按默认窗口继续跑，调用方
+    无法区分「参数写错」和「正常输出」。现在非法值一律抛 ``ValueError``，
+    由 argparse 转成退出码 2 + 可读原因（``parser.error`` 的语义）。
+
+    接受 ``YYYYMMDD`` 与 ``YYYY-MM-DD`` 两种写法（工具链两者都在用）。
+    先用正则卡**字面形状**，再交给 ``strptime`` 校验日历有效性：只靠
+    ``strptime`` 会放过 ``2026113`` / ``2026-1-1`` 这类补零不全的写法
+    （它会当合法日期接受），而 issue #18 的契约是这两个精确格式。
+    格式对但日期不存在（如 ``20260231``）同样拒绝 —— 否则会被
+    ``pd.to_datetime`` 悄悄解析成 3 月 3 日，窗口与调用方预期不符。
+
+    返回原字符串（不做格式归一）：``--start`` 与 ``--as-of`` 的下游分别按
+    ``pd.to_datetime`` / ``pd.Timestamp`` 解析，改写入参可能改变既有输出。
+
+    抛 ``argparse.ArgumentTypeError``（而非 ``ValueError``）：前者会让 argparse
+    原样打印这条可读原因，后者只会打印 ``invalid <type> value`` 这类无信息文本。
+    两条路径都是 ``parser.error`` → stderr + 退出码 2。
+    """
+    text = str(value).strip()
+    if any(shape.match(text) for shape in _DATE_SHAPES):
+        for fmt in ("%Y%m%d", "%Y-%m-%d"):
+            try:
+                datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+            return text
+    raise argparse.ArgumentTypeError(
+        f"{option} 需要 {_DATE_FORMATS[0]} 或 {_DATE_FORMATS[1]} 格式的有效日期，"
+        f"收到 {value!r}")
+
+
+def _date_arg(option):
+    """为 argparse 生成 ``type=`` 回调（抛 ArgumentTypeError → 退出码 2）。"""
+    def _convert(value):
+        return _parse_cli_date(value, option)
+    _convert.__name__ = option
+    return _convert
+
+
 def build_parser():
     """D6: CLI 参数定义（probe 会直接复用本函数验证"旧参数不报 usage error"）。"""
     parser = argparse.ArgumentParser(description='Hermes Trading Decision Engine')
     parser.add_argument('code', help='股票代码或基金代码')
     parser.add_argument('--json', action='store_true', help='输出 JSON 格式（stdout 只输出单个 JSON 文档）')
     parser.add_argument('--fast', action='store_true', help='快速模式（缩减 bootstrap / 候选池 / walk-forward 折数）')
-    parser.add_argument('--start', default=None, help='开始日期，如 20200101')
+    parser.add_argument('--start', default=None, type=_date_arg('--start'),
+                        help='开始日期，YYYYMMDD 或 YYYY-MM-DD（如 20200101）')
     parser.add_argument('--type', '-t', default='auto',
                         help='类型：auto/stock/fund（auto 按代码前缀推断，5 开头视为基金）')
     parser.add_argument('--jobs', type=int, default=1, help='并行任务数')
@@ -648,8 +699,10 @@ def build_parser():
                         help='跳过 market_regime 计算，输出 Unknown/disabled（不假装 Bull）')
     parser.add_argument('--opt-iters', type=int, default=30,
                         help='--opt bayes 的迭代次数（--fast 时上限 12）')
-    parser.add_argument('--as-of', dest='as_of', default=None, metavar='YYYY-MM-DD',
-                        help='历史复盘：把行情截断到该日期（不含未来数据）')
+    parser.add_argument('--as-of', dest='as_of', default=None,
+                        metavar='YYYY-MM-DD', type=_date_arg('--as-of'),
+                        help='历史复盘：把行情截断到该日期（不含未来数据）；'
+                             'YYYYMMDD 或 YYYY-MM-DD')
     return parser
 
 

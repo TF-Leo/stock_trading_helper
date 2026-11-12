@@ -202,10 +202,15 @@ def read_cache(code, flow_dir=None):
 
 def empty_flow_block(code=None, reason="cache_missing", expected_date=None,
                      expected_source=None):
-    """不可用时的 ``evidence.flow`` 块：键与成功路径完全一致，值显式 null。"""
+    """不可用时的 ``evidence.flow`` 块：键与成功路径完全一致，值显式 null。
+
+    P2（issue #40）：``code`` 必须走 ``_normalize_code``，与成功路径的
+    ``summarize_flow`` 一致 —— 否则 ``sh600519`` / ``600519.SH`` 这类写法
+    在错误路径会原样进 JSON，同一个字段在两条路径上给出两种编码。
+    """
     return {
         "available": False,
-        "code": None if code is None else str(code),
+        "code": None if code is None else _normalize_code(code),
         "source": None,
         "caliber": None,
         "as_of": None,

@@ -138,7 +138,7 @@ python cli.py 600519 --start 20200101 --json
     "label": "Bull",
     "confidence": 0.7,
     "as_of": "2026-10-16",
-    "definition": "simple_moving_average",
+    "definition": "ma20_ma60_return_volatility",
     "index": {
       "label": "Shock",
       "confidence": 0.5,
@@ -353,7 +353,10 @@ python cli.py 600519 --start 20200101 --json
 ### market_regime
 
 `label / confidence / as_of / definition` 四个字段的含义与历史版本**完全一致**
-（输入是**个股自身**的日线），未做任何改动。
+（输入是**个股自身**的日线），未做任何改动。个股 `definition` 的实际取值是
+`ma20_ma60_return_volatility`（取不到时为 `unavailable`，`--no-regime` 时为
+`disabled`）。早期文档曾写成一个已废弃的均线口径名，与真实输出不符，现已按
+`cli.py <code> --json` 的实际结果更正。
 
 `index`（P1-3，additive，`schema_version` 仍为 `1.0`）是**沪深 300 指数**的
 市场环境判定，只展示、**不参与 action / 仓位 / `regime_win_rates`**：
@@ -370,6 +373,14 @@ python cli.py 600519 --start 20200101 --json
 > 指数日线取不到（断网 / WAF / 数据不足 60 根）时，`index` 六个键**全部为显式
 > `null`**，并在 `diagnostics.warnings` 追加一条说明；**CLI 正常返回**，`action`
 > 与原有 `market_regime` 不受任何影响。`--no-regime` 时 `index.definition = "disabled"`。
+>
+> **关于 WAF 的措辞**：指数日线的三个腾讯入口（`web.ifzq.gtimg.cn` /
+> `proxy.finance.qq.com` / `ifzq.gtimg.cn`）**并非永久同等可用**。
+> **2026-11-12 观测**：只有 `web.ifzq.gtimg.cn` 返回 HTTP 501 WAF 页
+> （`waf.tencent.com/501page.html`），另外两个正常 —— 即 **1/3 入口不可用**，
+> 而不是"三入口一律 501"。这是**某一时点的观测**，不是永久结论：入口可用性
+> 会随 WAF 策略变化，适配器因此保留三入口轮换 + 冷却，不依赖固定顺序。
+> 复现方式见 `docs/P1_EVIDENCE_PLAN.md` §2.2.3。
 >
 > 指数与个股标签**允许不同**（指数走弱而个股强势是正常现象）。本字段目前只用于
 > 展示与后续研究；任何"用指数 regime 替换个股 regime / 改 action"的提案都需要
@@ -473,9 +484,9 @@ python cli.py 600519 --start 20200101 --json
 | 键 | 含义 |
 |---|---|
 | `available` | 缓存可用且至少有一行；不可用时其余数值键为 `null` |
-| `code` | 6 位纯数字代码 |
-| `source` | `eastmoney_push2his` 或 `sina_fund_flow_backup` |
-| `caliber` | `eastmoney_main_net` 或 `sina_total_net`；不同口径不可直接比较 |
+| `code` | 6 位纯数字代码。**成功与错误路径一致**：`sh600519` / `600519.SH` 等写法都会被归一成 `600519`（`data_source_error` 等不可用块同样归一，不保留调用方原样写法） |
+| `source` | 写入缓存的**数据来源**，当前可能取值：`eastmoney_push2his`（东财优先，见 §4.5）或 `sina_fund_flow_backup`（东财整域不可用时的新浪备胎）。不可用（`available=false`）时为 `null`。**该字段是开放集合**：后续新增来源（如新的备胎通道）只会增加取值，读取方应按「未知来源 → 不猜口径」处理，不要写死枚举 |
+| `caliber` | **口径**，与 `source` 成对出现：`eastmoney_main_net`（主力净流入 = 超大单 + 大单）或 `sina_total_net`（总净流入）。两者**不是同一个量**，不可直接相减 / 排序 / 跨票比较；不可用时为 `null`。与 `source` 一样是开放集合，新口径会新增取值，读取方必须先看 `caliber` 再解读数值键 |
 | `as_of` | 摘要实际用到的**最后一根资金流日期**（不是文件时间） |
 | `fetched_at` | 预计算写入缓存的时间 |
 | `rows` | 本次摘要用到的行数（`--as-of` 时可能小于缓存总行数） |

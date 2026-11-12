@@ -1019,28 +1019,46 @@ def check_walk_forward():
 # F17 / F18 / F20 工程
 # ---------------------------------------------------------------------------
 def check_requirements():
-    """G30：requirements pin 与实测环境一致（D3(e)/F17）。"""
+    """G30：requirements 与实测环境一致（D3(e)/F17）。
+
+    issue #31：旧实现用 ``^([\\w-]+)==([\\w.]+)`` 把所有 ``==`` 行当硬 pin，
+    于是按 Python 版本分档的 ``numpy==2.2.6; python_version < "3.14"`` 与
+    ``numpy>=2.3.3,<3; python_version >= "3.14"`` 被压成同一个键（后写覆盖前写），
+    3.14 机器实装 2.3.5/2.5.4 → 长期假 FAIL。
+
+    现在交给 ``tools/requirements_check.py``：
+      * 逐行解析（保留 marker 与区间说明符），**不再**压成 dict；
+      * marker 不适用当前解释器 → 该行跳过（记进 observed）；
+      * 适用 → 按版本区间判定，不再要求与某个具体版本号逐字相等。
+    """
     import importlib.metadata as md
-    import re
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import requirements_check as reqcheck
+
     path = os.path.join(SRC, "requirements.txt")
-    txt = open(path, encoding="utf-8").read()
-    pins = dict(re.findall(r"^([a-zA-Z0-9_\-]+)==([\w\.]+)", txt, re.M))
-    problems = []
-    obs = {}
-    for pkg, want in pins.items():
+    with open(path, encoding="utf-8") as handle:
+        txt = handle.read()
+    try:
+        requirements = reqcheck.parse_requirements(txt)
+    except reqcheck.RequirementsParseError as e:
+        return {"status": "FAIL", "reason": f"requirements 无法解析: {e}",
+                "observed": {}}
+
+    versions = {}
+    for pkg in {r["name"] for r in requirements}:
         try:
-            have = md.version(pkg)
-        except Exception as e:
-            problems.append(f"{pkg} 未安装: {e}")
-            continue
-        obs[pkg] = {"pin": want, "actual": have}
-        if have != want:
-            problems.append(f"{pkg} pin={want} 实际={have}")
+            versions[pkg] = md.version(pkg)
+        except Exception:
+            pass  # 未安装 → 由 check_environment 记成问题
+
+    problems, observed = reqcheck.check_environment(requirements, versions)
+    # 核心依赖必须在 requirements 里出现（原 F17 的正面清单，不能因重写而丢失）
+    names = {re.sub(r"[-_.]+", "-", r["name"]).lower() for r in requirements}
     for pkg in ("akshare", "numpy", "pandas", "pytest", "requests"):
-        if pkg not in pins:
-            problems.append(f"{pkg} 未 pin")
+        if pkg not in names:
+            problems.append(f"{pkg} 未在 requirements.txt 中声明")
     return {"status": "PASS" if not problems else "FAIL",
-            "reason": "; ".join(problems), "observed": obs}
+            "reason": "; ".join(problems), "observed": observed}
 
 
 def check_fund_cache_guard():

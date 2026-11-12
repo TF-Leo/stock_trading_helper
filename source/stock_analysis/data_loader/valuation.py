@@ -182,10 +182,14 @@ def read_cache(code, valuation_dir=None):
 
 def empty_valuation_block(code=None, reason="cache_missing", expected_date=None,
                           expected_source=None):
-    """不可用时的 ``evidence.valuation`` 块：键与成功路径完全一致，值显式 null。"""
+    """不可用时的 ``evidence.valuation`` 块：键与成功路径完全一致，值显式 null。
+
+    P2（issue #40）：``code`` 与 ``evidence.flow`` 同理走 ``_normalize_code``，
+    保证错误路径与成功路径对同一标的给出同一种编码（6 位纯码）。
+    """
     return {
         "available": False,
-        "code": None if code is None else str(code),
+        "code": None if code is None else _normalize_code(code),
         "source": None,
         "as_of": None,
         "fetched_at": None,

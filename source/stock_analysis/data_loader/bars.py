@@ -44,13 +44,31 @@ TIMEOUT_KEYWORDS = ("timeout", "timed out", "超时", "read timed out", "connect
 # 错误文本经**脱敏 + 截断**，避免把长 URL / token / key 带进 diagnostics。
 # ---------------------------------------------------------------------------
 MAX_ATTEMPT_ERROR_TEXT = 200
-_URL_PATTERN = re.compile(r'https?://\S+', re.IGNORECASE)
+# issue #26：整条 warning 的上限。多通道同时失败时每条 warning 都要带来源名，
+# 单条再被 200 字的 error_text 撑满，warnings 就会变得难以扫读。
+# 截断保留**前缀**，因此「来源名 + error_class + 错误摘要开头」必然留存。
+MAX_WARNING_TEXT = 300
+# 任意 scheme 的绝对 URL（https / ftp / ws / wss / s3 / postgres …）。
+# 旧规则只认 http(s)，`ftp://user:pw@host` 这类会原样进 diagnostics（issue #26 第 3 条）。
+_URL_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9+.\-]*://\S+')
 # requests 的异常常写成 `... with url: /api/qt/...?fields1=...`（相对路径，
 # 不匹配上面的绝对 URL 规则），同样可能带长查询串 / 参数，一并脱敏。
 _RELATIVE_URL_PATTERN = re.compile(r'(?i)\burl:\s*\S+')
+# Authorization / Proxy-Authorization：必须把认证方案**后面的凭据本体**一起吃掉。
+# 旧规则 `authorization\s*[=:]\s*[^\s,;&]+` 只匹配到 `Bearer`，token 原样留存
+# （issue #26 第 1 条）。
+_AUTH_PATTERN = re.compile(
+    r'(?i)\b((?:proxy-)?authorization)\b\s*[:=]\s*'
+    r'(?:(?:bearer|basic|digest|negotiate|token)\s+)?[^\s,;&}]+'
+)
+# key=value / JSON 引号形式（issue #26 第 2 条）：`"api_key": "abc"`、
+# `"token":"abc"`、`token=abc`、`SECRET_KEY=xyz`。键与值两侧的引号都可选，
+# 替换时丢弃引号（只保留键名，避免把引号形式原样带进 diagnostics）。
+_SECRET_KEY = (r'token|api[_-]?key|access[_-]?key|secret(?:[_-]?key)?|'
+               r'password|passwd|pwd|auth[_-]?key|cookie|session(?:[_-]?id)?')
 _SECRET_PATTERN = re.compile(
-    r'(?i)\b(token|api[_-]?key|access[_-]?key|secret|authorization|password)'
-    r'\b\s*[=:]\s*[^\s,;&]+'
+    r'(?i)(?P<q>["\']?)\b(?P<key>' + _SECRET_KEY + r')(?P=q)\s*[=:]\s*'
+    r'(?:"[^"]*"|\'[^\']*\'|[^\s,;&}]+)'
 )
 _SAFE_SOURCE_PATTERN = re.compile(r'^[A-Za-z0-9_.-]{1,32}$')
 
@@ -66,10 +84,21 @@ def _sanitize_error_text(err) -> str:
     text = '' if err is None else str(err)
     text = _URL_PATTERN.sub('<url>', text)
     text = _RELATIVE_URL_PATTERN.sub('url: <url>', text)
-    text = _SECRET_PATTERN.sub(r'\1=<redacted>', text)
+    # 认证头先于通用 key=value：否则 `Authorization: Bearer <tok>` 只会被
+    # 通用规则吃掉 `Bearer` 四个字母。
+    text = _AUTH_PATTERN.sub(r'\1=<redacted>', text)
+    text = _SECRET_PATTERN.sub(r'\g<key>=<redacted>', text)
     text = ' '.join(text.split())
     if len(text) > MAX_ATTEMPT_ERROR_TEXT:
         text = text[:MAX_ATTEMPT_ERROR_TEXT - 3] + '...'
+    return text
+
+
+def _cap_warning(text) -> str:
+    """整条 warning 的硬上限（issue #26）：超长时保留前缀 + 省略号。"""
+    text = str(text)
+    if len(text) > MAX_WARNING_TEXT:
+        return text[:MAX_WARNING_TEXT - 3] + '...'
     return text
 
 
@@ -138,7 +167,7 @@ def format_attempt_warnings(attempts):
             flags.append("已从渠道池剔除")
         if flags:
             msg += f"（{'，'.join(flags)}）"
-        lines.append(msg)
+        lines.append(_cap_warning(msg))
     return lines
 
 
