@@ -363,6 +363,12 @@ python cli.py 600519 --start 20200101 --json
   - `error_text` 经脱敏（长 URL → `<url>`、token/key → `<redacted>`）并截断到 **≤200 字**；
     `source` 只允许池内登记的标识符，避免把任意异常文本带进对外 JSON。
   - 错误响应与成功响应键同构：无触网时为空数组 `[]`（G35）。
+  - **基金（issue #24，additive）**：ETF / OTC 通道同样逐次记录，来源名为
+    `fund_etf_sina`（`ak.fund_etf_hist_sina`）与 `eastmoney_otc`
+    （`ak.fund_open_fund_info_em`）。场外基金走场内 ETF 通道**常态就是 0 行**，
+    记为 `error_class="EmptyDataError"`；**同轮 OTC 成功时该条目不写入 `warnings`**
+    （避免 023299/001917 这类自选标的的正常路径被无意义失败刷屏），但
+    `source_attempts` 中仍可见。基金没有渠道池，故 `cooldown` / `removed` 恒为 `false`。
 
 ### recommendation
 - **status**: 状态枚举（见上表）

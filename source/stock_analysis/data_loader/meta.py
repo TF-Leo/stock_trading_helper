@@ -10,6 +10,8 @@ from stock_analysis.data_loader.bars import (
     DATA_DIR,
     _normalize_daily_df,
     _STOCK_DATA_SOURCE_POOL,
+    _attempt,
+    EmptyDataError,
 )
 
 # 调用方 `source=` 入参 → 渠道池优先顺序。
@@ -668,6 +670,10 @@ def get_fund_daily(symbol, start_date='20200101', adjust='', source='akshare'):
     print(f"正在拉取基金 {symbol} 历史数据（ETF → OTC）...", file=sys.stderr)
     df = None
     fund_channel = None
+    # P0（issue #24）：基金 ETF / OTC 通道的逐次尝试，结构与股票渠道池一致
+    # （{source, ok, error_class, error_text, cooldown, removed}）。基金没有渠道池，
+    # 因此 cooldown/removed 恒为 False —— 没有的状态不虚构。
+    fund_attempts = []
 
     # --- 通道 1：场内 ETF（新浪）
     try:
@@ -680,10 +686,17 @@ def get_fund_daily(symbol, start_date='20200101', adjust='', source='akshare'):
                 sina_symbol = 'sz' + symbol
         etf = ak.fund_etf_hist_sina(symbol=sina_symbol)
         if etf is not None and not etf.empty:
-            df, fund_channel = etf, 'sina_etf'
+            fund_attempts.append(_attempt('fund_etf_sina', True))
+            df, fund_channel = etf, 'fund_etf_sina'
         else:
+            # 场外基金（023299/001917…）走场内 ETF 通道常态就是 0 行：这是
+            # 「不适用」而非故障。仍结构化留痕，但同轮 OTC 成功时不会变成噪声。
+            fund_attempts.append(_attempt(
+                'fund_etf_sina', False,
+                error=EmptyDataError('fund_etf_sina 无数据（非场内 ETF）')))
             print(f"ETF 通道无数据（{symbol}），尝试 OTC 净值通道", file=sys.stderr)
     except Exception as e:
+        fund_attempts.append(_attempt('fund_etf_sina', False, error=e))
         print(f"ETF 通道失败：{e}；尝试 OTC 净值通道", file=sys.stderr)
 
     # --- 通道 2：场外 OTC 单位净值（东财）
@@ -692,9 +705,17 @@ def get_fund_daily(symbol, start_date='20200101', adjust='', source='akshare'):
             import akshare as ak  # 已在上面 import，此处防御 ak 未定义情形
             otc = ak.fund_open_fund_info_em(symbol=symbol, indicator="单位净值走势")
             if otc is not None and not otc.empty:
+                fund_attempts.append(_attempt('eastmoney_otc', True))
                 df, fund_channel = otc, 'eastmoney_otc'
+            else:
+                fund_attempts.append(_attempt(
+                    'eastmoney_otc', False,
+                    error=EmptyDataError('eastmoney_otc 无数据')))
         except Exception as e:
+            fund_attempts.append(_attempt('eastmoney_otc', False, error=e))
             print(f"OTC 净值通道失败：{e}", file=sys.stderr)
+
+    _LAST_FETCH_INFO['source_attempts'] = [dict(item) for item in fund_attempts]
 
     if df is None or df.empty:
         if cached_df is not None and not cached_df.empty:
