@@ -1,0 +1,42 @@
+a-stock-data
+============
+
+This directory contains a fixed snapshot of the upstream "a-stock-data" skill
+document at commit f21534946c42be3ad048ac938eecb1bad84cb8ab (tag v3.10.4).
+
+Copyright and license
+---------------------
+Upstream project: https://github.com/simonlin1212/a-stock-data
+Licensed under the Apache License, Version 2.0. A copy is provided in LICENSE.
+
+Modifications by stock_trading_helper
+-------------------------------------
+The upstream SKILL.md is stored verbatim. Code is not vendored wholesale:
+`tools/astock_extract.py` extracts only the functions listed in
+`source/stock_analysis/data_sources/_astock_manifest.json` and writes them to
+`source/stock_analysis/data_sources/_astock_generated.py`.
+
+The extractor applies exactly one mechanical modification to the extracted
+source: upstream HTTP timeout literals are replaced by the module constant
+`_ASTOCK_HTTP_TIMEOUT` (see the manifest's "modifications" section). This is
+needed so a calendar lookup can fail fast and fall back to the local weekday
+estimate instead of blocking a CLI call for up to 50 seconds. No algorithmic
+logic is changed.
+
+Sections used
+-------------
+* "市场前缀规则（全局通用）" — get_prefix / norm_ticker
+* "V3.9.0 共用 helper"        — HTTP/JSON/number/frame helpers
+* "§1.1 腾讯财经 API"          — tencent_quote (optional realtime snapshot)
+* "§1.2 腾讯 K 线"             — tencent_kline (raw daily bars)
+* "§1.6 新浪复权因子"          — sina_adjust_factor / apply_adjust
+  (Tencent qfq is an arithmetic/dividend-subtraction convention; upstream
+   explicitly recommends raw bars + §1.6 ratio factors for long backtests.
+   The adapter follows that recommendation so the numbers stay compatible
+   with the existing Sina cache.)
+* "§12 指数与交易日历"         — trading_calendar (SZSE official calendar)
+
+Regenerate with:
+    python tools/astock_extract.py
+Verify without touching the working tree:
+    python tools/astock_extract.py --check

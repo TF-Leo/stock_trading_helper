@@ -13,14 +13,17 @@ from stock_analysis.data_loader.bars import (
 )
 
 # 调用方 `source=` 入参 → 渠道池优先顺序。
-#   'akshare'（默认）/ 'eastmoney' → 先试东财
-#   'sina' / 'sina_stock'          → 先试新浪股票
-# 未列出的（含 None）→ 不指定偏好，按渠道池自身的轮询顺序
+#   'akshare'（默认）/ 'astock' → 腾讯 K 线优先（固定快照，不封 IP）
+#   'eastmoney'                → 显式要求东财时仍先试东财，失败再腾讯
+#   'sina' / 'sina_stock'      → 显式要求新浪时先试新浪，失败再腾讯
+# 未列出的（含 None）→ 不指定偏好，按渠道池自身的轮询顺序（腾讯仍排第一）
 _SOURCE_PREFERENCE = {
-    'akshare': ['eastmoney', 'sina_stock', 'sina_fund'],
-    'eastmoney': ['eastmoney', 'sina_stock', 'sina_fund'],
-    'sina': ['sina_stock', 'eastmoney', 'sina_fund'],
-    'sina_stock': ['sina_stock', 'eastmoney', 'sina_fund'],
+    'akshare': ['astock_tencent', 'eastmoney', 'sina_stock', 'sina_fund'],
+    'astock': ['astock_tencent', 'eastmoney', 'sina_stock', 'sina_fund'],
+    'astock_tencent': ['astock_tencent', 'eastmoney', 'sina_stock', 'sina_fund'],
+    'eastmoney': ['eastmoney', 'astock_tencent', 'sina_stock', 'sina_fund'],
+    'sina': ['sina_stock', 'astock_tencent', 'eastmoney', 'sina_fund'],
+    'sina_stock': ['sina_stock', 'astock_tencent', 'eastmoney', 'sina_fund'],
 }
 
 # F20: 缓存写盘最小行数 —— 低于该值视为"失败拉取的空壳"，绝不落盘。
@@ -42,7 +45,14 @@ _LAST_FETCH_INFO = {
     'cache_last_date': None,  # 缓存末根 K 线日期（ISO）
     'lag_days': None,        # 缓存末日 → 期望最新交易日 之间的交易日数
     'expected_date': None,   # 期望的最新交易日（跳过周末/未收盘）
+    # a-stock-data §12：期望交易日的来源。'astock_calendar' = 深交所官方日历；
+    # 'estimate' = 原有「周末推算」回退。只进 _LAST_FETCH_INFO（CLI JSON 契约未改，
+    # 因为 decision/schema.py 属本任务禁止修改的范围——见 PR 说明）。
+    'expected_source': None,
 }
+
+# 最近一次 _expected_latest_trade_date() 的判定来源
+_EXPECTED_SOURCE = {'value': None}
 
 
 def last_fetch_info():
@@ -63,6 +73,8 @@ def _record_fetch(source, from_cache, **extra):
     for k, v in extra.items():
         if k in _LAST_FETCH_INFO:
             _LAST_FETCH_INFO[k] = v
+    # 期望交易日来源随每条取数记录一起落账（caller 无需逐处传参）
+    _LAST_FETCH_INFO['expected_source'] = _EXPECTED_SOURCE.get('value')
 
 
 def _mark_degraded(reason, cached_df):
@@ -395,9 +407,28 @@ def get_stock_name(code):
     return code
 
 
-def _expected_latest_trade_date():
-    """计算期望的最新交易日日期。"""
-    now = datetime.datetime.now()
+def _expected_latest_trade_date(now=None):
+    """计算期望的最新交易日日期。
+
+    a-stock-data §12 接入（2026-11-12）：优先使用深交所官方整月日历，
+    能正确跨过法定节假日（旧实现只跳周末，节假日会误判"缓存过期"→
+    无谓触网 50s 再回退）。日历不可用（离线 / 未发布 / 接口失败）时，
+    **完全回退**到原来的周末推算法，行为与接入前一致。
+    """
+    now = now or datetime.datetime.now()
+
+    try:
+        from stock_analysis.data_sources import astock
+        official = astock.latest_trading_day_at(now)
+    except Exception as e:  # 日历是辅助信号，任何异常都不得阻断取数
+        print(f"[WARN] 官方交易日历不可用，回退周末推算：{e}", file=sys.stderr)
+        official = None
+
+    if official is not None:
+        _EXPECTED_SOURCE['value'] = 'astock_calendar'
+        return official
+
+    _EXPECTED_SOURCE['value'] = 'estimate'
     expected = now.date()
     if now.hour < 15:
         expected = expected - datetime.timedelta(days=1)
@@ -450,7 +481,9 @@ def resolve_and_fetch(code, type_hint='auto', start_date=None):
     def _fetch(dtype):
         if dtype == 'fund':
             return get_fund_daily(code, start_date=start_date)
-        return get_stock_daily(code, start_date=start_date, source='sina')
+        # 2026-11-12：主流程改用默认渠道优先级（腾讯优先），不再硬绑新浪。
+        # 显式 source='sina' 仍可用（见 _SOURCE_PREFERENCE）。
+        return get_stock_daily(code, start_date=start_date, source='akshare')
 
     if type_hint == 'fund':
         return _fetch('fund'), 'fund', None
