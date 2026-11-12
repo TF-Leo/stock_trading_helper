@@ -11,6 +11,7 @@ import numpy as np
 
 from stock_analysis.data_loader import get_stock_daily, get_fund_daily, get_stock_name
 from stock_analysis.data_loader.meta import last_fetch_info
+from stock_analysis.data_loader.status import resolve_trading_status
 from stock_analysis.backtest.analyzer import run_strategy_tournament, calc_buy_hold_baseline
 from stock_analysis.backtest.engine import BacktestConfig
 from stock_analysis.strategy.registry import (
@@ -256,6 +257,19 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     board, price_limit_pct, is_st = classify_board(code)
     name = get_stock_name(code) if data_type == 'stock' else code
 
+    # P0-3（issue #6）：真实交易状态（ST / 停牌 / 涨跌停 / 退市信号）。
+    # 只对个股查询；基金保留静态字段。查询失败永不阻断主流程，只降级 + warning。
+    trading = None
+    if data_type == 'stock':
+        trading = resolve_trading_status(
+            code, board, name=name, data_lag_days=fetch_info.get('lag_days'))
+        if trading.price_limit_pct is not None:
+            price_limit_pct = trading.price_limit_pct
+        # is_st 可能为 None（ST 名单 / 腾讯报价 / 本地名称都不可用）：
+        # 直接透传未知态，绝不保留 classify_board 的静态 False 伪装成"非 ST"。
+        is_st = trading.is_st
+        warnings.extend(trading.warnings)
+
     # 运行回测
     strategies = build_strategy_signals() if data_type == 'stock' else build_fund_strategy_signals()
     fam_map = stock_family_map() if data_type == 'stock' else fund_family_map()
@@ -437,6 +451,15 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     else:
         status = 'ok'
 
+    # P0-3：真实交易状态硬约束 —— 停牌 / 疑似退市 / 一字板无法成交时，
+    # 只把 status 升为 untradeable（退出码 40）+ 硬提示；不改 actions.py 的决策表。
+    if trading is not None:
+        _block = trading.execution_block(
+            policy_block['pending'], bool(exp_buy['ok']), bool(policy_block['holding']))
+        if _block:
+            status = 'untradeable'
+            warnings.append(_block)
+
     # v3.0 决策表：买入看条件期望，卖出只看风控；no_edge 不再阻断交易
     action = act_mod.decide(status, policy_block['pending'], bool(exp_buy['ok']),
                             bool(policy_block['holding']))
@@ -505,7 +528,13 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'name': name,
             'board': board,
             'price_limit_pct': price_limit_pct,
-            'is_st': is_st
+            'is_st': is_st,
+            # P0-3 additive：真实交易状态（未知显式 null，不伪装成 False）
+            'is_suspended': None if trading is None else trading.is_suspended,
+            'limit_up': None if trading is None else trading.limit_up,
+            'limit_down': None if trading is None else trading.limit_down,
+            'quote_stale': None if trading is None else trading.quote_stale,
+            'status_source': 'fund_static' if trading is None else trading.status_source,
         },
         'data': {
             'bars': len(df),

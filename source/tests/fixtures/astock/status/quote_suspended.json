@@ -1,0 +1,23 @@
+{
+  "name": "停牌示例",
+  "price": 10.00,
+  "last_close": 10.00,
+  "open": 0.0,
+  "change_amt": 0.0,
+  "change_pct": 0.0,
+  "high": 0.0,
+  "low": 0.0,
+  "amount_wan": 0.0,
+  "turnover_pct": 0.0,
+  "pe_ttm": 12.0,
+  "amplitude_pct": 0.0,
+  "float_mcap_yi": 50.0,
+  "mcap_yi": 60.0,
+  "pb": 1.50,
+  "limit_up": 11.00,
+  "limit_down": 9.00,
+  "vol_ratio": 0.0,
+  "pe_static": 12.0,
+  "is_stale": true,
+  "stale_reason": "成交量为 0（停牌 / 未开盘 / 废码），报价非当日真实成交"
+}

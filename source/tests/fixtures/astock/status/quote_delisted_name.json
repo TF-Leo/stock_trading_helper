@@ -1,0 +1,23 @@
+{
+  "name": "退市示例",
+  "price": 1.00,
+  "last_close": 1.00,
+  "open": 0.0,
+  "change_amt": 0.0,
+  "change_pct": 0.0,
+  "high": 0.0,
+  "low": 0.0,
+  "amount_wan": 0.0,
+  "turnover_pct": 0.0,
+  "pe_ttm": 0.0,
+  "amplitude_pct": 0.0,
+  "float_mcap_yi": 1.0,
+  "mcap_yi": 1.0,
+  "pb": 0.5,
+  "limit_up": 1.10,
+  "limit_down": 0.90,
+  "vol_ratio": 0.0,
+  "pe_static": 0.0,
+  "is_stale": true,
+  "stale_reason": "成交量为 0（停牌 / 未开盘 / 废码），报价非当日真实成交"
+}

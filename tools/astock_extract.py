@@ -58,6 +58,8 @@ SELECTION = [
         "V39_UA", "V39_RETRY_SESSION",
         "_v39_http", "_v39_json", "_v39_date", "_v39_src_date",
         "_v39_num", "_v39_req_num", "_v39_contract", "_v39_frame",
+        # §6.8 ST 名单翻页完整性校验依赖这两个（上游同一 marker 块）。
+        "_v39_rows", "_v39_count",
     ]),
     ("v39-tencent-kline", "marker", None, [
         "TENCENT_KLINE_HOSTS", "_TENCENT_HOST_COOLDOWN",
@@ -72,6 +74,18 @@ SELECTION = [
     ]),
     ("§1.1 腾讯财经 API", "section", "### 1.1 腾讯财经 API", [
         "tencent_quote",
+    ]),
+    # P0-3（issue #6）：ST 名单依赖东财限流入口。只取 em_get / session /
+    # 间隔常量，不取同块的 eastmoney_datacenter（本项目不用该端点）。
+    ("东财数据中心统一查询（共用 helper）", "section",
+     "### 东财数据中心统一查询（共用 helper）", [
+         "UA", "EM_SESSION", "EM_MIN_INTERVAL", "_em_last_call", "em_get",
+    ]),
+    # §6.8 ST / *ST 当日名单。上游在東财不可达时退到 baostock；本任务明确
+    # 不引入新依赖，生成时把该兜底替换为显式 RuntimeError（见 build()）。
+    ("§6.8 ST / *ST 名单", "section",
+     "### 6.8 ST / *ST 名单 — 全市场风险警示快照（V3.9.0 新增）", [
+         "EM_CLIST_HOSTS", "_em_clist_all", "st_stock_list",
     ]),
     ("official-data-core", "marker", None, [
         "_official_code", "_official_date", "_official_get", "_official_frame",
@@ -93,7 +107,7 @@ PREAMBLE = """\
 # snapshot: vendor/a-stock-data/SKILL.md
 # sha256:   {skill_sha}
 # license:  Apache-2.0 (vendor/a-stock-data/LICENSE)
-# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历
+# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §6.8 ST 名单
 # manifest: source/stock_analysis/data_sources/_astock_manifest.json
 # body_sha256: {body_sha}
 #
@@ -106,6 +120,7 @@ import calendar
 import functools
 import json
 import math
+import random
 import re
 import time
 import urllib.request
@@ -220,6 +235,55 @@ def _render_node(node):
     return ast.unparse(ast.fix_missing_locations(node))
 
 
+class _BaostockFallbackDisabled(ast.NodeTransformer):
+    """Disable upstream's baostock fallback in §6.8 ``st_stock_list``.
+
+    The project explicitly does not add baostock (issue #1 decision record,
+    2026-11-12).  Upstream calls ``return _st_list_baostock(reason)`` when both
+    Eastmoney domains are unreachable; we replace that single ``return`` with a
+    ``RuntimeError`` so the failure is explicit and the status layer can fall
+    back to its own short-lived cache.  Everything else is copied verbatim.
+    """
+
+    def __init__(self):
+        self.count = 0
+
+    def visit_Return(self, node):
+        self.generic_visit(node)
+        value = node.value
+        if (isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "_st_list_baostock"):
+            self.count += 1
+            reason = ast.BinOp(
+                left=ast.Constant(
+                    value="东财 ST 名单不可达（%s）；baostock 兜底已禁用："
+                          "本项目不引入 baostock（issue #1 决策）"),
+                op=ast.Mod(),
+                right=ast.Call(func=ast.Name(id="str", ctx=ast.Load()),
+                               args=[ast.Name(id="exc", ctx=ast.Load())],
+                               keywords=[]),
+            )
+            return ast.Raise(
+                exc=ast.Call(func=ast.Name(id="RuntimeError", ctx=ast.Load()),
+                             args=[reason], keywords=[]),
+                cause=None)
+        return node
+
+
+# Eastmoney's session UA is set upstream by a bare module-level expression
+# (``EM_SESSION.headers.update(...)``), which carries no symbol for the
+# extractor to select.  Re-apply it after the generated body when the session
+# is part of the selection.
+POSTAMBLE = """\
+# Extraction-time override (not upstream): upstream configures the Eastmoney
+# session UA with a bare module-level statement that carries no named symbol.
+# Re-apply it here so extracted requests do not look like a bot.
+if 'EM_SESSION' in globals():
+    EM_SESSION.headers.update({'User-Agent': UA})
+"""
+
+
 def build():
     version = _read_version()
     with open(SKILL_PATH, "r", encoding="utf-8") as handle:
@@ -232,6 +296,8 @@ def build():
     rendered = []
     selections = []
     injections = 0
+    baostock_disabled = 0
+    selected_names = set()
     for label, kind, needle, names in SELECTION:
         chunks = _marked_block(text, label) if kind == "marker" else _section_block(text, needle)
         symbols = _collect_symbols(chunks, label)
@@ -243,20 +309,29 @@ def build():
             injected = _TimeoutInjection()
             node = injected.visit(ast.fix_missing_locations(node))
             injections += injected.count
+            disabled = _BaostockFallbackDisabled()
+            node = disabled.visit(ast.fix_missing_locations(node))
+            baostock_disabled += disabled.count
             generated_src = _render_node(node)
             rendered.append(generated_src)
+            selected_names.add(name)
             selections.append({
                 "symbol": name,
                 "section": label,
                 "upstream_sha256": _sha256_bytes(upstream_src.encode("utf-8")),
                 "generated_sha256": _sha256_bytes(generated_src.encode("utf-8")),
                 "timeout_injections": injected.count,
+                "baostock_fallback_disabled": disabled.count,
             })
 
     if injections == 0:
         raise SystemExit(
             "没有替换任何 HTTP timeout —— 上游代码可能已变化，"
             "请检查 _official_get / _tencent_kline_call 并更新本工具")
+    if "st_stock_list" in selected_names and baostock_disabled != 1:
+        raise SystemExit(
+            f"st_stock_list 的 baostock 兜底替换次数应为 1，实际 {baostock_disabled} —— "
+            "上游代码可能已变化，请检查 _st_list_baostock 调用点")
 
     body = PREAMBLE.format(
         version=version["version"],
@@ -264,9 +339,34 @@ def build():
         skill_sha=skill_sha,
         body_sha="__BODY_SHA__",
     ) + "\n\n".join(rendered) + "\n"
+    if "EM_SESSION" in selected_names:
+        body += POSTAMBLE
 
     body_sha = _sha256_bytes(body.encode("utf-8"))
     output = body.replace("__BODY_SHA__", body_sha)
+
+    modifications = [
+        {
+            "kind": "http_timeout_override",
+            "detail": "HTTP timeout literals in extracted call sites replaced "
+                      "by _ASTOCK_HTTP_TIMEOUT (5, 15).",
+            "injections": injections,
+        },
+    ]
+    if baostock_disabled:
+        modifications.append({
+            "kind": "baostock_fallback_disabled",
+            "detail": "§6.8 st_stock_list's baostock fallback return replaced by "
+                      "an explicit RuntimeError; no baostock dependency is added.",
+            "injections": baostock_disabled,
+        })
+    if "EM_SESSION" in selected_names:
+        modifications.append({
+            "kind": "eastmoney_session_ua",
+            "detail": "Re-applied the session User-Agent that upstream sets via an "
+                      "unnamed module-level statement.",
+            "injections": 1,
+        })
 
     manifest = {
         "generator": "tools/astock_extract.py",
@@ -281,14 +381,7 @@ def build():
         "generated_sha256": _sha256_bytes(output.encode("utf-8")),
         "body_sha256": body_sha,
         "selections": selections,
-        "modifications": [
-            {
-                "kind": "http_timeout_override",
-                "detail": "HTTP timeout literals in extracted call sites replaced "
-                          "by _ASTOCK_HTTP_TIMEOUT (5, 15).",
-                "injections": injections,
-            }
-        ],
+        "modifications": modifications,
     }
     return output, manifest
 

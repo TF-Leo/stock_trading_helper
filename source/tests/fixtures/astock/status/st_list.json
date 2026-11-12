@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "source": "eastmoney",
+  "coverage": "沪深京",
+  "fetched_at": "2026-11-12T09:40:00",
+  "session_date": "2026-11-12",
+  "count": 2,
+  "stocks": {
+    "600001": {"name": "*ST示例", "st_type": "*ST", "market": "sh", "price": 5.0, "pct_change": 1.01},
+    "000002": {"name": "ST示例二", "st_type": "ST", "market": "sz", "price": 3.2, "pct_change": -0.31}
+  }
+}

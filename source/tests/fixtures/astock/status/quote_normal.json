@@ -1,0 +1,22 @@
+{
+  "name": "贵州茅台",
+  "price": 1410.27,
+  "last_close": 1402.30,
+  "open": 1395.13,
+  "change_amt": 7.97,
+  "change_pct": 0.57,
+  "high": 1411.00,
+  "low": 1388.11,
+  "amount_wan": 453681.0,
+  "turnover_pct": 0.26,
+  "pe_ttm": 21.46,
+  "amplitude_pct": 1.63,
+  "float_mcap_yi": 17629.53,
+  "mcap_yi": 17629.53,
+  "pb": 6.50,
+  "limit_up": 1542.53,
+  "limit_down": 1262.07,
+  "vol_ratio": 0.91,
+  "pe_static": 20.51,
+  "is_stale": false
+}

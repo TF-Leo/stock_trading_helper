@@ -9,9 +9,9 @@
 # snapshot: vendor/a-stock-data/SKILL.md
 # sha256:   09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2
 # license:  Apache-2.0 (vendor/a-stock-data/LICENSE)
-# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历
+# sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §6.8 ST 名单
 # manifest: source/stock_analysis/data_sources/_astock_manifest.json
-# body_sha256: bcea37d1c8737ffd17be75649d458467b7aa313ac9a43b591849f0bbcbf026ee
+# body_sha256: bfb2cfe81d2a4be91a02261efb6dad5b84b7a5a45b55f0cacc3899408f10a0c9
 #
 # Regenerate: python tools/astock_extract.py
 # Verify:     python tools/astock_extract.py --check
@@ -22,6 +22,7 @@ import calendar
 import functools
 import json
 import math
+import random
 import re
 import time
 import urllib.request
@@ -189,6 +190,23 @@ def _v39_frame(rows, source, url, columns=None):
     frame['source_url'] = url
     frame['fetched_at'] = datetime.now(timezone.utc).isoformat()
     return frame
+
+def _v39_rows(value, what):
+    """来源里可能整段缺失的行列表：字段没有（None）按空处理，其余必须是对象列表。
+    写成 `value or []` 会把 {} / '' / 0 这类结构改变也当成空表，静默丢掉整段数据。"""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all((isinstance(row, dict) for row in value)):
+        raise RuntimeError(f'{what} 应为对象列表，实际是 {type(value).__name__}: {str(value)[:120]}')
+    return value
+
+def _v39_count(value, what):
+    """来源自报的页数 / 条数 → 非负 int。只认 int 或纯数字串；bool 抛错（int(True)=1 会让
+    「只返回 1 条」通过完整性核对），其他写法也抛 RuntimeError。"""
+    text = str(value).strip() if isinstance(value, (int, str)) and (not isinstance(value, bool)) else ''
+    if not re.fullmatch('[0-9]+', text):
+        raise RuntimeError(f'{what} 不是非负整数: {value!r}')
+    return int(text)
 
 TENCENT_KLINE_HOSTS = ['https://web.ifzq.gtimg.cn', 'https://proxy.finance.qq.com/ifzqgtimg', 'https://ifzq.gtimg.cn']
 
@@ -483,6 +501,95 @@ def tencent_quote(codes: list[str]) -> dict[str, dict]:
             q['stale_reason'] = '成交量为 0（停牌 / 未开盘 / 废码），报价非当日真实成交'
     return result
 
+UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+
+EM_SESSION = requests.Session()
+
+EM_MIN_INTERVAL = 1.0
+
+_em_last_call = [0.0]
+
+def em_get(url: str, params: Optional[dict]=None, headers: Optional[dict]=None, timeout: int=15, **kwargs):
+    """东财统一请求入口：自动节流 + 复用 session + 默认 UA。
+    所有 eastmoney.com 接口都应通过它请求，避免高频被封 IP。"""
+    wait = EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+    if wait > 0:
+        time.sleep(wait + random.uniform(0.1, 0.5))
+    try:
+        return EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
+    finally:
+        _em_last_call[0] = time.time()
+
+EM_CLIST_HOSTS = ['https://push2.eastmoney.com', 'https://push2delay.eastmoney.com']
+
+def _em_clist_all(fs, fields, page_size=100):
+    """东财 clist 全量翻页。主域网络失败时换 push2delay（同一接口，行情延迟约 15 分钟）。
+    网络层全部失败抛 requests.ConnectionError；服务端返回异常内容（含非 JSON 的错误页）抛 RuntimeError，
+    不换域重试，也不会让 st_stock_list 退到只有沪深的备胎。"""
+    errors = []
+    for host in EM_CLIST_HOSTS:
+        url = host + '/api/qt/clist/get'
+        rows, page, total = ([], 1, None)
+        try:
+            while True:
+                response = em_get(url, params={'pn': page, 'pz': page_size, 'po': 1, 'np': 1, 'fltt': 2, 'invt': 2, 'fid': 'f12', 'fs': fs, 'fields': fields}, timeout=15)
+                response.raise_for_status()
+                payload = _v39_json(response)
+                data = payload.get('data') if isinstance(payload, dict) else None
+                if not isinstance(data, dict) or payload.get('rc') != 0 or (not data):
+                    raise RuntimeError(f'东财 clist 返回异常或无数据（fs={fs}）: {str(payload)[:100]}')
+                page_total = _v39_count(data.get('total'), f'东财 clist total（fs={fs}）')
+                diff = _v39_rows(data.get('diff'), f'东财 clist 的 diff（fs={fs}）')
+                if total is None:
+                    total = page_total
+                elif page_total != total:
+                    raise RuntimeError(f'东财 clist 翻页时 total 从 {total} 变成 {page_total}，请重试')
+                rows.extend(diff)
+                if not diff or len(rows) >= total:
+                    break
+                page += 1
+        except requests.RequestException as exc:
+            errors.append(f'{host}: {type(exc).__name__}')
+            continue
+        if len(rows) != total:
+            raise RuntimeError(f'东财 clist 翻页后 {len(rows)} 条，与 total={total} 不符')
+        return (rows, url)
+    raise requests.ConnectionError('东财 push2 / push2delay 均不可达: ' + '; '.join(errors))
+
+@_v39_contract
+def st_stock_list():
+    """全市场 ST / *ST 名单（风险警示）— 当日快照。
+
+    沪深：东财「风险警示板」过滤（含 B 股）；北交所：东财不纳入该过滤，改为拉北交所全表按名称筛。
+    东财两个域名都连不上时退到 baostock 证券列表按名称筛（**只有沪深、没有价格**，attrs 里注明）。
+    price / pct_change 在走 push2delay 时约有 15 分钟延迟（source_url 可看出走的是哪个域）。
+    """
+    fields = 'f12,f13,f14,f2,f3'
+    try:
+        shsz, url = _em_clist_all('m:0+f:4,m:1+f:4', fields)
+        bj, bj_url = _em_clist_all('m:0+t:81+s:2048', fields)
+    except requests.ConnectionError as exc:
+        raise RuntimeError('东财 ST 名单不可达（%s）；baostock 兜底已禁用：本项目不引入 baostock（issue #1 决策）' % str(exc))
+    if not shsz or not bj:
+        raise RuntimeError(f'东财风险警示板 {len(shsz)} 条、北交所全表 {len(bj)} 条，有一边为空，不能当成沪深京完整名单')
+    if bj_url != url:
+        url = url + ' | ' + bj_url
+    rows = []
+    for rec, is_bj in [(r, False) for r in shsz] + [(r, True) for r in bj]:
+        code, market_id, name = (rec['f12'], rec['f13'], str(rec['f14']).strip())
+        if not re.fullmatch('[0-9]{6}', str(code)) or isinstance(market_id, bool) or market_id not in (0, 1):
+            raise RuntimeError(f'东财 clist 返回了认不出的代码 / 市场号: f12={code!r} f13={market_id!r}')
+        if not name:
+            raise RuntimeError(f'东财 clist 里 {code} 没有名称，ST 判定要靠名称，不能当成完整名单')
+        if is_bj and 'ST' not in name.upper():
+            continue
+        rows.append({'code': code, 'market': 'bj' if is_bj else 'sh' if market_id == 1 else 'sz', 'name': name, 'st_type': '*ST' if name.startswith('*') else 'ST', 'price': _v39_num(rec.get('f2')), 'pct_change': _v39_num(rec.get('f3'))})
+    frame = _v39_frame(rows, 'eastmoney', url)
+    if frame.empty or frame.duplicated(['code']).any():
+        raise RuntimeError('ST 名单为空或代码重复，不能当成完整快照')
+    frame.attrs['coverage'] = '沪深京'
+    return frame
+
 def _official_code(value):
     value = str(value).strip()
     if not re.fullmatch('[0-9]{6}', value):
@@ -528,3 +635,8 @@ def trading_calendar(year, month):
     if set(frame.date) != expected:
         raise RuntimeError('日历月份错位或日期不完整，不能继续调度')
     return frame
+# Extraction-time override (not upstream): upstream configures the Eastmoney
+# session UA with a bare module-level statement that carries no named symbol.
+# Re-apply it here so extracted requests do not look like a bot.
+if 'EM_SESSION' in globals():
+    EM_SESSION.headers.update({'User-Agent': UA})
