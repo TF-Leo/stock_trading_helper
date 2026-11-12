@@ -484,9 +484,9 @@ python cli.py 600519 --start 20200101 --json
 | 键 | 含义 |
 |---|---|
 | `available` | 缓存可用且至少有一行；不可用时其余数值键为 `null` |
-| `code` | 6 位纯数字代码 |
-| `source` | `eastmoney_push2his` 或 `sina_fund_flow_backup` |
-| `caliber` | `eastmoney_main_net` 或 `sina_total_net`；不同口径不可直接比较 |
+| `code` | 6 位纯数字代码。**成功与错误路径一致**：`sh600519` / `600519.SH` 等写法都会被归一成 `600519`（`data_source_error` 等不可用块同样归一，不保留调用方原样写法） |
+| `source` | 写入缓存的**数据来源**，当前可能取值：`eastmoney_push2his`（东财优先，见 §4.5）或 `sina_fund_flow_backup`（东财整域不可用时的新浪备胎）。不可用（`available=false`）时为 `null`。**该字段是开放集合**：后续新增来源（如新的备胎通道）只会增加取值，读取方应按「未知来源 → 不猜口径」处理，不要写死枚举 |
+| `caliber` | **口径**，与 `source` 成对出现：`eastmoney_main_net`（主力净流入 = 超大单 + 大单）或 `sina_total_net`（总净流入）。两者**不是同一个量**，不可直接相减 / 排序 / 跨票比较；不可用时为 `null`。与 `source` 一样是开放集合，新口径会新增取值，读取方必须先看 `caliber` 再解读数值键 |
 | `as_of` | 摘要实际用到的**最后一根资金流日期**（不是文件时间） |
 | `fetched_at` | 预计算写入缓存的时间 |
 | `rows` | 本次摘要用到的行数（`--as-of` 时可能小于缓存总行数） |
