@@ -494,6 +494,70 @@ python cli.py 600519 --start 20200101 --json
 > `available=false, reason="fund_not_supported"`，且**不追加 warning**，避免每次基金运行刷屏。
 > 股票缓存缺失/过期会在 `diagnostics.warnings` 给出一条可操作的提示，但不改变任何决策字段。
 
+### evidence.valuation（P1-1，issue #46）
+
+估值历史**上下文**，`schema_version` 仍为 `1.0`（additive）。
+**CLI / 9:15 主路径绝不触网，`source/` 也不 import baostock** —— 只读预计算缓存：
+
+1. 可选依赖（**不进主 `source/requirements.txt`**）：
+   ```bash
+   pip install -r requirements-research.txt      # baostock==0.9.4，仅研究/预计算
+   ```
+2. 收盘后运行预计算（登录一次、逐票串行、失败重试后继续）：
+   ```bash
+   python tools/precompute_valuation.py 600519 002415
+   # 默认 14 只自选；--start 2016-01-04 --end 2026-11-12；--json 输出机读统计
+   ```
+   写入 `source/stock_analysis/data/valuation/<code>.json`（`data/` 已在 `.gitignore`）。
+   baostock 的登录/查询日志会被重定向，`--json` 的 stdout 不被 `login success` 污染。
+3. CLI 只读这份缓存。缓存缺失/无效/过期时 `valuation.available=false` + warning，
+   CLI 正常返回，**不会为了估值多发一个请求**。
+
+取数口径为上游 a-stock-data v3.10.4 §6.5（`adjustflag="3"`，不复权）：
+`peTTM` / `pbMRQ` / `psTTM` / `pcfNcfTTM` + 换手率 + 停牌 + ST。baostock 不支持北交所，
+预计算会在登录前拒绝 4/8/92/920 号段并继续下一票。**与本轮东财/同花顺是否可达无关**：
+估值来源是 baostock，不经过东财 push2/datacenter。
+
+**只展示、不改决策**：`evidence.valuation` 不参与 `action`、`status`、
+`position_fraction`、`entry_zone`、`target_position` 的任何计算；A/B 对照中
+`recommendation` 逐键一致。前向 PE / PEG / 一致预期**本任务不做**（东财/同花顺当前不可达），
+相关字段不出现、也不猜测。
+
+| 键 | 含义 |
+|---|---|
+| `available` | 缓存可用且至少有一行不晚于 `as_of`；不可用时其余数值键为 `null` |
+| `code` | 6 位纯数字代码 |
+| `source` | 恒为 `baostock_valuation` |
+| `as_of` | 摘要实际用到的**最后一根估值日期**（不是文件时间/运行日） |
+| `fetched_at` | 预计算写入缓存的时间 |
+| `rows` | 本次摘要用到的行数（`--as-of` 时只统计不晚于该日的行） |
+| `pub_lag_days` | 恒为 `0`：估值基于当日收盘价，`--as-of d` 使用 `date <= d` 的行 |
+| `pe_ttm` / `pb` / `ps` | 截至 `as_of` 的最新值；缺失为 `null`。亏损股 PE 可为负，**不参与排序** |
+| `pe_percentile_3y` / `pb_percentile_3y` / `ps_percentile_3y` | 0–100 分位；见下方定义 |
+| `*_percentile_reason` | 分位为 `null` 的原因：`missing` / `non_positive` / `insufficient_samples` |
+| `percentile_window_days` | 窗口长度，恒为 `756`（≈3 年交易日） |
+| `percentile_samples` | `{pe, pb, ps}` 各自实际进入分位的有效样本数 |
+| `turnover_latest` | 最新换手率，**百分数**（0.31 = 0.31%），与上游一致 |
+| `is_st_hist` | 截至 `as_of` 当日的**历史 ST 标记**（baostock `isST`）；回答「当时是不是 ST」 |
+| `stale` | 缓存末日早于「期望最新交易日」；判定只读本地磁盘交易日历，缺失时退回周末推算 |
+| `expected_date` / `expected_source` | 期望交易日及其口径（`calendar_cache` / `estimate`） |
+| `reason` | 不可用原因：`cache_missing` / `cache_invalid` / `no_rows_as_of` / `fund_not_supported` / `data_source_error` |
+
+**3 年分位定义**（写死，README/测试/实现共用）：
+
+```
+100 × (窗口内严格小于当前值的样本数) / (窗口样本数 − 1)
+```
+
+窗口 = 截至 `as_of` 的最近 **756 个交易日**；**停牌日**（`tradestatus=0`）与
+**指标非正**的行不进入样本（亏损股的 PE 不可排序）。当前值缺失/非正，或有效样本
+少于 **250** 时，该分位为 `null` 并在 `*_percentile_reason` 写明原因 —— 不拿几十行
+冒充「3 年」。并列值不计入「严格小于」，因此窗口最大值恒为 100、最小值恒为 0。
+
+> 基金（含 ETF）固定返回 `available=false, reason="fund_not_supported"`，
+> 且**不追加 warning**（上游 §6.5 只覆盖沪深个股）。股票缓存缺失/过期会给出
+> 一条可操作提示，但不改变任何决策字段。
+
 ### data.execution（v2.0 新增字段）
 
 `{signal_bar, fill, slippage_bps, commission_bps}` —— 本次结论对应的成交假设。
@@ -509,6 +573,8 @@ python cli.py 600519 --start 20200101 --json
 - `evidence.edge` 七键齐全（值全 `null`）、`evidence.signal_stats` 展开到 5 个 horizon 子键（值 `null`）、
   `evidence.decision_replay` 七键齐全、`recommendation.signal` 十三键齐全、`data.execution` 四键齐全
 - `evidence.flow` 十八键齐全（`available=false, reason="data_source_error"`，数值键全 `null`）
+- `evidence.valuation` 二十四键齐全（`available=false, reason="data_source_error"`，数值键全 `null`；
+  `pub_lag_days=0`，`percentile_samples={pe: null, pb: null, ps: null}`）
 - `recommendation.horizon_days = [null, null]`、`stop_loss/take_profit/stop_method = null`、`position_fraction = 0.0`
 - `data.bars/start/end/last_close` 在"数据太短"时是**已知真实值**（如 `bars=23`），与 `invalidation` 文本一致；拉取彻底失败时才为 `0 / "" / null`
 - `candidates = []`（没有候选才是正确语义，不是缺字段）
@@ -908,6 +974,10 @@ numpy>=2.3.3,<3; python_version >= "3.14"
 cd source
 pip install -r requirements.txt
 ```
+
+> **可选：估值预计算依赖**。`requirements-research.txt` 里的 `baostock==0.9.4` **不属于**
+> 主依赖，只有 `tools/precompute_valuation.py`（P1-1 估值历史）需要它；主 CLI 与测试
+> 不安装也能完整运行。安装方式：`pip install -r requirements-research.txt`。
 
 装完自查（一条命令确认版本组合）：
 
