@@ -13,14 +13,17 @@ from stock_analysis.data_loader.bars import (
 )
 
 # 调用方 `source=` 入参 → 渠道池优先顺序。
-#   'akshare'（默认）/ 'eastmoney' → 先试东财
-#   'sina' / 'sina_stock'          → 先试新浪股票
-# 未列出的（含 None）→ 不指定偏好，按渠道池自身的轮询顺序
+#   'akshare'（默认）/ 'astock' → 腾讯 K 线优先（固定快照，不封 IP）
+#   'eastmoney'                → 显式要求东财时仍先试东财，失败再腾讯
+#   'sina' / 'sina_stock'      → 显式要求新浪时先试新浪，失败再腾讯
+# 未列出的（含 None）→ 不指定偏好，按渠道池自身的轮询顺序（腾讯仍排第一）
 _SOURCE_PREFERENCE = {
-    'akshare': ['eastmoney', 'sina_stock', 'sina_fund'],
-    'eastmoney': ['eastmoney', 'sina_stock', 'sina_fund'],
-    'sina': ['sina_stock', 'eastmoney', 'sina_fund'],
-    'sina_stock': ['sina_stock', 'eastmoney', 'sina_fund'],
+    'akshare': ['astock_tencent', 'eastmoney', 'sina_stock', 'sina_fund'],
+    'astock': ['astock_tencent', 'eastmoney', 'sina_stock', 'sina_fund'],
+    'astock_tencent': ['astock_tencent', 'eastmoney', 'sina_stock', 'sina_fund'],
+    'eastmoney': ['eastmoney', 'astock_tencent', 'sina_stock', 'sina_fund'],
+    'sina': ['sina_stock', 'astock_tencent', 'eastmoney', 'sina_fund'],
+    'sina_stock': ['sina_stock', 'astock_tencent', 'eastmoney', 'sina_fund'],
 }
 
 # F20: 缓存写盘最小行数 —— 低于该值视为"失败拉取的空壳"，绝不落盘。
@@ -42,7 +45,18 @@ _LAST_FETCH_INFO = {
     'cache_last_date': None,  # 缓存末根 K 线日期（ISO）
     'lag_days': None,        # 缓存末日 → 期望最新交易日 之间的交易日数
     'expected_date': None,   # 期望的最新交易日（跳过周末/未收盘）
+    # a-stock-data §12：期望交易日的来源。'astock_calendar' = 深交所官方日历；
+    # 'estimate' = 原有「周末推算」回退。只进 _LAST_FETCH_INFO（CLI JSON 契约未改，
+    # 因为 decision/schema.py 属本任务禁止修改的范围——见 PR 说明）。
+    'expected_source': None,
+    # 本次刷新是否与旧缓存取并集，以及并集里有多少行只存在于旧缓存。
+    # 仅用于可观测性（stderr + last_fetch_info），不进 CLI JSON。
+    'merged_from_cache': False,
+    'cache_rows_kept': 0,
 }
+
+# 最近一次 _expected_latest_trade_date() 的判定来源
+_EXPECTED_SOURCE = {'value': None}
 
 
 def last_fetch_info():
@@ -55,6 +69,8 @@ def _reset_fetch_info(requested_source=None):
         _LAST_FETCH_INFO[k] = None
     _LAST_FETCH_INFO['degraded'] = False
     _LAST_FETCH_INFO['requested_source'] = requested_source
+    _LAST_FETCH_INFO['merged_from_cache'] = False
+    _LAST_FETCH_INFO['cache_rows_kept'] = 0
 
 
 def _record_fetch(source, from_cache, **extra):
@@ -63,6 +79,8 @@ def _record_fetch(source, from_cache, **extra):
     for k, v in extra.items():
         if k in _LAST_FETCH_INFO:
             _LAST_FETCH_INFO[k] = v
+    # 期望交易日来源随每条取数记录一起落账（caller 无需逐处传参）
+    _LAST_FETCH_INFO['expected_source'] = _EXPECTED_SOURCE.get('value')
 
 
 def _mark_degraded(reason, cached_df):
@@ -150,6 +168,276 @@ def _write_cache(df, cache_file, label):
         return False
 
 
+# ---------------------------------------------------------------------------
+# 旧缓存增量更新（2026-11-12，修复 PR #9 阻断回归）
+#
+# 事故：新主通道 astock_tencent 把「未指定 start」解释成 2020-01-01，冷/热跑都把
+# 600519 的 6041 根缓存覆盖成 1662 根，回测结论从 no_edge/唐奇安 变成 ok/配对交易。
+#
+# 修复后的不变量：
+#   1. 冷启动（无缓存）→ 从 FULL_HISTORY_START 拉全量；
+#   2. 过期缓存 → 只拉「缓存末日 - CACHE_OVERLAP_DAYS」的近端窗口（通常 1 个
+#      腾讯分页窗口），按 _classify_overlap 分类后合并；
+#   3. 分类为 basis_changed / no_overlap → 从**缓存首日**全量重取（不是从 1990，
+#      避免无谓的 19 次分页）；
+#   4. 全量重取后按**覆盖范围**而非行数决定是否接受：
+#      * 起始日 <= 缓存起始日（覆盖起点）→ 接受。
+#        - consistent / source_noise → 与旧缓存取并集，**重叠日保留旧缓存值**，
+#          只追加缓存末日之后的新行（保留源端缺失的历史根，如腾讯缺 2007-09-04；
+#          源间噪声不污染旧基准）；
+#        - basis_changed（系统性平移）→ 以新基准整体替换并 warning；
+#        - no_overlap（但覆盖起点）→ 直接用新结果。
+#      * 起始日 >  缓存起始日（真正的历史截断）→ 保留原缓存并报 degraded。
+#      行数变少本身不再是拒绝理由：少 1 根可能只是源端缺点，缓存必须能前进。
+# ---------------------------------------------------------------------------
+CACHE_OVERLAP_DAYS = 40       # 近端回看天数（覆盖春节等长假，保证有重叠交易日）
+OVERLAP_PRICE_TOL = 0.01      # 重叠段价格容差（元；4 位小数舍入）
+OVERLAP_VOLUME_TOL = 100.0    # 重叠段成交量容差（股；腾讯按整手取整，上游 #57）
+# 源间噪声 vs 复权基准变化（2026-11-12，PR #9 最终判据修正）
+#
+# 判据不能是「任一重叠日超差 = 基准已变」，也不能是「最大相对差 >0.5% = 基准已变」：
+# 后者仍会被**单个异常日**绑架。实盘 600519 缓存历史来自新浪，腾讯全量重取在
+# 6040 个重叠交易日里只有 12 天（0.199%）价格差 0.1–0.72 元；其中 2011-12-13
+# 相对差 0.6155%、2011-12-15 0.5527% —— 两天就足以把整段判成「系统性平移」，
+# 于是整体替换成腾讯 6040 根，丢掉新浪独有的 2007-09-04（策略由唐奇安变 CMF）。
+#
+# 真正的系统性复权基准变化（除权后 qfq 整体重算）会让**大多数**日期同时超差，
+# 而不是 6040 天里的 12 天。因此价格基准改用**分布判据**：
+#
+#   frac_price = OHLC 逐项超差占比（超差项数 / 4×重叠日数；价格超差 = 绝对差 > 0.01）
+#   p95_rel    = 逐日相对价格差 |Δ|/|缓存价| 的 95 分位
+#                （只对价格超差日取值，其余日按 0 计入；重叠 <20 日时退回 max，
+#                 小样本下 95 分位几乎恒为 0，用 max 才不会漏判）
+#
+#   consistent   : 价格、成交量全部在容差内
+#   source_noise : frac_price <= 1% 且 p95_rel <= 0.5%
+#                  —— 少数日子的源间差异，旧历史仍属同一基准，取并集并保留旧值
+#   basis_changed: frac_price > 1% 或 p95_rel > 0.5%（系统性平移，如除权后 ×0.98）
+#   no_overlap   : 无共同交易日
+#
+# 成交量与价格基准**分开判断**（成交量没有复权基准，只有单位/口径问题）：
+#   frac_vol = 成交量超差日数 / 重叠日数   （超差 = 绝对差 > 100 股）
+#     frac_vol > 10%      → 成交量单位/尺度变化，新 tail 不能与旧序列混用，
+#                           同样判 basis_changed（走整体替换）
+#     0 < frac_vol <= 10% → 只 warning（数据质量提示），不改变价格基准分类
+#   成交量超差日不并入 frac_price。
+OVERLAP_NOISE_MAX_PRICE_FRAC = 0.01  # OHLC 逐项超差占比上限（1%）
+OVERLAP_NOISE_MAX_REL = 0.005        # 相对价格差 95 分位上限（0.5%）
+OVERLAP_VOLUME_SCALE_FRAC = 0.10     # 成交量超差日占比超过 10% → 尺度变化
+OVERLAP_MIN_SAMPLE = 20              # 重叠日少于此值：p95 退回 max
+# 冷启动下限：1990-01-01 早于 A 股任一标的上市日，等价「全量」。
+# 用 YYYYMMDD 是因为 eastmoney/sina 通道收这个格式（astock 侧会转成 1990-01-01）。
+FULL_HISTORY_START = '19900101'
+
+
+def _prepare_indexed_frame(raw):
+    """渠道原始 DataFrame → DatetimeIndex + 数值列（写盘与合并共用）。"""
+    full = raw
+    if 'date' not in full.columns:
+        full = _normalize_daily_df(full)
+    full = full.copy()
+    full['date'] = pd.to_datetime(full['date'])
+    full = full.set_index('date').sort_index()
+    for col in ('open', 'high', 'low', 'close', 'volume'):
+        if col in full.columns:
+            full[col] = pd.to_numeric(full[col], errors='coerce')
+    return full[~full.index.duplicated(keep='last')]
+
+
+def _overlap_stats(cached, fresh):
+    """重叠交易日的超差统计（向量化）。
+
+    价格与成交量**分别**统计（成交量没有复权基准，不能并入价格超差占比）：
+
+      * ``common``       —— 重叠交易日数；
+      * ``price_exceed`` —— 价格超差日数（任一 OHLC 绝对差 > 0.01，或任一侧 NaN）；
+      * ``vol_exceed``   —— 成交量超差日数（绝对差 > 100 股，或任一侧 NaN）；
+      * ``frac_price``   —— OHLC 逐项超差占比（超差项数 / 4×重叠日数）。按列而非
+                            按日统计，才能区分「4% 的日期只有一列差 1%」（1% 项，
+                            源噪声）与「5% 的日期各列都差 1%」（>1% 项，系统性）；
+      * ``p95_rel``      —— 逐日相对价格差 |Δ|/|缓存价| 的 95 分位；
+      * ``max_rel``      —— 价格超差日的最大相对差（无超差为 0）；
+      * ``frac_vol``     —— vol_exceed / common；
+      * ``max_vol_abs`` / ``max_vol_rel`` —— 成交量超差日的最大绝对/相对差；
+      * ``exceed``       —— 兼容旧调用方的别名，等于 price_exceed。
+
+    ``p95_rel`` 的口径：在**全部重叠日**上取 95 分位，非超差日按 0 计入 ——
+    这样 6040 天里 12 天（0.2%）的源间噪声落在右侧 5% 尾部之外，p95 仍为 0，
+    不会被单个异常日绑架。重叠样本 <20 日时 95 分位几乎恒等于最大值，改为
+    直接取 max，避免小样本下 p95 退化成 0 而漏判基准变化。
+
+    相对差只在超过**绝对**容差的日子上计算：未超容差的日子不参与，避免低价股
+    因为 0.005 元的正常舍入就被判成「相对差 1%」。
+    任一侧 NaN 视为超差且相对差 = inf（无法验证的基准不能并入旧序列）。
+    """
+    empty = {
+        'common': 0, 'price_exceed': 0, 'vol_exceed': 0, 'exceed': 0,
+        'price_cells': 0, 'price_cells_bad': 0,
+        'frac_price': 0.0, 'p95_rel': 0.0, 'max_rel': 0.0,
+        'frac_vol': 0.0, 'max_vol_abs': 0.0, 'max_vol_rel': 0.0,
+        'price_nan': 0,
+    }
+    common = cached.index.intersection(fresh.index)
+    if len(common) == 0:
+        return empty
+
+    a = cached.loc[common]
+    b = fresh.loc[common]
+    price_bad = pd.Series(False, index=common)
+    price_nan = pd.Series(False, index=common)
+    rel = pd.Series(0.0, index=common)
+    price_cells = 0          # OHLC 逐项比较的样本数（= 4 × 重叠日）
+    price_cells_bad = 0
+
+    for col in ('open', 'high', 'low', 'close'):
+        if col not in cached.columns or col not in fresh.columns:
+            continue
+        ca = pd.to_numeric(a[col], errors='coerce').astype(float)
+        cb = pd.to_numeric(b[col], errors='coerce').astype(float)
+        diff = (ca - cb).abs()
+        nan = ca.isna() | cb.isna()
+        over = diff > OVERLAP_PRICE_TOL
+        price_bad = price_bad | nan | over
+        price_nan = price_nan | nan
+        price_cells += int(len(common))
+        price_cells_bad += int((nan | over).sum())
+        with np.errstate(divide='ignore', invalid='ignore'):
+            day_rel = diff / ca.abs()
+        day_rel = day_rel.where(over & ~nan, 0.0)
+        day_rel = day_rel.mask(nan | ((ca.abs() == 0) & over), np.inf)
+        rel = np.maximum(rel, day_rel.fillna(0.0))
+
+    vol_bad = pd.Series(False, index=common)
+    vol_rel = pd.Series(0.0, index=common)
+    vol_abs = pd.Series(0.0, index=common)
+    if 'volume' in cached.columns and 'volume' in fresh.columns:
+        va = pd.to_numeric(a['volume'], errors='coerce').astype(float)
+        vb = pd.to_numeric(b['volume'], errors='coerce').astype(float)
+        vol_abs = (va - vb).abs()
+        vnan = va.isna() | vb.isna()
+        vol_bad = vnan | (vol_abs > OVERLAP_VOLUME_TOL)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            day_vrel = vol_abs / va.abs()
+        day_vrel = day_vrel.where(vol_bad & ~vnan, 0.0)
+        day_vrel = day_vrel.mask(vnan | ((va.abs() == 0) & vol_bad), np.inf)
+        vol_rel = day_vrel.fillna(0.0)
+
+    n = int(len(common))
+    price_exceed = int(price_bad.sum())
+    vol_exceed = int(vol_bad.sum())
+    rel_values = rel.to_numpy(dtype=float)
+
+    if price_exceed == 0:
+        max_rel = p95_rel = 0.0
+    else:
+        max_rel = float(np.max(rel_values))
+        if n < OVERLAP_MIN_SAMPLE:
+            p95_rel = max_rel
+        else:
+            # 'higher'：取不低于 95% 位置的那个实际观测值，边界（恰好 5% 的日期
+            # 超差）不会被线性插值稀释。
+            p95_rel = float(np.quantile(rel_values, 0.95, method='higher'))
+
+    if vol_exceed == 0:
+        max_vol_abs = max_vol_rel = 0.0
+    else:
+        max_vol_abs = float(vol_abs.to_numpy()[vol_bad.to_numpy()].max())
+        max_vol_rel = float(vol_rel.to_numpy()[vol_bad.to_numpy()].max())
+
+    return {
+        'common': n,
+        'price_exceed': price_exceed,
+        'vol_exceed': vol_exceed,
+        'exceed': price_exceed,          # 兼容旧调用方
+        'price_cells': price_cells,
+        'price_cells_bad': price_cells_bad,
+        'frac_price': (price_cells_bad / price_cells) if price_cells else 0.0,
+        'p95_rel': p95_rel,
+        'max_rel': max_rel,
+        'frac_vol': vol_exceed / n,
+        'max_vol_abs': max_vol_abs,
+        'max_vol_rel': max_vol_rel,
+        'price_nan': int(price_nan.sum()),
+    }
+
+
+def _classify_overlap(cached, fresh, stats=None):
+    """重叠段分类：'consistent' / 'source_noise' / 'basis_changed' / 'no_overlap'。
+
+    旧实现按「任一超差日」判基准变化，后来按「超差占比 + 最大相对差」，两者都
+    会被**单个异常日**绑架（12/6040 的源间噪声里有两天相对差 0.55–0.62%）。
+    现按**分布判据**：大多数日期同时超差才是系统性复权基准变化。
+
+    价格基准：
+      * frac_price > 1%  或
+      * p95_rel > 0.5%   或
+      * 存在无法验证的价格 NaN（相对差 inf）
+      → basis_changed；否则 source_noise。
+
+    成交量尺度（与价格基准分开）：
+      * frac_vol > 10% → 成交量单位/口径变化，tail 不能与旧序列混用 → basis_changed；
+      * 0 < frac_vol <= 10% → 只 warning，不改变价格基准分类。
+
+    ``stats``（可选 dict）会被填入 ``_overlap_stats`` 的统计，供调用方打日志。
+    """
+    s = _overlap_stats(cached, fresh)
+    if stats is not None:
+        stats.update(s)
+    if s['common'] == 0:
+        return 'no_overlap'
+    if s['price_exceed'] == 0 and s['vol_exceed'] == 0:
+        return 'consistent'
+
+    # 用整数比较，避开 1/100、10/100 这类浮点边界误差：
+    #   frac_price > 1%  <=>  price_cells_bad * 100 > price_cells
+    #   frac_vol   > 10% <=>  vol_exceed * 10      > common
+    price_frac_changed = (s['price_cells_bad'] * 100 > s['price_cells']) \
+        if s['price_cells'] else False
+    price_rel_changed = (not np.isfinite(s['p95_rel'])
+                         or s['p95_rel'] > OVERLAP_NOISE_MAX_REL)
+    vol_scale_changed = s['vol_exceed'] * 10 > s['common']
+    if (price_frac_changed or price_rel_changed or vol_scale_changed
+            or s['price_nan'] > 0):
+        return 'basis_changed'
+    return 'source_noise'
+
+
+def _log_overlap_verdict(label, cls, s, stage=''):
+    """把完整判据打到 stderr（可审计：分类不靠猜）。"""
+    def _pct(v):
+        return 'inf' if not np.isfinite(v) else f'{v:.3%}'
+
+    print(f"[INFO] {label} {stage}重叠判据：重叠 {s['common']} 日；"
+          f"价格超差 {s['price_exceed']} 日（frac_price={_pct(s['frac_price'])}），"
+          f"p95_rel={_pct(s['p95_rel'])}，max_rel={_pct(s['max_rel'])}；"
+          f"成交量超差 {s['vol_exceed']} 日（frac_vol={_pct(s['frac_vol'])}）；"
+          f"分类={cls}", file=sys.stderr)
+    if 0 < s['vol_exceed'] and s['frac_vol'] <= OVERLAP_VOLUME_SCALE_FRAC:
+        print(f"[WARN] {label} 成交量异常 {s['vol_exceed']} 日"
+              f"（最大绝对差 {s['max_vol_abs']:.0f} 股、最大相对差 "
+              f"{_pct(s['max_vol_rel'])}），仅数据质量提示，不改变价格基准分类",
+              file=sys.stderr)
+
+
+def _merge_with_cache(cached, fresh, label, cls='consistent'):
+    """旧缓存与本次结果取并集，返回 (merged, 只存在于旧缓存的行数)。
+
+    并集语义（2026-11-12 修正）：**重叠日保留旧缓存值**，只追加缓存末日之后
+    的新行；旧缓存独有的历史根保留（腾讯不复权日线缺 2007-09-04 这类单点缺口
+    不因刷新增量而丢失）。不用新值覆盖重叠日，是因为本次来源可能与旧缓存历史
+    来自不同渠道（新浪历史 + 腾讯刷新），两套基准存在 0.01–0.72 元的源间噪声；
+    保留旧值可让既有序列维持单一基准，也满足「源噪声不污染旧历史」的要求。
+    """
+    new_tail = fresh[fresh.index > cached.index[-1]]
+    merged = pd.concat([cached, new_tail])
+    merged = merged[~merged.index.duplicated(keep='first')].sort_index()
+    kept = int(len(cached.index.difference(fresh.index)))
+    print(f"[WARN] {label} 增量合并：保留旧缓存 {kept} 行"
+          f"（本次源端 {len(fresh)} 行，合并后 {len(merged)} 行；重叠分类={cls}）",
+          file=sys.stderr)
+    return merged, kept
+
+
 def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare'):
     """获取股票日线数据（前复权）。
 
@@ -158,7 +446,11 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
       非交易日不再无谓触网（原实现用 today-1，周日在周六→必然触网失败再回退）；
     * 缓存命中时**仍按 start_date 截取**（原实现完全忽略该参数）；
     * 写盘一律写**未截断的全量**（原实现把 start 过滤后的子集写回，
-      一次 `--start 2024` 就会把 2020–2023 的缓存永久削掉）。
+      一次 `--start 2024` 就会把 2020–2023 的缓存永久削掉）；
+    * 未指定 start_date 时按**全量历史**取数（FULL_HISTORY_START），不再被
+      适配器默认的 2020-01-01 截断；过期缓存走近端增量 + 合并，写盘以**覆盖
+      范围**为准（见上面 CACHE_OVERLAP_DAYS 一节的不变量），不因源端少一根而
+      拒绝推进缓存。
     """
     cache_file = os.path.join(DATA_DIR, f'stock_{symbol}_{adjust}.csv')
     _reset_fetch_info(source)
@@ -194,27 +486,105 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
     # 后果：东财节点一封 IP，整条取数链就死掉，尽管新浪通道完全可用
     # （实测 Hermes 环境：ak.stock_zh_a_daily 返回正常，东财 TCP 层被拒）。
     # 现改为走渠道池，任一通道成功即返回，全部失败才回退旧缓存。
-    print(f"正在拉取 {symbol} 历史数据 (渠道池) ...", file=sys.stderr)
+    # 取数窗口：冷启动拉全量；过期缓存只拉近端窗口，拿回后再与旧缓存比对/合并。
+    incremental = _stale_cache is not None and not _stale_cache.empty
+    if incremental:
+        last_cached = pd.Timestamp(_stale_cache.index[-1])
+        fetch_start = (last_cached - pd.Timedelta(days=CACHE_OVERLAP_DAYS)).strftime('%Y%m%d')
+    else:
+        fetch_start = FULL_HISTORY_START
+
+    print(f"正在拉取 {symbol} 历史数据 (渠道池，起 {fetch_start}) ...", file=sys.stderr)
     raw = None
     used_source = None
     try:
         raw, used_source = _STOCK_DATA_SOURCE_POOL.fetch(
-            symbol, start_date, adjust, preferred=_SOURCE_PREFERENCE.get(source)
+            symbol, fetch_start, adjust, preferred=_SOURCE_PREFERENCE.get(source)
         )
     except Exception as e:
         print(f"渠道池调用异常：{e}", file=sys.stderr)
 
     if raw is not None and not raw.empty:
         try:
-            full = raw
-            if 'date' not in full.columns:
-                full = _normalize_daily_df(full)
-            full = full.copy()
-            full['date'] = pd.to_datetime(full['date'])
-            full = full.set_index('date').sort_index()
-            for col in ('open', 'high', 'low', 'close', 'volume'):
-                if col in full.columns:
-                    full[col] = pd.to_numeric(full[col], errors='coerce')
+            full = _prepare_indexed_frame(raw)
+            merged_from_cache = False
+            cache_rows_kept = 0
+            if incremental:
+                cls_stats = {}
+                cls = _classify_overlap(_stale_cache, full, cls_stats)
+                _log_overlap_verdict(f'stock_{symbol}', cls, cls_stats, '增量段')
+                if cls in ('consistent', 'source_noise'):
+                    full, cache_rows_kept = _merge_with_cache(
+                        _stale_cache, full, f'stock_{symbol}', cls)
+                    merged_from_cache = True
+                else:
+                    # 近端窗口无法与旧缓存直接拼接 → 从缓存首日全量重取。
+                    # 是否接受这份全量结果，取决于它**是否覆盖缓存起始日**
+                    # （覆盖范围不变量），而不是行数多少：行数更少可能只是
+                    # 源端少一根（如腾讯缺 2007-09-04），不代表历史被截断。
+                    reason = ('重叠段复权基准已变' if cls == 'basis_changed'
+                              else '与旧缓存无重叠')
+                    print(f"[WARN] {symbol} 增量{reason}（分类={cls}，"
+                          f"重叠 {cls_stats['common']} 日、价格超差 "
+                          f"{cls_stats['price_exceed']} 日、成交量超差 "
+                          f"{cls_stats['vol_exceed']} 日），"
+                          f"改为从缓存首日 "
+                          f"{pd.Timestamp(_stale_cache.index[0]).date()} 全量重取", file=sys.stderr)
+                    raw2, used2 = None, None
+                    try:
+                        raw2, used2 = _STOCK_DATA_SOURCE_POOL.fetch(
+                            symbol, pd.Timestamp(_stale_cache.index[0]).strftime('%Y%m%d'),
+                            adjust, preferred=_SOURCE_PREFERENCE.get(source))
+                    except Exception as e:
+                        print(f"渠道池全量重取异常：{e}", file=sys.stderr)
+                    if raw2 is not None and not raw2.empty:
+                        fresh_full = _prepare_indexed_frame(raw2)
+                        used_source = used2 or used_source
+                        if fresh_full.index[0] > _stale_cache.index[0]:
+                            # 真正的历史截断：新结果起始日晚于缓存首日，覆盖不了
+                            # 旧历史 → 历史一旦丢失不可逆，保留原缓存并降级。
+                            _mark_degraded(
+                                f"{symbol} 全量重取起始日 "
+                                f"{pd.Timestamp(fresh_full.index[0]).date()} 晚于缓存首日 "
+                                f"{pd.Timestamp(_stale_cache.index[0]).date()}"
+                                f"（比本地缓存短或缺根），保留原缓存",
+                                _stale_cache)
+                            return _apply_start(_stale_cache, start_date)
+                        recon_stats = {}
+                        recon = _classify_overlap(_stale_cache, fresh_full, recon_stats)
+                        _log_overlap_verdict(f'stock_{symbol}', recon, recon_stats,
+                                             '全量重取段')
+                        if recon == 'basis_changed':
+                            # 系统性平移（除权/分红后 qfq 整体重算）：新基准才是正确
+                            # 基准，整体采用新结果，绝不把旧基准混进序列。
+                            print(f"[WARN] {symbol} 全量重取与旧缓存重叠段不一致"
+                                  f"（复权基准已变，分类={recon}，重叠 "
+                                  f"{recon_stats['common']} 日、价格超差 "
+                                  f"{recon_stats['price_exceed']} 日、成交量超差 "
+                                  f"{recon_stats['vol_exceed']} 日、"
+                                  f"frac_price={recon_stats['frac_price']:.4%}、"
+                                  f"p95_rel={recon_stats['p95_rel']:.4%}、"
+                                  f"frac_vol={recon_stats['frac_vol']:.4%}），"
+                                  f"采用新基准并整体替换旧缓存",
+                                  file=sys.stderr)
+                            full = fresh_full
+                        elif recon in ('consistent', 'source_noise'):
+                            # 覆盖缓存起始日，且差异只是源间噪声（或完全一致）
+                            # → 取并集，保留源端缺失的历史根与旧值。
+                            full, cache_rows_kept = _merge_with_cache(
+                                _stale_cache, fresh_full, f'stock_{symbol}', recon)
+                            merged_from_cache = True
+                        else:
+                            # 无重叠但已确认覆盖缓存起始日（理论边界）→ 用新结果
+                            print(f"[INFO] {symbol} 全量重取与旧缓存无重叠"
+                                  f"（分类={recon}），采用新结果", file=sys.stderr)
+                            full = fresh_full
+                    else:
+                        print(f"全量重取失败，回退到本地旧缓存", file=sys.stderr)
+                        _mark_degraded(f"{symbol} 增量{reason}且全量重取失败，回退到本地旧缓存",
+                                       _stale_cache)
+                        return _apply_start(_stale_cache, start_date)
+
             # 写盘用全量，返回用截断窗口
             _write_cache(full, cache_file, f'stock_{symbol}')
             _record_fetch(used_source or 'unknown', False,
@@ -222,7 +592,9 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
                                            if len(full) else None),
                           lag_days=0,
                           expected_date=expected.isoformat(),
-                          requested_source=source)
+                          requested_source=source,
+                          merged_from_cache=merged_from_cache,
+                          cache_rows_kept=cache_rows_kept)
             return _apply_start(full, start_date)
         except Exception as e:
             print(f"渠道池数据规范化失败（source={used_source}）：{e}", file=sys.stderr)
@@ -395,9 +767,28 @@ def get_stock_name(code):
     return code
 
 
-def _expected_latest_trade_date():
-    """计算期望的最新交易日日期。"""
-    now = datetime.datetime.now()
+def _expected_latest_trade_date(now=None):
+    """计算期望的最新交易日日期。
+
+    a-stock-data §12 接入（2026-11-12）：优先使用深交所官方整月日历，
+    能正确跨过法定节假日（旧实现只跳周末，节假日会误判"缓存过期"→
+    无谓触网 50s 再回退）。日历不可用（离线 / 未发布 / 接口失败）时，
+    **完全回退**到原来的周末推算法，行为与接入前一致。
+    """
+    now = now or datetime.datetime.now()
+
+    try:
+        from stock_analysis.data_sources import astock
+        official = astock.latest_trading_day_at(now)
+    except Exception as e:  # 日历是辅助信号，任何异常都不得阻断取数
+        print(f"[WARN] 官方交易日历不可用，回退周末推算：{e}", file=sys.stderr)
+        official = None
+
+    if official is not None:
+        _EXPECTED_SOURCE['value'] = 'astock_calendar'
+        return official
+
+    _EXPECTED_SOURCE['value'] = 'estimate'
     expected = now.date()
     if now.hour < 15:
         expected = expected - datetime.timedelta(days=1)
@@ -450,7 +841,9 @@ def resolve_and_fetch(code, type_hint='auto', start_date=None):
     def _fetch(dtype):
         if dtype == 'fund':
             return get_fund_daily(code, start_date=start_date)
-        return get_stock_daily(code, start_date=start_date, source='sina')
+        # 2026-11-12：主流程改用默认渠道优先级（腾讯优先），不再硬绑新浪。
+        # 显式 source='sina' 仍可用（见 _SOURCE_PREFERENCE）。
+        return get_stock_daily(code, start_date=start_date, source='akshare')
 
     if type_hint == 'fund':
         return _fetch('fund'), 'fund', None

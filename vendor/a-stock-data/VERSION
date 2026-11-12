@@ -1,0 +1,12 @@
+upstream: a-stock-data
+repository: https://github.com/simonlin1212/a-stock-data
+version: 3.10.4
+tag: v3.10.4
+commit: f21534946c42be3ad048ac938eecb1bad84cb8ab
+commit_date: 2026-11-04T07:50:57+08:00
+fetched_at: 2026-11-12
+snapshot: SKILL.md (fixed commit; never follow floating main)
+license: Apache-2.0 (see LICENSE)
+skill_sha256: 09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2
+extracted_by: tools/astock_extract.py
+generated: source/stock_analysis/data_sources/_astock_generated.py

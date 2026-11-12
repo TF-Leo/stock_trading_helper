@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Callable, Optional
 
+from stock_analysis.data_sources import astock as _astock_source
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 
@@ -165,6 +167,15 @@ def _normalize_daily_df(df):
     return normalized
 
 
+def _fetch_from_astock_tencent(symbol, start_date, adjust):
+    """a-stock-data 腾讯 K 线（固定快照；§1.2 原始价 + §1.6 比例前复权）。
+
+    返回 DatetimeIndex + OHLCV；meta 的 `_normalize_daily_df` 会把索引还原成
+    `date` 列后走与其它通道完全相同的规范化/缓存路径。
+    """
+    return _astock_source.fetch_daily(symbol, start_date=start_date, adjust=adjust)
+
+
 def _fetch_from_eastmoney(symbol, start_date, adjust):
     if ak is None:
         raise RuntimeError("akshare未安装，无法在线拉取(eastmoney)")
@@ -202,6 +213,9 @@ def _fetch_from_sina_fund(symbol, start_date, adjust):
 
 _STOCK_DATA_SOURCE_POOL = _DataSourcePool(
     sources=[
+        # 首选腾讯：实测不封 IP，只做单入口限流（自带三入口轮换 + 120s 冷却）。
+        # 东财被 IP 级封锁时仍能取数——这正是本任务要解决的健壮性问题。
+        ("astock_tencent", _fetch_from_astock_tencent),
         ("eastmoney", _fetch_from_eastmoney),
         ("sina_stock", _fetch_from_sina_stock),
         ("sina_fund", _fetch_from_sina_fund),
