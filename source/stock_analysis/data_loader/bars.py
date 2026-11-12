@@ -73,6 +73,22 @@ def _sanitize_error_text(err) -> str:
     return text
 
 
+class EmptyDataError(RuntimeError):
+    """通道正常响应但**没有数据**（与「调用失败」区分开）。
+
+    P0（issue #24）：场外基金走场内 ETF 通道（``ak.fund_etf_hist_sina``）时，
+    正常结果就是 0 行 —— 这不是故障，而是「该代码不是场内 ETF」的正常答案。
+    用独立异常类把它和网络/解析失败分开：
+
+      * 仍按 ``{source, ok=False, error_class='EmptyDataError', ...}`` 结构化留痕，
+        满足「逐通道可见」；
+      * ``format_attempt_warnings`` 在**同轮有其它通道成功**时不把它当噪声输出，
+        避免 023299/001917 这类场外基金的正常路径被无意义的失败条目刷屏。
+
+    股票渠道池的空结果仍用 ``RuntimeError('... 返回空数据')``，语义不变。
+    """
+
+
 def _attempt(source, ok, error=None, cooldown=False, removed=False,
              cooldown_seconds=None):
     record = {
@@ -93,11 +109,19 @@ def format_attempt_warnings(attempts):
 
     只在失败 / 冷却 / 剔除时产出条目；全通道首试成功时返回空列表
     （P0-4 要求：成功路径不新增噪声）。
+
+    特例（issue #24）：``EmptyDataError`` 表示「通道正常响应但无数据」，典型场景
+    是场外基金走场内 ETF 通道（023299/001917 等常态 0 行）。当同轮**已有通道成功**
+    时它是预期内的「不适用」，不再输出噪声；只有整轮全部失败时才作为诊断信息呈现。
     """
+    items = list(attempts or [])
+    any_ok = any(item.get('ok') is True for item in items)
     lines = []
-    for item in attempts or []:
+    for item in items:
         source = _safe_source_name(item.get('source'))
         if item.get('ok') is True:
+            continue
+        if any_ok and item.get('error_class') == 'EmptyDataError':
             continue
         if item.get('ok') is None:
             reason = '已从渠道池剔除' if item.get('removed') else '冷却中'
