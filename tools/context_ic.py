@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""P1 证据 v1（issue #51）：估值 / 资金面 / 指数 regime 的 IC 与分层检验。
+"""P1 证据 v1/v2（issue #51 / #62）：估值 / 资金面 / 指数 regime 的 IC 与分层检验。
 
-任务书：GitHub issue #51；口径：``docs/P1_EVIDENCE_PLAN.md`` §3.1–§3.4。
+任务书：GitHub issue #51（v1）、#62（v2）；口径：``docs/P1_EVIDENCE_PLAN.md``
+§3.1–§3.4、§3.6（R4 门槛修订）。
+
+v2 新增 ``stratify-buypoints``：按 **「票 × 季度」聚类** 的买点分层检验，门槛
+X = Δ命中率 ≥ 3pp + 聚类稳健 p<0.05 + OOS 同号 + n_clusters ≥ 2,500。
+``fetch`` 同时支持**分批 + 退避 + 失败重试轮**（R3 实测第 73 只后整段失败）。
 
 两个阶段，联网与离线严格分开
 ----------------------------
@@ -35,6 +40,9 @@
     # 离线分析（秒级）
     python tools/context_ic.py analyze --horizon 20
 
+    # v2：买点分层（票 × 季度聚类；R4 §3.6.2 / issue #62）
+    python tools/context_ic.py stratify-buypoints --bootstrap 1000
+
     # 前置校验
     python tools/context_ic.py check-asof
     python tools/context_ic.py selftest
@@ -50,7 +58,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "source")
@@ -84,6 +92,14 @@ MAIN_FACTOR = {"valuation": "pb_pct_3y", "flow": "flow_net_20d_pct",
 
 #: 买点确认用的策略（**预注册 3 个**，各代表一个族；不按结果挑选）。
 BUY_STRATEGIES = ["均线趋势(5-20-60)", "MACD(12-26-9)", "量价突破"]
+
+#: R4 §3.6.3 / §3.6.6：X 路径门槛。簇 = 「票 × 季度」。
+X_DELTA_PP = 3.0          # 命中率提升 ≥ 3 个百分点
+X_N_CLUSTERS = 2500       # 聚类数下限（ICC ≤ 0.20 最坏情形下的 80% 功效预算）
+ALPHA = 0.05
+OOS_FRAC = 0.30           # 样本外 = 最后 30% 时间
+BOOTSTRAP_DEFAULT = 1000  # 聚类 bootstrap 最少次数（§3.6.2 要求 ≥1,000）
+BOOTSTRAP_SEED = 20261113
 
 
 # ---------------------------------------------------------------------------
@@ -150,21 +166,29 @@ def build_pool(limit, use_csi300=True):
     return codes[:limit], provenance
 
 
-def fetch_price(code, start):
+def fetch_price(code, start, attempts=3, backoff=5.0, min_last=None):
     """腾讯日线（前复权，比例口径）→ ``evidence/p1/data/price/<code>.csv``。
 
     直接调 ``astock.fetch_daily``（1–2 次 HTTP），不走 ``get_stock_daily`` 的全量
     分页，也不写主 CLI 的缓存目录。
+
+    ``min_last``：缓存末日 ≥ 该日期才视为新鲜并跳过（默认 2026-11-10，与 v1 相同；
+    v2 用 ``--min-as-of`` 显式传入，避免把「上周的缓存」当成今天的数据）。
     """
     import pandas as pd
     from stock_analysis.data_sources import astock
 
+    if min_last is None:
+        min_last = "2026-11-10"
     path = os.path.join(PRICE_DIR, f"{code}.csv")
     if os.path.exists(path):
         try:
             cached = pd.read_csv(path, index_col=0, parse_dates=True)
-            if len(cached) > 0 and str(cached.index[-1].date()) >= "2026-11-10":
+            if len(cached) > 0 and str(cached.index[-1].date()) >= min_last:
+                # 缓存来源如实回填：baostock 补齐的票不能标成腾讯（价格水平不同，
+                # 但收益率等价；报告里必须能区分）。
                 return {"code": code, "rows": len(cached), "cached": True,
+                        "source": _load_price_sources().get(code, "tencent_qfq"),
                         "first": str(cached.index[0].date()),
                         "last": str(cached.index[-1].date())}
         except Exception:  # noqa: BLE001
@@ -172,8 +196,9 @@ def fetch_price(code, start):
     last_exc = None
     # 腾讯对连续请求会限流（三个入口同时 501/空响应）。批量抓 100 只时实测
     # 在第 73 只后整段失败，隔几分钟重试即恢复 —— 因此这里对单票做退避重试，
-    # 避免把限流当成「该票无数据」。
-    for attempt in range(3):
+    # 避免把限流当成「该票无数据」。（v2 扩池到 300 只时，cmd_fetch 还会在
+    # 批次之间暂停、对整轮失败做冷却，见 ``--batch-size/--batch-pause/--cooldown``。）
+    for attempt in range(int(attempts)):
         try:
             frame = astock.fetch_daily(code, start_date=start, adjust="qfq")
             if frame is None or frame.empty:
@@ -186,8 +211,8 @@ def fetch_price(code, start):
                     "last": str(frame.index[-1].date())}
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            if attempt < 2:
-                time.sleep(5.0 * (attempt + 1))
+            if attempt < int(attempts) - 1:
+                time.sleep(float(backoff) * (attempt + 1))
     raise last_exc
 
 
@@ -206,54 +231,265 @@ def fetch_index(start):
             "last": str(frame.index[-1].date())}
 
 
+def _fresh_json_codes(directory, codes, min_as_of):
+    """按缓存 ``as_of`` 拆分「已新鲜 / 需重取」；缺失或损坏一律视为需重取。"""
+    fresh, stale = [], []
+    for code in codes:
+        path = os.path.join(directory, f"{code}.json")
+        try:
+            payload = _read_json(path)
+        except Exception:  # noqa: BLE001
+            stale.append(code)
+            continue
+        (fresh if str(payload.get("as_of", "")) >= str(min_as_of) else stale).append(code)
+    return fresh, stale
+
+
+def _bs_code(code):
+    """6 位代码 → baostock 代码；北交所/基金直接抛错（§6.5 不支持）。"""
+    code = str(code).zfill(6)
+    if code[:2] in ("60", "68", "90"):
+        return f"sh.{code}"
+    if code[:2] in ("00", "30", "20"):
+        return f"sz.{code}"
+    raise ValueError(f"baostock 不支持 {code}（北交所/基金不在 §6.5 覆盖范围）")
+
+
+def fetch_price_baostock(code, start, session):
+    """baostock §6.5 前复权（``adjustflag='2'``）日线 → 同一份 CSV 格式。
+
+    **为什么可以作为腾讯的备胎**：实测 600519 与腾讯 qfq 缓存 2,149 根完全重叠，
+    日收益最大绝对差 **3.5e-6**（9/2,149 天 > 1e-6，均为四舍五入级），
+    即两源的比例复权口径在收益上等价。差别只在「价格水平」（复权基准不同），
+    而本项目所有标签/因子都用收益率，不用绝对价位。
+
+    调用方必须传入**已登录**的 ``session``（baostock 一个进程只允许一个会话，
+    并发登录会互相踢下线 —— 实测报 ``10001001 用户未登录``）。
+    """
+    import pandas as pd
+
+    bs_code = _bs_code(code)
+    rs = session.query_history_k_data_plus(
+        bs_code, "date,open,high,low,close,volume", start_date=start,
+        end_date=datetime.now().date().isoformat(), frequency="d",
+        adjustflag="2")
+    rows = []
+    while rs.error_code == "0" and rs.next():
+        rows.append(rs.get_row_data())
+    if rs.error_code != "0":
+        raise RuntimeError(f"baostock 查询失败 {rs.error_code} {rs.error_msg}")
+    if not rows:
+        raise RuntimeError("baostock 空行情")
+    frame = pd.DataFrame(rows, columns=["date", "open", "high", "low",
+                                        "close", "volume"])
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame.set_index("date").sort_index()
+    # baostock 停牌日会返回空字符串（不是 NaN），直接 astype(float) 会抛
+    # ``could not convert string to float: ''``。停牌日没有有效 OHLCV，
+    # 直接剔除（价格序列本来就是交易日序列，缺停牌日不影响收益率）。
+    for col in ("open", "high", "low", "close", "volume"):
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    dropped = int(frame[["open", "high", "low", "close"]].isna().any(axis=1).sum())
+    frame = frame.dropna(subset=["open", "high", "low", "close"])
+    frame = frame[~frame.index.duplicated(keep="last")]
+    frame = frame[["open", "high", "low", "close", "volume"]]
+    if len(frame) < 100:
+        raise RuntimeError(f"baostock 行情仅 {len(frame)} 根（过短）")
+    path = os.path.join(PRICE_DIR, f"{code}.csv")
+    frame.index.name = "date"
+    frame.to_csv(path)
+    return {"code": code, "rows": int(len(frame)), "cached": False,
+            "source": "baostock_qfq",
+            "first": str(frame.index[0].date()),
+            "last": str(frame.index[-1].date())}
+
+
+def _load_price_sources():
+    path = os.path.join(DATA, "price_sources.json")
+    try:
+        return _read_json(path)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _fetch_prices(codes, args, min_as_of):
+    """分批抓日线：每批暂停 ``--batch-pause``；连续 3 只失败即冷却 ``--cooldown``。
+
+    腾讯失败时按 ``--price-fallback`` 降级到 baostock（单会话、逐票串行）。
+    返回 ``(ok, failed)``，二者都是 dict 列表。失败票由调用方在下一轮重试，
+    **绝不**把限流静默当成「该票无数据」。
+    """
+    ok, failed = [], []
+    streak = 0
+    sources = _load_price_sources()
+    bs_session = None
+    if args.price_fallback == "baostock":
+        import precompute_valuation as pv
+        bs = pv.import_baostock()
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            login = bs.login()
+        if str(getattr(login, "error_code", "0")) != "0":
+            _log(f"[WARN] baostock 登录失败，日线备胎不可用："
+                 f"{getattr(login, 'error_msg', '')}")
+        else:
+            bs_session = bs
+            _log("日线备胎已就绪：baostock 前复权（单会话串行）")
+    try:
+        for i, code in enumerate(codes, 1):
+            info = None
+            reason = None
+            try:
+                info = fetch_price(code, args.start, attempts=args.attempts,
+                                   backoff=args.backoff, min_last=min_as_of)
+            except Exception as exc:  # noqa: BLE001
+                reason = f"{type(exc).__name__}: {exc}"
+            if info is None and bs_session is not None:
+                try:
+                    info = fetch_price_baostock(code, args.start, bs_session)
+                    _log(f"[price {i}/{len(codes)}] {code} 腾讯失败 → baostock 补齐 "
+                         f"{info['rows']} 根")
+                except Exception as exc:  # noqa: BLE001
+                    reason = f"tencent: {reason}; baostock: {type(exc).__name__}: {exc}"
+            if info is None:
+                failed.append({"code": code, "reason": reason})
+                streak += 1
+                _log(f"[price {i}/{len(codes)}] {code} FAIL {reason}")
+                if streak >= 3:
+                    _log(f"  [backoff] 连续 {streak} 只失败，冷却 "
+                         f"{args.cooldown}s（疑似腾讯限流）")
+                    time.sleep(args.cooldown)
+                continue
+            info.setdefault("source", "tencent_qfq")
+            ok.append(info)
+            sources[code] = info["source"]
+            streak = 0
+            _log(f"[price {i}/{len(codes)}] {code} {info['rows']} 根 "
+                 f"{info['first']}~{info['last']} [{info['source']}]"
+                 f"{' (cache)' if info['cached'] else ''}")
+            if i % max(1, args.batch_size) == 0 and i < len(codes):
+                _log(f"  [batch] {i}/{len(codes)} 完成，暂停 {args.batch_pause}s")
+                time.sleep(args.batch_pause)
+    finally:
+        if bs_session is not None:
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                bs_session.logout()
+    if sources:
+        _write_json(os.path.join(DATA, "price_sources.json"), sources)
+    return ok, failed
+
+
 def cmd_fetch(args):
     _ensure_dirs()
     import precompute_valuation as pv      # tools/ 下的既有预计算入口
     import precompute_flow as pf
 
+    min_as_of = args.min_as_of or (datetime.now() - timedelta(days=4)).date().isoformat()
     codes, provenance = build_pool(args.limit, use_csi300=not args.no_csi300)
     _log(f"样本池 {len(codes)} 只（自选 {len(WATCHLIST)} + 追加 {len(EXTRA)} + "
          f"沪深300 补齐 {provenance['csi300_added']}，快照 "
-         f"{provenance['csi300_snapshot_date']}）")
+         f"{provenance['csi300_snapshot_date']}）；缓存新鲜线 {min_as_of}")
 
+    # ---- 日线：分批 + 退避 + 失败重试轮 ----
     price_ok, price_fail = [], []
-    for i, code in enumerate(codes, 1):
-        try:
-            info = fetch_price(code, args.start)
-            price_ok.append(info)
-            _log(f"[price {i}/{len(codes)}] {code} {info['rows']} 根 "
-                 f"{info['first']}~{info['last']}{' (cache)' if info['cached'] else ''}")
-        except Exception as exc:  # noqa: BLE001
-            price_fail.append({"code": code, "reason": f"{type(exc).__name__}: {exc}"})
-            _log(f"[price {i}/{len(codes)}] {code} FAIL {exc}")
+    pending = [] if args.skip_price else list(codes)
+    for round_no in range(1, max(1, args.rounds) + 1):
+        if not pending:
+            break
+        _log(f"\n日线第 {round_no} 轮：{len(pending)} 只待抓")
+        got, lost = _fetch_prices(pending, args, min_as_of)
+        price_ok += got
+        price_fail = lost
+        pending = [item["code"] for item in lost]
+        if pending and round_no < max(1, args.rounds):
+            wait = args.cooldown * 2
+            _log(f"  仍有 {len(pending)} 只失败，{wait}s 后进入重试轮："
+                 f"{', '.join(pending[:12])}{' ...' if len(pending) > 12 else ''}")
+            time.sleep(wait)
 
-    _log("估值预计算（baostock §6.5，逐票串行）...")
-    val_stats = pv.precompute(codes, out_dir=VAL_DIR, start=args.start,
-                              end=args.end, interval=0.2, retries=2)
+    # ---- 估值：只补过期缓存；失败票再单独重试一次 ----
+    fresh_val, stale_val = ([], []) if args.skip_valuation else \
+        _fresh_json_codes(VAL_DIR, codes, min_as_of)
+    _log(f"\n估值预计算（baostock §6.5）：已新鲜 {len(fresh_val)} 只，"
+         f"待取 {len(stale_val)} 只")
+    val_stats = {"ok": [], "failed": [], "login": "skipped", "wall_seconds": 0.0}
+    if stale_val:
+        val_stats = pv.precompute(stale_val, out_dir=VAL_DIR, start=args.start,
+                                  end=args.end, interval=0.2, retries=2)
+        retry_codes = [item["code"] for item in val_stats["failed"]
+                       if item.get("code")]
+        if retry_codes:
+            _log(f"  估值失败 {len(retry_codes)} 只，{args.cooldown}s 后单票重试")
+            time.sleep(args.cooldown)
+            retry = pv.precompute(retry_codes, out_dir=VAL_DIR, start=args.start,
+                                  end=args.end, interval=0.2, retries=2)
+            val_stats["ok"] = list(val_stats["ok"]) + list(retry["ok"])
+            val_stats["failed"] = retry["failed"]
+            val_stats["login"] = retry["login"]
+            val_stats["wall_seconds"] = (val_stats["wall_seconds"]
+                                         + retry["wall_seconds"])
     _log(f"  估值 ok={len(val_stats['ok'])} failed={len(val_stats['failed'])} "
          f"login={val_stats['login']} wall={val_stats['wall_seconds']}s")
 
-    _log("资金流预计算（东财优先，新浪备胎；防封铁律 ≥1.0s/请求）...")
-    flow_stats = pf.precompute(codes, out_dir=FLOW_DIR, interval=1.0, retries=1)
+    # ---- 资金流：只补过期缓存；失败票再单独重试一次 ----
+    fresh_flow, stale_flow = ([], []) if args.skip_flow else \
+        _fresh_json_codes(FLOW_DIR, codes, min_as_of)
+    _log(f"\n资金流预计算（东财优先，新浪备胎；防封铁律 ≥1.0s/请求）："
+         f"已新鲜 {len(fresh_flow)} 只，待取 {len(stale_flow)} 只")
+    flow_stats = {"ok": [], "failed": [], "requests": 0,
+                  "ok_sources": {}, "wall_seconds": 0.0}
+    if stale_flow:
+        flow_stats = pf.precompute(stale_flow, out_dir=FLOW_DIR, interval=1.0,
+                                   retries=1)
+        retry_codes = [item["code"] for item in flow_stats["failed"]
+                       if item.get("code")]
+        if retry_codes:
+            _log(f"  资金流失败 {len(retry_codes)} 只，{args.cooldown}s 后单票重试")
+            time.sleep(args.cooldown)
+            retry = pf.precompute(retry_codes, out_dir=FLOW_DIR, interval=1.0,
+                                  retries=1)
+            flow_stats["ok"] = list(flow_stats["ok"]) + list(retry["ok"])
+            flow_stats["failed"] = retry["failed"]
+            flow_stats["requests"] += retry["requests"]
+            for key, value in retry.get("ok_sources", {}).items():
+                flow_stats.setdefault("ok_sources", {})
+                flow_stats["ok_sources"][key] = (flow_stats["ok_sources"].get(key, 0)
+                                                 + value)
+            flow_stats["wall_seconds"] = (flow_stats["wall_seconds"]
+                                          + retry["wall_seconds"])
     _log(f"  资金流 ok={len(flow_stats['ok'])} failed={len(flow_stats['failed'])} "
          f"requests={flow_stats['requests']} wall={flow_stats['wall_seconds']}s "
-         f"sources={flow_stats['ok_sources']}")
+         f"sources={flow_stats.get('ok_sources')}")
 
-    idx = fetch_index(args.start)
-    _log(f"指数 sh000300 {idx['rows']} 根 {idx['first']}~{idx['last']}")
+    idx = {"rows": 0, "first": None, "last": None, "skipped": True}
+    if not args.skip_index:
+        idx = fetch_index(args.start)
+        _log(f"指数 sh000300 {idx['rows']} 根 {idx['first']}~{idx['last']}")
 
     manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "git_head": os.popen("git -C %s rev-parse HEAD" % ROOT).read().strip(),
         "python": sys.version.split()[0],
-        "start": args.start, "end": args.end,
+        "start": args.start, "end": args.end, "min_as_of": min_as_of,
         "pool": codes, "pool_size": len(codes), "provenance": provenance,
         "price_ok": len(price_ok), "price_failed": price_fail,
-        "valuation": {"ok": len(val_stats["ok"]), "failed": val_stats["failed"],
+        "price_cached": sum(1 for item in price_ok if item.get("cached")),
+        "price_rounds": max(1, args.rounds),
+        "price_batch": {"size": args.batch_size, "pause_seconds": args.batch_pause,
+                        "cooldown_seconds": args.cooldown,
+                        "attempts_per_code": args.attempts},
+        "valuation": {"fresh_skipped": len(fresh_val),
+                      "ok": len(val_stats["ok"]), "failed": val_stats["failed"],
                       "login": val_stats["login"],
                       "wall_seconds": val_stats["wall_seconds"]},
-        "flow": {"ok": len(flow_stats["ok"]), "failed": flow_stats["failed"],
-                 "sources": flow_stats["ok_sources"],
+        "flow": {"fresh_skipped": len(fresh_flow),
+                 "ok": len(flow_stats["ok"]), "failed": flow_stats["failed"],
+                 "sources": flow_stats.get("ok_sources"),
                  "requests": flow_stats["requests"],
                  "wall_seconds": flow_stats["wall_seconds"]},
         "index": idx,
@@ -839,6 +1075,546 @@ def buy_point_check(panel, horizon=HORIZON):
             "policy_skipped": skipped_gates}
 
 
+# ---------------------------------------------------------------------------
+# v2：买点分层（「票 × 季度」聚类；R4 §3.6.2 / issue #62）
+# ---------------------------------------------------------------------------
+def _finite(value):
+    """None / NaN / inf → False；有限数 → True（numpy 标量也适用）。"""
+    try:
+        return bool(math.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def build_buypoint_frame(panel, horizon=HORIZON):
+    """预注册 3 策略的买点并集 → 逐买点观测（code/date/ret/hit/上下文）。
+
+    与 :func:`buy_point_check` 的买点来源**完全相同**（同一组策略、同一份价格
+    缓存、同一开盘口径标签、同一 as-of 当日池内中位数）。v1 的 ``buy_point_check``
+    保留不动，v2 用同一套生成逻辑产出聚类所需的逐点表；``stratify-buypoints``
+    会把总买点/命中率与 ``analyze`` 的数字对照，若不一致即为实现漂移。
+    """
+    import numpy as np
+    import pandas as pd
+    from stock_analysis.strategy.registry import build_strategy_signals
+
+    signals = build_strategy_signals()
+    available = [name for name in BUY_STRATEGIES if name in signals]
+    missing = [name for name in BUY_STRATEGIES if name not in signals]
+
+    med_by_day = (panel.dropna(subset=["pb_pct_3y"])
+                  .groupby("date")["pb_pct_3y"].median())
+
+    records = []
+    for code, block in panel.groupby("code"):
+        price = _load_price(code)
+        if price is None:
+            continue
+        price = price.loc[price.index >= block["date"].min()].copy()
+        price = price.reindex(block["date"]).dropna(how="all")
+        if len(price) < 300:
+            continue
+        block = block.set_index("date").reindex(price.index)
+        buy_any = pd.Series(False, index=price.index)
+        for name in available:
+            try:
+                sig = signals[name](price)
+                buy_any |= sig["buy"].astype(bool)
+            except Exception:  # noqa: BLE001
+                continue
+        fwd = (price["open"].shift(-(horizon + 1))
+               / price["open"].shift(-1) - 1.0)
+        med = med_by_day.reindex(price.index)
+        for day in price.index[buy_any.fillna(False)]:
+            if day not in block.index:
+                continue
+            row = block.loc[day]
+            ret = fwd.get(day)
+            if not _finite(ret):
+                continue
+            pb = row.get("pb_pct_3y")
+            medv = med.get(day)
+            pb_defined = _finite(pb) and _finite(medv)
+            records.append({
+                "code": code, "date": day, "ret": float(ret),
+                "hit": int(ret > 0),
+                "pb_pct_3y": float(pb) if _finite(pb) else float("nan"),
+                "pb_defined": bool(pb_defined),
+                "pb_cheap": bool(pb_defined and float(pb) <= float(medv)),
+                "flow_net_20d_pct": (float(row.get("flow_net_20d_pct"))
+                                     if _finite(row.get("flow_net_20d_pct"))
+                                     else float("nan")),
+                "index_label": row.get("index_label"),
+            })
+    if not records:
+        return None, {"strategies": available, "missing_strategies": missing}
+    frame = pd.DataFrame(records)
+    return frame, {"strategies": available, "missing_strategies": missing}
+
+
+def _cluster_table(frame):
+    """按「票 × 自然季度」聚合：每个聚类 1 行（n / hits / hit_rate）。"""
+    import pandas as pd
+    work = frame.copy()
+    work["quarter"] = pd.PeriodIndex(pd.to_datetime(work["date"]),
+                                     freq="Q").astype(str)
+    grouped = work.groupby(["code", "quarter"], sort=True)
+    table = grouped.agg(n=("hit", "size"), hits=("hit", "sum"))
+    table["hit_rate"] = table["hits"] / table["n"]
+    return table.reset_index()
+
+
+def _icc_binary(table):
+    """二值结果的聚类内相关 ICC（单因素 ANOVA 矩估计）。
+
+    ``ICC = (MSB − MSW) / (MSB + (m0 − 1)·MSW)``，其中 MSW 用二项方差
+    ``n·h·(1−h)/(N−k)``，``m0`` 为均衡聚类大小。全部聚类纯 0/1 时 MSW=0，
+    ICC 无定义（返回 None）—— 不得用 0 代替。
+    """
+    import numpy as np
+    n = table["n"].to_numpy(float)
+    h = table["hit_rate"].to_numpy(float)
+    k, total = len(n), float(n.sum())
+    if k < 2 or total <= k:
+        return None
+    p = float((n * h).sum() / total)
+    msb = float((n * (h - p) ** 2).sum() / (k - 1))
+    msw = float((n * h * (1 - h)).sum() / (total - k))
+    if msw <= 0:
+        return None
+    m0 = float((total - (n ** 2).sum() / total) / (k - 1))
+    return {"icc": (msb - msw) / (msb + (m0 - 1) * msw),
+            "m0": m0, "mean_cluster_n": float(n.mean())}
+
+
+def _weighted_stats(table):
+    """聚类级加权均值（权重=聚类内买点数）与等权口径。
+
+    ``se`` 为**聚类**级加权均值的标准误，按同方差模型估计（与 §3.6.6 的 DEFF/MDE
+    推导同一套假设）：``se_w² = (Σ n_c²/(Σ n_c)²) · σ̂²``，
+    ``σ̂² = Σ n_c (h_c − m)² / (Σ n_c − Σ n_c²/Σ n_c)``（ANOVA 型，按聚类大小为权重）。
+    等权时退化为 ``sd(h_c)/√k``。
+
+    注意：这是**模型型**标准误，不是 HC 三明治估计；异方差下会偏乐观。
+    因此本工具的**主推断用 cluster bootstrap**（``_cluster_bootstrap``），
+    Welch t 只作对照，报告里两者都列。
+    """
+    import numpy as np
+    n = table["n"].to_numpy(float)
+    h = table["hit_rate"].to_numpy(float)
+    k = len(n)
+    total = float(n.sum())
+    if k < 2 or total <= 0:
+        return None
+    mean_w = float((n * h).sum() / total)
+    denom = total - float((n ** 2).sum()) / total
+    if denom > 0:
+        var_h = float((n * (h - mean_w) ** 2).sum() / denom)
+        se_w = math.sqrt(float((n ** 2).sum()) / total ** 2 * var_h)
+        sd_w = math.sqrt(var_h)
+    else:
+        sd_w = se_w = None
+    eq_mean = float(h.mean())
+    eq_se = float(h.std(ddof=1) / math.sqrt(k)) if k > 1 else None
+    return {"mean": mean_w, "sd": sd_w, "se": se_w,
+            "eq_mean": eq_mean, "eq_se": eq_se,
+            "k": k, "n_points": int(total),
+            "mean_cluster_n": float(n.mean()),
+            "median_cluster_n": float(np.median(n))}
+
+
+def _welch_normal(a, b):
+    """Welch t（用聚类级标准误；p 用正态近似，另给 Satterthwaite df）。
+
+    n_clusters 通常 > 2500，正态近似与 t 的差异可忽略；小样本（如资金流）以
+    cluster bootstrap 的 p 为准，本函数只作对照。
+    """
+    if not a or not b or a["se"] is None or b["se"] is None:
+        return None
+    sa2, sb2 = a["se"] ** 2, b["se"] ** 2
+    if sa2 + sb2 <= 0:
+        return None
+    t = (a["mean"] - b["mean"]) / math.sqrt(sa2 + sb2)
+    df = None
+    if a["k"] > 1 and b["k"] > 1:
+        denom = sa2 ** 2 / (a["k"] - 1) + sb2 ** 2 / (b["k"] - 1)
+        if denom > 0:
+            df = (sa2 + sb2) ** 2 / denom
+    p = math.erfc(abs(t) / math.sqrt(2.0))
+    return {"t": t, "df": df, "p": p}
+
+
+def _cluster_bootstrap(a_table, b_table, reps=BOOTSTRAP_DEFAULT,
+                       seed=BOOTSTRAP_SEED):
+    """按**票分层**重抽聚类：每只票内对它的聚类做有放回抽样。
+
+    有/无两组各自独立重抽（两样本检验），统计量为加权命中率差。
+    返回 Δ 的 bootstrap 分布、95% 百分位 CI 与双侧 p
+    （``2·min(P(Δ*≤0), P(Δ*≥0))``）。
+    """
+    import numpy as np
+    rng = np.random.default_rng(seed)
+
+    def _groups(table):
+        return {code: (block["n"].to_numpy(float),
+                       block["hit_rate"].to_numpy(float))
+                for code, block in table.groupby("code", sort=False)}
+
+    groups_a, groups_b = _groups(a_table), _groups(b_table)
+
+    def _weighted_mean(groups):
+        weight_sum = hit_sum = 0.0
+        for n, h in groups.values():
+            idx = rng.integers(0, len(n), len(n))
+            drawn_n = n[idx]
+            weight_sum += float(drawn_n.sum())
+            hit_sum += float((drawn_n * h[idx]).sum())
+        return hit_sum / weight_sum if weight_sum > 0 else float("nan")
+
+    deltas = np.empty(int(reps), dtype=float)
+    for i in range(int(reps)):
+        deltas[i] = _weighted_mean(groups_a) - _weighted_mean(groups_b)
+    finite = deltas[np.isfinite(deltas)]
+    if len(finite) == 0:
+        return {"reps": int(reps), "delta_mean": None, "ci_low": None,
+                "ci_high": None, "p": None, "n_finite": 0}
+    p = 2.0 * min(float((finite <= 0).mean()), float((finite >= 0).mean()))
+    p = min(1.0, max(p, 1.0 / len(finite)))
+    return {"reps": int(reps),
+            "delta_mean": float(finite.mean()),
+            "ci_low": float(np.percentile(finite, 2.5)),
+            "ci_high": float(np.percentile(finite, 97.5)),
+            "p": p, "n_finite": int(len(finite))}
+
+
+def _delta_reason(delta_pp):
+    """Δ 未达 3pp 的措辞要区分「方向为负」与「幅度不足」（两者结论不同）。"""
+    if delta_pp < 0:
+        return f"方向为负（Δ={delta_pp:+.2f}pp）"
+    return f"Δ={delta_pp:+.2f}pp < {X_DELTA_PP:.1f}pp"
+
+
+def _x_verdict(delta_pp, p_boot, oos_same_sign, n_clusters, mde_pp):
+    """按 §3.6.3 的 X 路径给判定：达到 / 未达到 / 样本不足。"""
+    reasons = []
+    if n_clusters < X_N_CLUSTERS:
+        reasons.append(f"n_clusters={n_clusters} < {X_N_CLUSTERS}"
+                       f"（本样本 MDE≈{mde_pp:.2f}pp）"
+                       if mde_pp is not None else
+                       f"n_clusters={n_clusters} < {X_N_CLUSTERS}")
+        if delta_pp < X_DELTA_PP:
+            reasons.append(_delta_reason(delta_pp))
+        if p_boot is None or p_boot >= ALPHA:
+            reasons.append("聚类 p 不显著" if p_boot is not None
+                           else "聚类 p 不可得")
+        if not oos_same_sign:
+            reasons.append("OOS 反号")
+        return "样本不足", reasons
+    if delta_pp < X_DELTA_PP:
+        reasons.append(_delta_reason(delta_pp))
+    if p_boot is None or p_boot >= ALPHA:
+        reasons.append("聚类 p 不显著" if p_boot is not None else "聚类 p 不可得")
+    if not oos_same_sign:
+        reasons.append("OOS 反号")
+    return ("达到" if not reasons else "未达到"), reasons
+
+
+def _power_budget(a_stats, b_stats, n_clusters, n_points, span_years,
+                  icc, median_m, p_base=0.4966, n_stocks=None):
+    """X=3pp 的功效预算：用**实测**聚类 SD / ICC 反推所需聚类数与年份。
+
+    * ``MDE_obs``：当前聚类数下 80% 功效可检出的最小 Δ（z=2.8016；
+      ``MDE = z·√(se_a² + se_b²)``，se 为聚类级标准误）；
+    * ``required_clusters_obs_sd``：按实测聚类 SD、保持实测有/无比例，
+      达到 3pp 所需的总聚类数；
+    * ``required_clusters_model``：按实测 ICC + 中位聚类大小（DEFF 公式）
+      代入 §3.6.6 的模型所需聚类数；
+    * ``years_at_current_pool``：按本池每年**实际产生**的聚类数线性外推。
+    """
+    if not a_stats or not b_stats:
+        return None
+    z = 1.959964 + 0.841621
+    ratio = a_stats["k"] / max(1, a_stats["k"] + b_stats["k"])
+    ratio = min(max(ratio, 0.05), 0.95)
+    balance = 1.0 / ratio + 1.0 / (1.0 - ratio)   # 等分组时为 4
+    mde_obs = (z * math.sqrt(a_stats["se"] ** 2 + b_stats["se"] ** 2)
+               if a_stats["se"] is not None and b_stats["se"] is not None
+               else None)
+    sd_pool = None
+    if a_stats["sd"] is not None and b_stats["sd"] is not None:
+        sd_pool = math.sqrt((a_stats["sd"] ** 2 + b_stats["sd"] ** 2) / 2.0)
+    required_obs = None
+    if mde_obs is not None and mde_obs > 0:
+        # 与 MDE_obs 自洽：按当前分组比例与聚类规模等比扩样，
+        # ``N_req = N_cur · (MDE_cur / Δ)²``。
+        required_obs = n_clusters * (mde_obs / (X_DELTA_PP / 100.0)) ** 2
+    required_model = None
+    sd_model = None
+    if icc is not None and median_m and median_m > 0:
+        deff = 1.0 + (median_m - 1.0) * max(0.0, icc)
+        sd_model = math.sqrt(p_base * (1 - p_base) / median_m * deff)
+        required_model = (z * sd_model / (X_DELTA_PP / 100.0)) ** 2 * balance
+    # 年产量 = 聚类数 / 窗口年数，但**必须按理论上限封顶**：
+    # 「票 × 季度」每票每年最多 4 个聚类。资金流窗口只有 0.33 年（120 个交易日）
+    # 却跨 3 个日历季度，线性外推得到 1,839 聚类/年，而理论上限是 4×299≈1,196。
+    # 用窗口内实际票数 × 4 作为上限（``n_stocks`` 由调用方给出）。
+    clusters_per_year = None
+    capped = False
+    if span_years and span_years > 0:
+        raw = n_clusters / span_years
+        if n_stocks:
+            limit = 4.0 * float(n_stocks)
+            if raw > limit:
+                raw, capped = limit, True
+        clusters_per_year = raw
+    years_obs = (required_obs / clusters_per_year
+                 if required_obs is not None and clusters_per_year else None)
+    years_model = (required_model / clusters_per_year
+                   if required_model is not None and clusters_per_year else None)
+    return {"mde_pp": None if mde_obs is None else 100.0 * mde_obs,
+            "sd_pool_cluster": sd_pool,
+            "sd_model_cluster": sd_model,
+            "deff_model": (1.0 + (median_m - 1.0) * max(0.0, icc)
+                           if icc is not None and median_m else None),
+            "required_clusters_obs_sd": required_obs,
+            "required_clusters_model": required_model,
+            "current_clusters": n_clusters,
+            "current_points": n_points,
+            "clusters_per_year": clusters_per_year,
+            "years_to_required_at_current_pool": years_obs,
+            "years_to_required_model_at_current_pool": years_model,
+            "z": z, "balance_factor": balance, "clusters_per_year_capped": capped}
+
+
+def _size_strata(table_yes, table_no, buckets=((1, 3), (4, 7), (8, 12), (13, 10 ** 6))):
+    """按聚类内买点数分层，暴露「加权 vs 等权」分歧的来源（聚类大小混杂）。
+
+    加权口径给大聚类更高权重；若大聚类的命中率在两组间方向不同（Simpson 型
+    混杂），加权 Δ 与等权 Δ 会反号。本表把每层的人数、等权命中率、点权命中率
+    都列出来，供报告逐层解释 —— 这是「不能只看一个口径」的实证依据。
+    """
+    rows = []
+    for low, high in buckets:
+        row = {"bucket": f"{low}-{'' if high >= 10 ** 6 else high}"}
+        for name, table in (("yes", table_yes), ("no", table_no)):
+            sel = table[(table["n"] >= low) & (table["n"] <= high)]
+            if len(sel) == 0:
+                row[name] = None
+                continue
+            row[name] = {
+                "clusters": int(len(sel)),
+                "points": int(sel["n"].sum()),
+                "hit_equal_weight": float(sel["hit_rate"].mean()),
+                "hit_point_weight": float((sel["n"] * sel["hit_rate"]).sum()
+                                          / sel["n"].sum()),
+            }
+        rows.append(row)
+    return rows
+
+
+def _nonoverlap_welch(a_table, b_table, stride=2):
+    """非重叠子样本 t（§3.6.7 第 4 条的三重报告之一）。
+
+    同一票相邻季度的聚类共享 20 日窗口；按票**每隔 ``stride`` 个季度取一个**
+    （stride=2 ≈ 6 个月，远大于 20 个交易日）后，同一票的窗口不再重叠。
+    返回该子样本上的加权 Δ 与 Welch t（聚类级标准误）。
+    """
+    def _thin(table):
+        return (table.sort_values(["code", "quarter"])
+                .groupby("code", sort=False).apply(
+                    lambda g: g.iloc[::stride], include_groups=False)
+                .reset_index(drop=False))
+
+    try:
+        thin_a, thin_b = _thin(a_table), _thin(b_table)
+    except Exception:  # noqa: BLE001  pandas 版本差异时退回手工循环
+        thin_a, thin_b = a_table.iloc[::stride], b_table.iloc[::stride]
+    stats_a, stats_b = _weighted_stats(thin_a), _weighted_stats(thin_b)
+    welch = _welch_normal(stats_a, stats_b)
+    if not welch:
+        return None
+    return {"delta_pp": 100.0 * (stats_a["mean"] - stats_b["mean"]),
+            "t": welch["t"], "p": welch["p"],
+            "n_clusters_yes": stats_a["k"], "n_clusters_no": stats_b["k"],
+            "stride_quarters": stride}
+
+
+def stratify_buypoints(frame, reps=BOOTSTRAP_DEFAULT, seed=BOOTSTRAP_SEED,
+                       oos_frac=OOS_FRAC):
+    """买点分层检验（有/无上下文），统计单位为「票 × 季度」聚类。
+
+    三个门槛**预注册**（与 v1 相同，不按结果挑选）：
+    估值 ``pb_pct_3y ≤ 当日池内中位数``；资金 ``flow_net_20d_pct > 0``；
+    regime ``index_label != 'Bear'``。每个门槛报点级 Δ（与 R3 对读）、
+    聚类加权 Δ、等权 Δ、Welch t、cluster bootstrap（按票分层重抽）、
+    OOS 同号、实测 ICC/DEFF、MDE 与所需样本量。
+    """
+    import numpy as np
+    import pandas as pd
+
+    if frame is None or frame.empty:
+        return None
+    valid_pb = frame["pb_defined"].astype(bool)
+    valid_flow = frame["flow_net_20d_pct"].notna()
+    valid_regime = frame["index_label"].notna()
+    specs = [
+        {"key": "valuation", "label": "估值分位 ≤ 当日池内中位数",
+         "definition": "pb_pct_3y ≤ 当日横截面中位数（as-of）",
+         "valid": valid_pb, "yes": valid_pb & frame["pb_cheap"].astype(bool)},
+        {"key": "flow", "label": "资金净流入 > 0",
+         "definition": "flow_net_20d_pct > 0（新浪总净流入口径，pub_lag=1）",
+         "valid": valid_flow, "yes": valid_flow & (frame["flow_net_20d_pct"] > 0)},
+        {"key": "regime", "label": "指数 regime ≠ Bear",
+         "definition": "index_label != 'Bear'（沪深 300 时序标签）",
+         "valid": valid_regime,
+         "yes": valid_regime & (frame["index_label"] != "Bear")},
+    ]
+
+    dates = pd.to_datetime(frame["date"])
+    span_years = ((dates.max() - dates.min()).days / 365.25
+                  if len(dates) else None)
+    n_points_total = int(len(frame))
+    hit_all = float(frame["hit"].mean())
+    mean_all = float(frame["ret"].mean())
+    all_clusters = _cluster_table(frame)
+    overall_icc = _icc_binary(all_clusters)
+    overall_sizes = all_clusters["n"].to_numpy(float)
+
+    entries, power = [], []
+    for spec in specs:
+        valid_mask = (spec["valid"].reindex(frame.index).fillna(False)
+                      .astype(bool))
+        yes_mask = ((spec["yes"].reindex(frame.index).fillna(False)
+                     .astype(bool)) & valid_mask)
+        valid = frame[valid_mask].copy()
+        yes = frame[yes_mask].copy()
+        no = frame[valid_mask & ~yes_mask].copy()
+        ct_yes, ct_no = _cluster_table(yes), _cluster_table(no)
+        ct_all = _cluster_table(valid)
+        stats_yes, stats_no = _weighted_stats(ct_yes), _weighted_stats(ct_no)
+        point_delta = float(yes["hit"].mean() - no["hit"].mean())
+        p_point = _two_prop_z(int(yes["hit"].sum()), len(yes),
+                              int(no["hit"].sum()), len(no))[1]
+        welch = _welch_normal(stats_yes, stats_no)
+        boot = _cluster_bootstrap(ct_yes, ct_no, reps=reps, seed=seed)
+        icc_yes = _icc_binary(ct_yes)
+        icc_no = _icc_binary(ct_no)
+        icc_all = _icc_binary(ct_all)
+
+        cut = (pd.to_datetime(valid["date"]).quantile(1.0 - oos_frac)
+               if len(valid) else None)
+        oos_yes = yes[pd.to_datetime(yes["date"]) >= cut] if cut is not None else None
+        oos_no = no[pd.to_datetime(no["date"]) >= cut] if cut is not None else None
+        oos_stats = None
+        if cut is not None and len(oos_yes) and len(oos_no):
+            oos_a = _weighted_stats(_cluster_table(oos_yes))
+            oos_b = _weighted_stats(_cluster_table(oos_no))
+            if oos_a and oos_b:
+                oos_stats = {
+                    "from": str(pd.Timestamp(cut).date()),
+                    "n_points": int(len(oos_yes) + len(oos_no)),
+                    "n_clusters": int(len(_cluster_table(pd.concat([oos_yes, oos_no])))),
+                    "delta_pp": 100.0 * (oos_a["mean"] - oos_b["mean"]),
+                    "n_clusters_yes": oos_a["k"], "n_clusters_no": oos_b["k"],
+                }
+        delta_pp = 100.0 * (stats_yes["mean"] - stats_no["mean"])
+        oos_same = bool(oos_stats is not None
+                        and (oos_stats["delta_pp"] >= 0) == (delta_pp >= 0))
+
+        median_m = (float(np.median(ct_all["n"])) if len(ct_all) else None)
+        # 年产量必须按**该门槛有定义的窗口**算，不能用全样本跨度：
+        # 资金流只覆盖 120 个交易日（0.48 年），若除以全样本 8.77 年会把
+        # 「聚类/年」低估 18 倍，进而把「达到门槛所需年份」高估 18 倍。
+        valid_dates = pd.to_datetime(valid["date"]) if len(valid) else None
+        gate_years = (max((valid_dates.max() - valid_dates.min()).days / 365.25,
+                          1.0 / 365.25)
+                      if valid_dates is not None and len(valid_dates) else None)
+        power_row = _power_budget(stats_yes, stats_no, len(ct_all), len(valid),
+                                  gate_years,
+                                  icc_all["icc"] if icc_all else None,
+                                  median_m, n_stocks=int(valid["code"].nunique()))
+        if power_row:
+            power_row["gate"] = spec["key"]
+            power_row["window_years"] = gate_years
+            power_row["window_from"] = (str(valid_dates.min().date())
+                                        if valid_dates is not None and len(valid_dates)
+                                        else None)
+            power_row["window_to"] = (str(valid_dates.max().date())
+                                      if valid_dates is not None and len(valid_dates)
+                                      else None)
+            power.append(power_row)
+
+        verdict, reasons = _x_verdict(delta_pp, boot["p"], oos_same, len(ct_all),
+                                      power_row["mde_pp"] if power_row else None)
+        entries.append({
+            "gate": spec["key"], "label": spec["label"],
+            "definition": spec["definition"],
+            "n_points": int(len(valid)), "coverage_of_buy_points": float(len(valid) / len(frame)),
+            "n_points_yes": int(len(yes)), "n_points_no": int(len(no)),
+            "n_clusters_yes": int(len(ct_yes)), "n_clusters_no": int(len(ct_no)),
+            "n_clusters": int(len(ct_all)),
+            "median_points_per_cluster": median_m,
+            "median_points_per_cluster_yes": float(np.median(ct_yes["n"])) if len(ct_yes) else None,
+            "median_points_per_cluster_no": float(np.median(ct_no["n"])) if len(ct_no) else None,
+            "hit_yes": float(yes["hit"].mean()), "hit_no": float(no["hit"].mean()),
+            "delta_point_pp": 100.0 * point_delta,
+            "p_point": p_point,
+            "hit_yes_weighted": stats_yes["mean"], "hit_no_weighted": stats_no["mean"],
+            "delta_weighted_pp": delta_pp,
+            "ci_low_pp": 100.0 * boot["ci_low"] if boot["ci_low"] is not None else None,
+            "ci_high_pp": 100.0 * boot["ci_high"] if boot["ci_high"] is not None else None,
+            "p_bootstrap": boot["p"],
+            "bootstrap_reps": boot["reps"], "bootstrap_finite": boot["n_finite"],
+            "welch_t": welch["t"] if welch else None,
+            "welch_df": welch["df"] if welch else None,
+            "p_welch": welch["p"] if welch else None,
+            "delta_equal_weight_pp": 100.0 * (stats_yes["eq_mean"] - stats_no["eq_mean"]),
+            "p_equal_weight": (None if not stats_yes["eq_se"] or not stats_no["eq_se"]
+                               or stats_yes["eq_se"] ** 2 + stats_no["eq_se"] ** 2 <= 0
+                               else math.erfc(abs((stats_yes["eq_mean"] - stats_no["eq_mean"])
+                                                  / math.sqrt(stats_yes["eq_se"] ** 2
+                                                              + stats_no["eq_se"] ** 2))
+                                              / math.sqrt(2.0))),
+            "icc_yes": icc_yes["icc"] if icc_yes else None,
+            "icc_no": icc_no["icc"] if icc_no else None,
+            "icc": icc_all["icc"] if icc_all else None,
+            "deff_measured": (1.0 + (median_m - 1.0) * max(0.0, icc_all["icc"])
+                              if icc_all and median_m else None),
+            "oos": oos_stats,
+            "oos_same_sign": oos_same,
+            "nonoverlap": _nonoverlap_welch(ct_yes, ct_no),
+            "size_strata": _size_strata(ct_yes, ct_no),
+            "mde_pp": power_row["mde_pp"] if power_row else None,
+            "verdict": verdict, "reasons": reasons,
+        })
+
+    return {
+        "n_buy_points": n_points_total,
+        "hit_all": hit_all, "mean_all": mean_all,
+        "n_stocks": int(frame["code"].nunique()),
+        "date_from": str(dates.min().date()), "date_to": str(dates.max().date()),
+        "span_years": span_years,
+        "clusters_total": int(len(all_clusters)),
+        "median_points_per_cluster": float(np.median(overall_sizes)),
+        "mean_points_per_cluster": float(overall_sizes.mean()),
+        "max_points_per_cluster": int(overall_sizes.max()),
+        "icc_overall": overall_icc,
+        "gates": entries, "power": power,
+        "n_trials": len(specs),
+        "thresholds": {"X_delta_pp": X_DELTA_PP, "X_n_clusters": X_N_CLUSTERS,
+                       "alpha": ALPHA, "oos_frac": oos_frac,
+                       "alpha_bonferroni": ALPHA / len(specs)},
+        "notes": [
+            "统计单位为「票 × 季度」聚类；同一聚类内多个买点只算 1 个聚类观测"
+            "（§3.6.7 第 3 条）。",
+            "加权 Δ 以聚类内买点数为权重；等权口径一并报告。",
+            "聚类 p 以 cluster bootstrap（按票分层重抽）为准；Welch t 用正态近似。",
+            "样本池是 2026-11-11 的沪深 300 当前成分，不是历史时点成分"
+            "（幸存者偏差）。",
+        ],
+    }
+
+
 def regime_timeseries(index_frame, panel):
     """§3.4：指数 regime 的时序检验 + 与个股 regime 的一致率。
 
@@ -1067,6 +1843,182 @@ def cmd_analyze(args):
     return 0
 
 
+def cmd_stratify_buypoints(args):
+    """v2：买点分层（票 × 季度聚类）—— 离线，只读 ``evidence/p1``。"""
+    _ensure_dirs()
+    import pandas as pd
+
+    manifest_path = os.path.join(DATA, "manifest.json")
+    if not os.path.exists(manifest_path):
+        print(f"ERROR 缺 {manifest_path}，请先运行 fetch", file=sys.stderr)
+        return 2
+    manifest = _read_json(manifest_path)
+    codes = manifest["pool"]
+
+    panel_path = os.path.join(OUT, "panel.csv")
+    panel = None
+    if args.reuse_panel and os.path.exists(panel_path):
+        # **必须**把 code 读成字符串：pandas 默认会把 ``000858`` 解析成整数 858，
+        # 于是 ``_load_price("858")`` 找不到文件，整票被静默跳过 —— 实测会让
+        # 299 只退化成 221 只（2026-11-13 本轮自查抓到）。low_memory=False 同时
+        # 避免 trade_status / is_st 这类混合列被分块推断成 object。
+        panel = pd.read_csv(panel_path, parse_dates=["date"],
+                            dtype={"code": str}, low_memory=False)
+        panel["code"] = panel["code"].str.zfill(6)
+        _log(f"复用面板 {panel_path}：{panel['code'].nunique()} 只 × "
+             f"{panel['date'].nunique()} 个交易日 = {len(panel)} 行")
+        if "index_label" not in panel.columns:
+            panel, _index_frame = add_index_regime(panel)
+        diag = {"stocks_used": sorted(panel["code"].unique().tolist()),
+                "stocks_skipped": []}
+    else:
+        _log(f"构建面板：{len(codes)} 只（离线，只读 evidence/p1/data）...")
+        panel, diag = build_panel(codes, args.start, horizon=args.horizon)
+        if panel is None:
+            print("ERROR 面板为空", file=sys.stderr)
+            return 1
+        panel, _index_frame = add_index_regime(panel)
+        panel.to_csv(panel_path, index=False)
+        _log(f"面板：{panel['code'].nunique()} 只 × {panel['date'].nunique()} 日 = "
+             f"{len(panel)} 行 → {panel_path}")
+
+    if args.exclude_source or args.only_source:
+        sources = _load_price_sources()
+        before = panel["code"].nunique()
+        if args.exclude_source:
+            drop = {code for code, src in sources.items()
+                    if src == args.exclude_source}
+            panel = panel[~panel["code"].isin(drop)]
+        if args.only_source:
+            keep = {code for code, src in sources.items()
+                    if src == args.only_source}
+            panel = panel[panel["code"].isin(keep)]
+        _log(f"来源过滤（exclude={args.exclude_source}, only={args.only_source}）："
+             f"{before} 只 → {panel['code'].nunique()} 只"
+             f"（来源表 {os.path.join(DATA, 'price_sources.json')}）")
+
+    frame, meta = build_buypoint_frame(panel, args.horizon)
+    if frame is None:
+        print("ERROR 无有效买点", file=sys.stderr)
+        return 1
+    _log(f"买点并集：{len(frame)} 个（策略 {', '.join(meta['strategies'])}；"
+         f"缺失 {meta['missing_strategies'] or '无'}）")
+
+    result = stratify_buypoints(frame, reps=args.bootstrap, seed=args.seed,
+                                oos_frac=args.oos_frac)
+    result.update({
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "git_head": manifest.get("git_head"),
+        "horizon": args.horizon, "start": args.start,
+        "pool_declared": len(codes),
+        "pool_used": int(panel["code"].nunique()),
+        "pool_in_buy_points": int(frame["code"].nunique()),
+        "panel_rows": int(len(panel)),
+        "strategies": meta["strategies"],
+        "missing_strategies": meta["missing_strategies"],
+    })
+    # 覆盖一致性自检：进入面板的票若没有产生任何买点，必须显式暴露，
+    # 不能静默缩小样本（2026-11-13 自查抓到的 ``--reuse-panel`` 缺陷即此类）。
+    if int(frame["code"].nunique()) < int(panel["code"].nunique()):
+        missing_codes = sorted(set(panel["code"].unique())
+                               - set(frame["code"].unique()))
+        result["stocks_without_buy_points"] = missing_codes
+        _log(f"[WARN] {len(missing_codes)} 只进入面板但没有买点："
+             f"{missing_codes[:10]}{' ...' if len(missing_codes) > 10 else ''}")
+    _write_json(os.path.join(OUT, "buypoints.json"), result)
+
+    rows = []
+    for gate in result["gates"]:
+        row = {key: gate[key] for key in (
+            "gate", "label", "n_points", "n_points_yes", "n_points_no",
+            "n_clusters", "n_clusters_yes", "n_clusters_no",
+            "median_points_per_cluster", "hit_yes", "hit_no",
+            "delta_point_pp", "p_point", "delta_weighted_pp",
+            "ci_low_pp", "ci_high_pp", "p_bootstrap", "p_welch",
+            "welch_t", "delta_equal_weight_pp", "p_equal_weight",
+            "icc", "deff_measured", "mde_pp", "oos_same_sign", "verdict")}
+        row["oos_delta_pp"] = (gate["oos"] or {}).get("delta_pp")
+        row["oos_n_clusters"] = (gate["oos"] or {}).get("n_clusters")
+        row["reasons"] = "；".join(gate["reasons"])
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(os.path.join(OUT, "buypoints.csv"), index=False)
+
+    _print_buypoints(result)
+    _log(f"\n结果 → {os.path.join(OUT, 'buypoints.json')} / buypoints.csv")
+    return 0
+
+
+def _print_buypoints(result):
+    icc = result["icc_overall"]
+    _log("\n=== 买点分层（票 × 季度聚类；R4 §3.6.2）===")
+    _log(f"买点 {result['n_buy_points']} 个（{result['n_stocks']} 只，"
+         f"{result['date_from']}~{result['date_to']}，"
+         f"{result['span_years']:.2f} 年）；20 日命中率 "
+         f"{result['hit_all']:.2%}，均值 {result['mean_all']:+.2%}")
+    _log(f"聚类（票 × 季度）总数 {result['clusters_total']}；每聚类买点 "
+         f"中位 {result['median_points_per_cluster']:.1f}、"
+         f"均值 {result['mean_points_per_cluster']:.1f}、"
+         f"最大 {result['max_points_per_cluster']}")
+    if icc:
+        _log(f"实测聚类内相关 ICC={icc['icc']:.4f}（m0={icc['m0']:.2f}，"
+             f"均衡聚类大小）")
+    else:
+        _log("聚类 ICC 不可得（全部聚类纯 0/1）")
+    for gate in result["gates"]:
+        _log(f"\n--- {gate['gate']}：{gate['label']} ---")
+        _log(f"  定义：{gate['definition']}")
+        _log(f"  点级：有 {gate['n_points_yes']}（{gate['hit_yes']:.2%}） vs "
+             f"无 {gate['n_points_no']}（{gate['hit_no']:.2%}），"
+             f"Δ={gate['delta_point_pp']:+.2f}pp p={gate['p_point']}")
+        _log(f"  聚类：n_clusters={gate['n_clusters']}"
+             f"（有 {gate['n_clusters_yes']} / 无 {gate['n_clusters_no']}），"
+             f"每聚类买点中位 {gate['median_points_per_cluster']:.1f}")
+        ci_low = gate["ci_low_pp"]
+        ci_high = gate["ci_high_pp"]
+        _log(f"  加权 Δ={gate['delta_weighted_pp']:+.2f}pp "
+             f"95%CI=[{ci_low:+.2f}, {ci_high:+.2f}]pp "
+             f"p_boot={gate['p_bootstrap']} p_welch={gate['p_welch']} "
+             f"t={gate['welch_t']}")
+        _log(f"  等权 Δ={gate['delta_equal_weight_pp']:+.2f}pp "
+             f"p={gate['p_equal_weight']}；实测 ICC={gate['icc']} "
+             f"DEFF={gate['deff_measured']}")
+        oos = gate["oos"] or {}
+        _log(f"  OOS（{oos.get('from', 'n/a')} 起）：Δ={oos.get('delta_pp')}pp，"
+             f"n_clusters={oos.get('n_clusters')}，同号={gate['oos_same_sign']}")
+        _log(f"  MDE（当前聚类数）={gate['mde_pp']}pp")
+        nov = gate.get("nonoverlap")
+        if nov:
+            _log(f"  非重叠子样本（每 {nov['stride_quarters']} 个季度取 1）："
+                 f"Δ={nov['delta_pp']:+.2f}pp t={nov['t']:+.2f} "
+                 f"p={nov['p']:.4f}（k={nov['n_clusters_yes']}/"
+                 f"{nov['n_clusters_no']}）")
+        strata = gate.get("size_strata") or []
+        if strata:
+            _log("  按聚类大小分层（等权 / 点权命中率；解释加权与等权为何可能反号）：")
+            for row in strata:
+                yes, no = row["yes"], row["no"]
+                if not yes or not no:
+                    continue
+                _log(f"    买点/聚类 {row['bucket']}: "
+                     f"有 k={yes['clusters']} eq={yes['hit_equal_weight']:.3f} "
+                     f"pw={yes['hit_point_weight']:.3f} | "
+                     f"无 k={no['clusters']} eq={no['hit_equal_weight']:.3f} "
+                     f"pw={no['hit_point_weight']:.3f}")
+        _log(f"  判定：{gate['verdict']}"
+             + (f"——{gate['reasons']}" if gate["reasons"] else ""))
+    _log("\n--- 功效预算（X=3pp）---")
+    for row in result["power"]:
+        _log(f"  {row['gate']}: 当前 {row['current_clusters']} 聚类，"
+             f"MDE={row['mde_pp']:.2f}pp；按实测聚类 SD 需 "
+             f"{row['required_clusters_obs_sd']:.0f} 聚类"
+             f"（按本门槛窗口 {row.get('window_years') or 0:.2f} 年、"
+             f"{row['clusters_per_year']:.0f} 聚类/年，约 "
+             f"{row['years_to_required_at_current_pool']:.1f} 年）；"
+             f"按实测 ICC 模型需 {row['required_clusters_model']:.0f} 聚类"
+             f"（约 {row['years_to_required_model_at_current_pool']:.1f} 年）")
+    _log(f"\nn_trials={result['n_trials']}（3 个预注册门槛；探索性指标不计入判定）")
+
+
 def _print_ic_table(ic_frame):
     _log("\n=== 横截面秩 IC（label = 次日开盘买入、20 日开盘卖出）===")
     _log(f"{'factor':18s}{'group':16s}{'IC':>9s}{'t_iid':>8s}{'t_nw':>8s}"
@@ -1251,9 +2203,38 @@ def cmd_selftest(args):
     _log(f"[5] 滚动分位：{got[-1]:.4f} vs percentile_rank={manual:.4f} "
          f"→ {'PASS' if ok5 else 'FAIL'}")
 
-    passed = sum([ok, ok2, ok3, ok4, ok5])
-    _log(f"\n自检 {passed}/5 通过")
-    return 0 if passed == 5 else 1
+    # [6] v2 聚类统计：聚类随机效应 → ICC>0；已知 Δ=10pp → CI 不含 0、p<0.01
+    def _make_clusters(effect, seed_offset):
+        r = np.random.default_rng(11 + seed_offset)
+        rows = []
+        for stock in range(50):
+            for quarter in range(24):
+                cluster_effect = r.normal(0, 0.12)
+                p = min(0.98, max(0.02, 0.50 + effect + cluster_effect))
+                day = pd.Timestamp("2020-01-01") + pd.DateOffset(months=3 * quarter)
+                for _ in range(8):
+                    rows.append({"code": f"{stock:03d}", "date": day,
+                                 "hit": int(r.random() < p), "ret": 0.0})
+        return _cluster_table(pd.DataFrame(rows))
+
+    ct_yes = _make_clusters(0.10, 0)
+    ct_no = _make_clusters(0.0, 1000)
+    stats_yes, stats_no = _weighted_stats(ct_yes), _weighted_stats(ct_no)
+    icc6 = _icc_binary(ct_yes)
+    welch6 = _welch_normal(stats_yes, stats_no)
+    boot6 = _cluster_bootstrap(ct_yes, ct_no, reps=200, seed=5)
+    ok6 = bool(icc6 and 0.02 < icc6["icc"] < 0.20
+               and stats_yes["mean"] - stats_no["mean"] > 0.06
+               and boot6["ci_low"] is not None and boot6["ci_low"] > 0
+               and boot6["p"] < 0.01 and welch6 and welch6["p"] < 0.01)
+    _log(f"[6] 聚类检验：ICC={icc6['icc']:.4f}  "
+         f"Δ={100 * (stats_yes['mean'] - stats_no['mean']):+.2f}pp  "
+         f"CI=[{100 * boot6['ci_low']:+.2f}, {100 * boot6['ci_high']:+.2f}]pp  "
+         f"p_boot={boot6['p']:.4f}  → {'PASS' if ok6 else 'FAIL'}")
+
+    passed = sum([ok, ok2, ok3, ok4, ok5, ok6])
+    _log(f"\n自检 {passed}/6 通过")
+    return 0 if passed == 6 else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1268,15 +2249,61 @@ def build_parser():
     fetch.add_argument("--start", default=DEFAULT_START)
     fetch.add_argument("--end", default=None)
     fetch.add_argument("--limit", type=int, default=100,
-                       help="样本池上限（默认 100；自选 15 只优先）")
+                       help="样本池上限（默认 100；issue #62 用 300）")
     fetch.add_argument("--no-csi300", action="store_true",
                        help="只用自选 15 只，不补沪深 300 成分")
+    fetch.add_argument("--min-as-of", default=None,
+                       help="缓存新鲜线（默认 今天-4 天）；早于它的缓存会重取")
+    fetch.add_argument("--batch-size", type=int, default=20,
+                       help="日线每抓 N 只暂停一次（默认 20）")
+    fetch.add_argument("--batch-pause", type=float, default=20.0,
+                       help="批次间隔秒数（默认 20）")
+    fetch.add_argument("--cooldown", type=float, default=120.0,
+                       help="连续失败/整轮重试前的冷却秒数（默认 120）")
+    fetch.add_argument("--attempts", type=int, default=3,
+                       help="单票日线尝试次数（默认 3）")
+    fetch.add_argument("--backoff", type=float, default=5.0,
+                       help="单票退避基数秒（5/10/15…）")
+    fetch.add_argument("--rounds", type=int, default=2,
+                       help="日线抓取轮数（失败票每轮重试；默认 2）")
+    fetch.add_argument("--skip-price", action="store_true",
+                       help="跳过日线抓取（腾讯整域限流时先跑其它源）")
+    fetch.add_argument("--skip-valuation", action="store_true",
+                       help="跳过 baostock 估值")
+    fetch.add_argument("--skip-flow", action="store_true",
+                       help="跳过资金流（东财/新浪）")
+    fetch.add_argument("--skip-index", action="store_true",
+                       help="跳过沪深 300 指数")
+    fetch.add_argument("--price-fallback", choices=("baostock", "none"),
+                       default="baostock",
+                       help="腾讯失败时的日线备胎（默认 baostock；两者都失败才记失败）")
     fetch.set_defaults(func=cmd_fetch)
 
     analyze = sub.add_parser("analyze", help="离线分析（只读 evidence/p1/data）")
     analyze.add_argument("--start", default=DEFAULT_START)
     analyze.add_argument("--horizon", type=int, default=HORIZON)
     analyze.set_defaults(func=cmd_analyze)
+
+    strat = sub.add_parser(
+        "stratify-buypoints",
+        help="v2：买点分层（票 × 季度聚类；§3.6.2）")
+    strat.add_argument("--start", default=DEFAULT_START)
+    strat.add_argument("--horizon", type=int, default=HORIZON)
+    strat.add_argument("--bootstrap", type=int, default=BOOTSTRAP_DEFAULT,
+                       help="cluster bootstrap 次数（≥1000；默认 1000）")
+    strat.add_argument("--seed", type=int, default=BOOTSTRAP_SEED)
+    strat.add_argument("--oos-frac", type=float, default=OOS_FRAC,
+                       help="样本外 = 最后该比例的时间（默认 0.30）")
+    strat.add_argument("--reuse-panel", action="store_true",
+                       help="复用 evidence/p1/out/panel.csv（analyze 产出的面板）")
+    strat.add_argument("--exclude-source", default=None,
+                       choices=("tencent_qfq", "baostock_qfq"),
+                       help="剔除某个日线来源的票（稳健性检验；来源见 "
+                            "evidence/p1/data/price_sources.json）")
+    strat.add_argument("--only-source", default=None,
+                       choices=("tencent_qfq", "baostock_qfq"),
+                       help="只用某个日线来源的票（稳健性检验）")
+    strat.set_defaults(func=cmd_stratify_buypoints)
 
     asof = sub.add_parser("check-asof", help="无前视校验")
     asof.add_argument("--start", default=DEFAULT_START)
