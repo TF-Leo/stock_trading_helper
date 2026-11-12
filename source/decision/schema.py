@@ -106,6 +106,9 @@ class MarketRegime:
     confidence: float
     as_of: str
     definition: str
+    # P1-3（issue #32）additive：指数 regime，**只展示、不改 action**。
+    # 键 {label, confidence, as_of, definition, source, bars}；取不到时显式 null。
+    index: Optional[Dict] = None
 
 
 @dataclass
@@ -342,7 +345,12 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'execution': execution_block(),
         },
         'market_regime': {'label': 'Unknown', 'confidence': 0.0,
-                          'as_of': None, 'definition': None},
+                          'as_of': None, 'definition': None,
+                          # P1-3（issue #32）additive：指数 regime 子块必须与成功
+                          # 路径键同构（G35 递归比对路径集合）。取数阶段就失败的
+                          # 响应没有指数数据 → 逐键显式 null，不编造标签。
+                          'index': {'label': None, 'confidence': None, 'as_of': None,
+                                    'definition': None, 'source': None, 'bars': None}},
         'recommendation': {
             'status': status,
             'action': 'insufficient_data' if status in ('insufficient_data', 'data_source_error') else 'avoid',

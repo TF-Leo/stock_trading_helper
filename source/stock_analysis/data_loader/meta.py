@@ -861,9 +861,132 @@ def resample_stock_data(df, period='W'):
         return None
 
 
+INDEX_CACHE_PREFIX = 'index_'
+# 指数缓存「新鲜」判据：末根日期 >= 期望最新交易日。与个股共用
+# _expected_latest_trade_date（官方日历优先、离线回退周末推算）。
+# 指数日线在收盘后才落定，故与个股同一口径，不额外放宽。
+INDEX_CACHE_OVERLAP_DAYS = 40   # 增量回看天数，与个股 CACHE_OVERLAP_DAYS 一致
+
+
+def _index_cache_path(symbol):
+    """指数缓存文件：``data/index_<sh000300>.csv``（data/ 已在 .gitignore）。"""
+    safe = str(symbol).strip().lower().replace('/', '_').replace('\\', '_')
+    return os.path.join(DATA_DIR, f'{INDEX_CACHE_PREFIX}{safe}.csv')
+
+
 def get_market_index_daily(symbol='000985', start_date='20200101', source='akshare'):
-    """获取指数数据。"""
-    return None
+    """获取指数日线（P1-3，issue #32）。
+
+    数据源：腾讯指数 K 线（``astock.fetch_index_daily``，§1.2），默认沪深 300。
+    缓存：``source/stock_analysis/data/index_<symbol>.csv``（gitignore）。
+    失败：**返回 None**（不抛），并在 stderr 打 ``[WARN]``；调用方据此降级，
+    绝不阻断主流程 —— 指数 regime 只展示、不参与决策。
+
+    返回 ``DataFrame``：``DatetimeIndex`` + ``open/high/low/close/volume``，
+    按 ``start_date`` 截取。``None`` 表示取不到（离线/网络/格式/空数据）。
+
+    缓存策略比个股简单（个股那套增量合并是为复权基准变化服务的，指数不复权，
+    没有基准问题）：新鲜则直接用；过期则拉「末根 - 40 天」近端窗口，与旧缓存
+    按日期并集（重叠日以新值为准）。取数失败时回退旧缓存并 warning，不推进缓存。
+    """
+    from stock_analysis.data_sources import astock
+
+    cache_file = _index_cache_path(symbol)
+    cached = None
+    if os.path.exists(cache_file):
+        try:
+            # 用位置索引而不是 index_col='date'：缓存若由外部工具写入、首列表头为空，
+            # 按名字取列会抛 "list.index(x): x not in list"，这里只依赖列顺序。
+            cached = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            if cached.empty:
+                cached = None
+            elif len(cached) < MIN_CACHE_ROWS:
+                print(f"[WARN] 指数缓存 {cache_file} 仅 {len(cached)} 行，判定为空壳并删除",
+                      file=sys.stderr)
+                os.remove(cache_file)
+                cached = None
+        except Exception as e:
+            print(f"[WARN] 读取指数缓存 {cache_file} 失败：{e}", file=sys.stderr)
+            cached = None
+
+    if cached is not None:
+        try:
+            last_date = pd.Timestamp(cached.index[-1]).date()
+            if last_date >= _expected_latest_trade_date():
+                return _apply_start(cached, start_date)
+        except Exception:
+            pass
+
+    # 过期缓存只拉近端窗口；冷启动拉 2020 起（regime 只要 60 根，不需要全历史）
+    fetch_start = (pd.Timestamp(cached.index[-1]) - pd.Timedelta(days=INDEX_CACHE_OVERLAP_DAYS)
+                   ).strftime('%Y%m%d') if cached is not None else str(start_date or '20200101')
+    try:
+        fresh = astock.fetch_index_daily(symbol, start_date=fetch_start)
+    except Exception as e:
+        fresh = None
+        reason = f"指数取数失败（{symbol}）：{e}"
+        if cached is not None:
+            reason += f"；回退本地缓存（末日 {pd.Timestamp(cached.index[-1]).date()}）"
+            print(f"[WARN] {reason}", file=sys.stderr)
+            return _apply_start(cached, start_date)
+        print(f"[WARN] {reason}", file=sys.stderr)
+        return None
+
+    if fresh is None or fresh.empty:
+        if cached is not None:
+            print(f"[WARN] 指数取数为空（{symbol}）；回退本地缓存", file=sys.stderr)
+            return _apply_start(cached, start_date)
+        print(f"[WARN] 指数取数为空（{symbol}）", file=sys.stderr)
+        return None
+
+    # 与旧缓存并集：重叠日以新值为准（指数不复权，不存在基准平移）
+    merged = fresh
+    if cached is not None:
+        try:
+            keep = cached.loc[~cached.index.isin(fresh.index)]
+            merged = pd.concat([keep, fresh]).sort_index()
+            merged = merged[~merged.index.duplicated(keep='last')]
+        except Exception as e:
+            print(f"[WARN] 指数缓存合并失败，改用新结果：{e}", file=sys.stderr)
+            merged = fresh
+
+    _write_cache(merged, cache_file, f'index_{symbol}')
+    return _apply_start(merged, start_date)
+
+
+def get_index_regime(symbol='sh000300', start_date=None):
+    """指数 regime（P1-3）：**复用** ``analyzer._regime_from_row`` 的同一套规则。
+
+    返回 ``{'label', 'confidence', 'as_of', 'definition', 'source', 'bars'}``；
+    取不到指数日线或行数不足 60 根时返回 ``None``（调用方写 null + warning），
+    绝不编造标签。``definition`` 与个股 ``market_regime`` 用同一个字符串，
+    便于调用方确认二者是同一判定口径、不同输入。
+
+    这里**不复制**判定逻辑：MA20/MA60/ret20/ret60/年化波动全部按
+    ``analyzer.get_current_market_regime`` 的算法算，然后调用同一个
+    ``_regime_from_row``。区别只在输入是**指数**日线而不是个股日线。
+    """
+    from stock_analysis.advisor.analyzer import get_current_market_regime
+
+    df = get_market_index_daily(symbol, start_date=start_date)
+    if df is None or len(df) < 60:
+        return None
+    try:
+        label, conf = get_current_market_regime(df)
+    except Exception as e:
+        print(f"[WARN] 指数 regime 计算失败（{symbol}）：{e}", file=sys.stderr)
+        return None
+    if str(label) == 'Unknown':
+        return None
+    return {
+        'label': str(label),
+        'confidence': round(float(conf), 3),
+        'as_of': str(df.index[-1]),
+        # 与个股 market_regime.definition 同一字符串：同一判定规则、不同输入
+        'definition': 'ma20_ma60_return_volatility',
+        'source': f'tencent_index:{symbol}',
+        'bars': int(len(df)),
+    }
 
 
 def resolve_and_fetch(code, type_hint='auto', start_date=None):

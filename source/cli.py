@@ -165,31 +165,22 @@ def _excess_vs_benchmark(result, df, config, fast=False):
     except Exception:
         return empty
 
-def _market_regime(df):
-    """把"当前市场环境"从占位常量改为基于真实行情的判定。
+def _market_regime_block(df, warnings):
+    """``market_regime`` 输出块（原有四字段 + P1-3 additive 的 ``index``）。
 
-    历史问题：这里曾硬编码 {'label': 'Bull', 'confidence': 0.7}，
-    无论行情如何都报牛市，与 C4（输出不得自相矛盾）冲突。
-
-    直接复用 advisor.analyzer.get_current_market_regime（A8 单一 regime 真源），
-    避免再造第二套标签。失败时显式返回 Unknown 而不是假装 Bull。
+    组装细节见 ``decision/regime.py``；迁出是为了守住契约 D4 的
+    ``cli.py ≤ 700`` 行。原有 ``label/confidence/as_of/definition``
+    的计算与取值一个字都不改。
     """
-    try:
-        from stock_analysis.advisor.analyzer import get_current_market_regime
-        label, conf = get_current_market_regime(df)
-        return {
-            'label': str(label),
-            'confidence': round(float(conf), 3),
-            'as_of': str(df.index[-1]),
-            'definition': 'ma20_ma60_return_volatility',
-        }
-    except Exception:
-        return {
-            'label': 'Unknown',
-            'confidence': 0.0,
-            'as_of': str(df.index[-1]) if df is not None and len(df) else '',
-            'definition': 'unavailable',
-        }
+    from decision.regime import market_regime_block
+    return market_regime_block(df, warnings)
+
+
+def _disabled_regime(df):
+    """``--no-regime`` 的显式禁用结构（指数侧同样禁用，不假装有标签）。"""
+    from decision.regime import disabled_block
+    return disabled_block(df.index[-1])
+
 
 def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
                     fast=False, detail=False, no_regime=False, opt_iters=30,
@@ -561,9 +552,9 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             # F29: 成交假设（signal_bar/fill/slippage_bps/commission_bps）
             'execution': execution_block(config),
         },
-        'market_regime': ({'label': 'Unknown', 'confidence': 0.0,
-                           'as_of': str(df.index[-1]), 'definition': 'disabled'}
-                          if no_regime else _market_regime(df)),
+        # P1-3 additive：--no-regime 时指数侧同样显式禁用；原有四字段逐字不变
+        'market_regime': (_disabled_regime(df) if no_regime
+                          else _market_regime_block(df, warnings)),
         'recommendation': {
             'status': status,
             'action': action,
