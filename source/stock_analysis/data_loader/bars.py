@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import datetime
 import os
+import re
 import sys
 import requests
 import time
@@ -29,6 +30,92 @@ RATE_LIMIT_KEYWORDS = (
     "429", "too many", "frequency", "limit", "反爬", "频率", "限制", "forbidden",
 )
 TIMEOUT_KEYWORDS = ("timeout", "timed out", "超时", "read timed out", "connect timeout")
+
+
+# ---------------------------------------------------------------------------
+# P0-4（issue #7）：逐通道取数尝试记录
+#
+# 旧实现只保留 `last_err`，前几个通道的错误在日志里一闪而过，调用方（Hermes）
+# 只看得到"全部失败"或"回退缓存"，无法执行「先报问题再报建议」。
+# 这里把每次尝试结构化：{source, ok, error_class, error_text, cooldown, removed}。
+#   * ok=True  → 本次成功
+#   * ok=False → 本次真实调用失败（error_class/error_text 必有）
+#   * ok=None  → 未调用：通道在冷却中或已被剔除（由 cooldown/removed 说明）
+# 错误文本经**脱敏 + 截断**，避免把长 URL / token / key 带进 diagnostics。
+# ---------------------------------------------------------------------------
+MAX_ATTEMPT_ERROR_TEXT = 200
+_URL_PATTERN = re.compile(r'https?://\S+', re.IGNORECASE)
+# requests 的异常常写成 `... with url: /api/qt/...?fields1=...`（相对路径，
+# 不匹配上面的绝对 URL 规则），同样可能带长查询串 / 参数，一并脱敏。
+_RELATIVE_URL_PATTERN = re.compile(r'(?i)\burl:\s*\S+')
+_SECRET_PATTERN = re.compile(
+    r'(?i)\b(token|api[_-]?key|access[_-]?key|secret|authorization|password)'
+    r'\b\s*[=:]\s*[^\s,;&]+'
+)
+_SAFE_SOURCE_PATTERN = re.compile(r'^[A-Za-z0-9_.-]{1,32}$')
+
+
+def _safe_source_name(name) -> str:
+    """来源白名单：只允许池内登记的简单标识符，异常输入一律显示 unknown。"""
+    text = str(name or '')
+    return text if _SAFE_SOURCE_PATTERN.match(text) else 'unknown'
+
+
+def _sanitize_error_text(err) -> str:
+    """错误文本脱敏：去 URL、去 token/key、压缩空白、截断 ≤200 字。"""
+    text = '' if err is None else str(err)
+    text = _URL_PATTERN.sub('<url>', text)
+    text = _RELATIVE_URL_PATTERN.sub('url: <url>', text)
+    text = _SECRET_PATTERN.sub(r'\1=<redacted>', text)
+    text = ' '.join(text.split())
+    if len(text) > MAX_ATTEMPT_ERROR_TEXT:
+        text = text[:MAX_ATTEMPT_ERROR_TEXT - 3] + '...'
+    return text
+
+
+def _attempt(source, ok, error=None, cooldown=False, removed=False,
+             cooldown_seconds=None):
+    record = {
+        'source': _safe_source_name(source),
+        'ok': ok,
+        'error_class': None if error is None else type(error).__name__,
+        'error_text': None if error is None else _sanitize_error_text(error),
+        'cooldown': bool(cooldown),
+        'removed': bool(removed),
+    }
+    if cooldown and cooldown_seconds:
+        record['cooldown_seconds'] = int(cooldown_seconds)
+    return record
+
+
+def format_attempt_warnings(attempts):
+    """把 source_attempts 转成可读中文 warnings。
+
+    只在失败 / 冷却 / 剔除时产出条目；全通道首试成功时返回空列表
+    （P0-4 要求：成功路径不新增噪声）。
+    """
+    lines = []
+    for item in attempts or []:
+        source = _safe_source_name(item.get('source'))
+        if item.get('ok') is True:
+            continue
+        if item.get('ok') is None:
+            reason = '已从渠道池剔除' if item.get('removed') else '冷却中'
+            lines.append(f"{source} {reason}，本轮跳过")
+            continue
+        detail = ' '.join(
+            str(x) for x in (item.get('error_class'), item.get('error_text')) if x)
+        msg = f"{source} 失败：{detail or '未知错误'}"
+        flags = []
+        if item.get('cooldown'):
+            seconds = item.get('cooldown_seconds')
+            flags.append(f"本轮已冷却 {seconds}s" if seconds else "本轮已冷却")
+        if item.get('removed'):
+            flags.append("已从渠道池剔除")
+        if flags:
+            msg += f"（{'，'.join(flags)}）"
+        lines.append(msg)
+    return lines
 
 
 def _to_exchange_symbol(symbol: str) -> str:
@@ -79,6 +166,9 @@ class _DataSourcePool:
         self._failure_window_seconds = failure_window_seconds
         self._cursor = 0
         self._lock = Lock()
+        # P0-4：最近一次 fetch 的逐通道尝试明细（含成功 / 失败 / 冷却 / 剔除）。
+        # 用属性而不是改返回值，保持既有 `df, used = pool.fetch(...)` 调用不变。
+        self.last_attempts = []
 
     def _is_transient_failure(self, err):
         msg = str(err).lower()
@@ -105,6 +195,7 @@ class _DataSourcePool:
             state.consecutive_failures = 0
 
     def _mark_failure(self, state, err):
+        """记录失败；返回 (是否进入冷却, 是否被剔除) 供 attempts 使用。"""
         now = time.time()
         transient = self._is_transient_failure(err)
         with self._lock:
@@ -124,10 +215,38 @@ class _DataSourcePool:
                   file=sys.stderr)
         if should_disable:
             print(f"[WARN] 数据源 {state.name} 失败过多，已从渠道池移除", file=sys.stderr)
+        return transient, should_disable
+
+    def _publish_attempts(self, attempts):
+        with self._lock:
+            self.last_attempts = [dict(item) for item in attempts]
 
     def fetch(self, symbol, start_date, adjust, preferred=None):
+        attempts = []
+        # 先清空，避免上一轮明细在异常提前退出时被误当成本轮结果。
+        self._publish_attempts(attempts)
+        now = time.time()
+        with self._lock:
+            all_states = list(self._states)
         candidates = self._ordered_candidates(preferred)
+        candidate_names = {state.name for state in candidates}
+        # 没被调用的通道也要留痕：冷却中 / 已剔除对调用方同样是"为什么没拿到数"。
+        for state in all_states:
+            if state.name in candidate_names:
+                continue
+            cooling = (not state.disabled) and state.cooldown_until > now
+            if state.disabled:
+                attempts.append(_attempt(
+                    state.name, None,
+                    error=RuntimeError('已从渠道池剔除'), removed=True))
+            elif cooling:
+                remaining = max(0, int(round(state.cooldown_until - now)))
+                attempts.append(_attempt(
+                    state.name, None,
+                    error=RuntimeError(f'冷却中（剩余 {remaining}s）'),
+                    cooldown=True, cooldown_seconds=remaining))
         if not candidates:
+            self._publish_attempts(attempts)
             print("[WARN] 渠道池无可用数据源（均在冷却或已剔除）", file=sys.stderr)
             return None, None
         last_err = None
@@ -137,10 +256,17 @@ class _DataSourcePool:
                 if df is None or df.empty:
                     raise RuntimeError(f"{state.name} 返回空数据")
                 self._mark_success(state)
+                attempts.append(_attempt(state.name, True))
+                self._publish_attempts(attempts)
                 return df, state.name
             except Exception as err:
                 last_err = err
-                self._mark_failure(state, err)
+                cooldown, removed = self._mark_failure(state, err)
+                attempts.append(_attempt(
+                    state.name, False, error=err,
+                    cooldown=cooldown, removed=removed,
+                    cooldown_seconds=self._cooldown_seconds if cooldown else None))
+        self._publish_attempts(attempts)
         if last_err:
             print(f"[WARN] 渠道池全部失败 {symbol}: {last_err}", file=sys.stderr)
         return None, None

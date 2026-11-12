@@ -277,7 +277,8 @@ python cli.py 600519 --start 20200101 --json
     "zero_trade_configs": 0,
     "survivor_configs": 10,
     "warnings": [],
-    "elapsed_seconds": 15.5
+    "elapsed_seconds": 15.5,
+    "source_attempts": []
   },
   "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
 }
@@ -340,6 +341,28 @@ python cli.py 600519 --start 20200101 --json
 
 > `stale=true` 时 `diagnostics.warnings` 必定包含一条降级说明。
 > 消费方应把 `stale=true` 视为"结论时效性下降"，而不是普通告警。
+
+### diagnostics
+
+- **warnings**: 可读中文告警数组。P0-4 起逐通道失败也会写入，例如
+  `astock_tencent 失败：HTTPError 429（本轮已冷却 120s）`、
+  `eastmoney 失败：Timeout read timed out`、`sina_stock 冷却中，本轮跳过`。
+  **首试即成功时不新增条目**（不制造噪声）。
+- **source_attempts**（P0-4 / issue #7，**additive**，`schema_version` 仍为 `1.0`）：
+  本轮渠道池的逐通道取数明细，数组元素为
+
+  ```json
+  {"source": "astock_tencent", "ok": false, "error_class": "HTTPError",
+   "error_text": "429 Client Error: Too Many Requests for url: <url>",
+   "cooldown": true, "cooldown_seconds": 120, "removed": false}
+  ```
+
+  - `ok=false`：本次**真实调用失败**，`error_class` / `error_text` 必有值；
+  - `ok=null`：本轮**未调用**，因为该通道在 `cooldown` 中或已被 `removed`（从池中剔除）；
+  - `ok=true`：本次成功；全通道首试成功时数组只有这一条，`warnings` 不新增。
+  - `error_text` 经脱敏（长 URL → `<url>`、token/key → `<redacted>`）并截断到 **≤200 字**；
+    `source` 只允许池内登记的标识符，避免把任意异常文本带进对外 JSON。
+  - 错误响应与成功响应键同构：无触网时为空数组 `[]`（G35）。
 
 ### recommendation
 - **status**: 状态枚举（见上表）
@@ -551,7 +574,8 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
     "zero_trade_configs": 19,
     "survivor_configs": 484,
     "warnings": [],
-    "elapsed_seconds": 9.3
+    "elapsed_seconds": 9.3,
+    "source_attempts": []
   },
   "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
 }

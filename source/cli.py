@@ -11,6 +11,7 @@ import numpy as np
 
 from stock_analysis.data_loader import get_stock_daily, get_fund_daily, get_stock_name
 from stock_analysis.data_loader.meta import last_fetch_info
+from stock_analysis.data_loader.bars import format_attempt_warnings
 from stock_analysis.data_loader.status import resolve_trading_status
 from stock_analysis.backtest.analyzer import run_strategy_tournament, calc_buy_hold_baseline
 from stock_analysis.backtest.engine import BacktestConfig
@@ -252,6 +253,12 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             f"缓存末日 {fetch_info.get('cache_last_date')}，"
             f"滞后 {fetch_info.get('lag_days')} 个交易日"
             f"（期望最新交易日 {fetch_info.get('expected_date')}），结论基于陈旧数据")
+
+    # P0-4（issue #7）：逐通道失败可见 —— 只把失败/冷却/剔除转成 warning；
+    # 首试即成功时 format_attempt_warnings 返回空列表，不新增噪声。
+    for line in format_attempt_warnings(fetch_info.get('source_attempts')):
+        if line not in warnings:
+            warnings.append(line)
 
     # 标的信息
     board, price_limit_pct, is_st = classify_board(code)
@@ -615,7 +622,10 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'zero_trade_configs': int((comparison['交易次数'].astype(int) == 0).sum()),
             'survivor_configs': int((comparison['评分'] > -100).sum()),
             'warnings': warnings,
-            'elapsed_seconds': round(time.time() - start_time, 2)
+            'elapsed_seconds': round(time.time() - start_time, 2),
+            # P0-4 additive：与错误路径键同构（G35）。
+            'source_attempts': [dict(item) for item in
+                                (fetch_info.get('source_attempts') or [])],
         },
         'disclaimer': '本结果不构成投资建议，市场有风险，投资需谨慎。'
     }

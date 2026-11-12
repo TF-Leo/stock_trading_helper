@@ -53,6 +53,9 @@ _LAST_FETCH_INFO = {
     # 仅用于可观测性（stderr + last_fetch_info），不进 CLI JSON。
     'merged_from_cache': False,
     'cache_rows_kept': 0,
+    # P0-4（issue #7）：本轮渠道池的逐通道尝试明细（additive）。
+    # 每条 {source, ok, error_class, error_text, cooldown, removed}；无触网时为空。
+    'source_attempts': [],
 }
 
 # 最近一次 _expected_latest_trade_date() 的判定来源
@@ -61,7 +64,10 @@ _EXPECTED_SOURCE = {'value': None}
 
 def last_fetch_info():
     """返回最近一次 get_*_daily 的真实取数来源与降级事实。"""
-    return dict(_LAST_FETCH_INFO)
+    info = dict(_LAST_FETCH_INFO)
+    info['source_attempts'] = [dict(item) for item in
+                               (_LAST_FETCH_INFO.get('source_attempts') or [])]
+    return info
 
 
 def _reset_fetch_info(requested_source=None):
@@ -71,6 +77,21 @@ def _reset_fetch_info(requested_source=None):
     _LAST_FETCH_INFO['requested_source'] = requested_source
     _LAST_FETCH_INFO['merged_from_cache'] = False
     _LAST_FETCH_INFO['cache_rows_kept'] = 0
+    _LAST_FETCH_INFO['source_attempts'] = []
+
+
+def _capture_source_attempts():
+    """把渠道池最近一次 fetch 的逐通道明细追加到 _LAST_FETCH_INFO。
+
+    一次 get_stock_daily 可能调用池两次（近端增量 + 全量重取），故用追加而非覆盖。
+    兼容既有测试里的 fake pool：没有 `last_attempts` 属性时静默跳过。
+    """
+    attempts = getattr(_STOCK_DATA_SOURCE_POOL, 'last_attempts', None)
+    if not attempts:
+        return
+    existing = list(_LAST_FETCH_INFO.get('source_attempts') or [])
+    existing.extend(dict(item) for item in attempts)
+    _LAST_FETCH_INFO['source_attempts'] = existing
 
 
 def _record_fetch(source, from_cache, **extra):
@@ -503,6 +524,7 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
         )
     except Exception as e:
         print(f"渠道池调用异常：{e}", file=sys.stderr)
+    _capture_source_attempts()
 
     if raw is not None and not raw.empty:
         try:
@@ -537,6 +559,7 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
                             adjust, preferred=_SOURCE_PREFERENCE.get(source))
                     except Exception as e:
                         print(f"渠道池全量重取异常：{e}", file=sys.stderr)
+                    _capture_source_attempts()
                     if raw2 is not None and not raw2.empty:
                         fresh_full = _prepare_indexed_frame(raw2)
                         used_source = used2 or used_source
@@ -853,6 +876,10 @@ def resolve_and_fetch(code, type_hint='auto', start_date=None):
     # auto：5/15/16/18 开头是场内基金的可靠段；其余默认按股票试
     first = 'fund' if code.startswith(('5', '15', '16', '18')) else 'stock'
     df = _fetch(first)
+    # P0-4：第二次探测（通常是基金）会 _reset_fetch_info，把第一次的渠道明细冲掉。
+    # 先快照，待两侧都失败时合并，否则"断源演练"里股票池的 4 条 attempts 全部丢失。
+    first_attempts = [dict(item) for item in
+                      (_LAST_FETCH_INFO.get('source_attempts') or [])]
     if df is not None and len(df) >= 100:
         return df, first, None
 
@@ -863,9 +890,15 @@ def resolve_and_fetch(code, type_hint='auto', start_date=None):
               f"（如需固定，请用 --type {alt}）", file=sys.stderr)
         return alt_df, alt, None
 
+    alt_attempts = [dict(item) for item in
+                    (_LAST_FETCH_INFO.get('source_attempts') or [])]
+    merged_attempts = first_attempts + [
+        item for item in alt_attempts if item not in first_attempts]
     # 两侧都没拿到足量数据：若首选有数据（只是不足 100 根）就返回它，让上层判 insufficient_data
     if df is not None:
+        _LAST_FETCH_INFO['source_attempts'] = merged_attempts
         return df, first, None
+    _LAST_FETCH_INFO['source_attempts'] = merged_attempts
     return None, first, (
         f"自动判定失败：按 stock 与 fund 两种类型均无法取到 {code} 的数据。"
         f"请用 --type stock 或 --type fund 显式指定。")

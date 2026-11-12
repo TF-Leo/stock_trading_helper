@@ -192,6 +192,9 @@ class Diagnostics:
     survivor_configs: int
     warnings: List[str]
     elapsed_seconds: float
+    # P0-4（issue #7）：逐通道取数尝试明细（additive，schema_version 仍 1.0）。
+    # 每条 {source, ok, error_class, error_text, cooldown, removed}；无触网时为空。
+    source_attempts: List[Dict] = field(default_factory=list)
 
 
 @dataclass
@@ -296,6 +299,13 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
     if status in ('data_source_error', 'insufficient_data'):
         is_st = None
     notes = list(warnings or [])
+    attempts = [dict(item) for item in (fi.get('source_attempts') or [])]
+    if attempts:
+        # P0-4：错误路径的逐通道说明必须与成功路径同构（G35）。
+        from stock_analysis.data_loader.bars import format_attempt_warnings
+        for line in format_attempt_warnings(attempts):
+            if line not in notes:
+                notes.append(line)
     if message not in notes:
         notes.insert(0, message)
     return {
@@ -387,6 +397,8 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'survivor_configs': 0,
             'warnings': notes,
             'elapsed_seconds': round(float(elapsed or 0.0), 2),
+            # P0-4 additive：与成功路径键同构（无触网时为空数组）。
+            'source_attempts': attempts,
         },
         'disclaimer': '本结果不构成投资建议，市场有风险，投资需谨慎。',
     }
