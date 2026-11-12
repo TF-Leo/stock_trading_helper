@@ -38,6 +38,7 @@ from . import _astock_generated as _g
 __all__ = [
     "AstockError",
     "fetch_daily",
+    "fetch_index_daily",
     "fetch_quote",
     "get_month_calendar",
     "is_trading_day",
@@ -176,6 +177,155 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq") -> pd.DataFrame:
     out = out[["open", "high", "low", "close", "volume"]]
     out.index.name = "date"
     return out
+
+
+# ---------------------------------------------------------------------------
+# 指数日线（P1-3，issue #32）
+# ---------------------------------------------------------------------------
+INDEX_OFFLINE_ENV = "ASTOCK_INDEX_OFFLINE"
+
+# 指数走 **newfqkline** 而不是个股用的 fqkline。2026-11-12 实测：本机对
+# ``/appstock/app/fqkline/get`` 三个入口一律 501（Tencent WAF 拦截页），而
+# ``/appstock/app/newfqkline/get`` 同样三个入口全部 200、返回结构一致
+# （``data[symbol]['day']``，行格式 [date, open, close, high, low, volume, ...]）。
+# 指数不需要复权，所以不涉及 qfq/hfq 口径差异；fqkline 仍作为第二入口兜底，
+# 以防哪天 newfqkline 反过来被拦。
+_INDEX_KLINE_PATHS = ("/appstock/app/newfqkline/get",
+                      "/appstock/app/fqkline/get")
+_INDEX_PAGE_BARS = 640        # 与上游 §1.2 单次上限一致
+_INDEX_MAX_PAGES = 40         # 1990→今约 9 页；40 页是防御性上限
+
+
+def _index_offline() -> bool:
+    """指数取数的离线开关（测试 / 断网演练）。
+
+    ``ASTOCK_INDEX_OFFLINE=1`` 是专用开关（与 ``ASTOCK_STATUS_OFFLINE`` 同一套路）；
+    ``ASTOCK_DISABLE_NETWORK=1`` 也生效，保持与日历一致的全局面断网语义。
+    """
+    for key in (INDEX_OFFLINE_ENV, "ASTOCK_DISABLE_NETWORK"):
+        if str(os.getenv(key, "")).strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def _index_symbol(symbol) -> str:
+    """指数代码 → ``sh000300`` 形式（腾讯要求带市场前缀）。
+
+    显式前缀/后缀原样透传；**裸 6 位码**按指数号段消歧：``000xxx`` 是沪市指数
+    （000001 上证 / 000300 沪深300 / 000985 中证全指 / 000905 中证500 …），
+    ``399xxx`` 是深市指数。上游 ``get_prefix`` 只认 ``SH_INDEX`` 里那几个固定
+    名单，``000985`` 这类不在名单里的裸码会被判成 ``sz``，所以这里补一条指数
+    专属规则；个股代码请勿走本函数。
+    """
+    raw = str(symbol).strip().lower()
+    try:
+        digits = _g.norm_ticker(symbol)
+    except ValueError as exc:
+        raise AstockError(f"指数代码无法解析: {symbol!r}") from exc
+    has_explicit = (raw[:2] in ("sh", "sz", "bj")
+                    or raw.endswith((".sh", ".sz", ".bj", ".xshg", ".xshe")))
+    if has_explicit:
+        return _g.get_prefix(symbol) + digits
+    if digits.startswith("399"):
+        return "sz" + digits
+    if digits.startswith("000"):
+        return "sh" + digits
+    return _g.get_prefix(symbol) + digits
+
+
+def _index_kline_call(param: str):
+    """按 ``_INDEX_KLINE_PATHS`` 顺序取一段指数 K 线；返回 (data, host)。"""
+    errors = []
+    for path in _INDEX_KLINE_PATHS:
+        try:
+            data, host = _g._tencent_kline_call(path, param)
+        except ValueError as exc:
+            # 上游对「区间过长 / 代码不存在」抛 ValueError，属于参数错，换路径也一样
+            raise AstockError(f"腾讯指数K线参数错误({param}): {exc}") from exc
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        return data, host
+    raise AstockError("腾讯指数K线入口均不可用: " + "; ".join(errors))
+
+
+def fetch_index_daily(symbol="sh000300", start_date=None) -> pd.DataFrame:
+    """拉取指数**不复权**日线（腾讯 §1.2，默认沪深 300）。
+
+    ``start_date`` 为 None / 空时返回全量历史（下限 ``FULL_HISTORY_START``）。
+    腾讯 ``newfqkline`` 只认 ``count`` + ``end``（``start`` 会被忽略），因此这里
+    从最新一根开始**向前翻页**：每次取 ``end`` 之前的 640 根，直到覆盖
+    ``start_date`` 或源端返回不足一页。日常 2020 起的区间通常 1–2 次 HTTP。
+
+    返回 ``DataFrame``：``DatetimeIndex``（升序、无重复），列
+    ``open/high/low/close/volume``。
+
+    成交量**原样透传**（腾讯指数口径，不做个股那条 ×100 归一）；regime 判定只
+    消费 ``close``，成交量仅作可选诊断，不能当个股成交量口径使用。
+
+    失败（网络 / WAF / 空数据 / 格式变化 / 离线）抛 :class:`AstockError`。
+    """
+    if str(os.getenv(FORCE_FAIL_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
+        raise AstockError(f"{FORCE_FAIL_ENV}=1：腾讯源被强制失败（降级演练）")
+    if _index_offline():
+        raise AstockError(f"{INDEX_OFFLINE_ENV}/ASTOCK_DISABLE_NETWORK 生效：指数取数已禁用")
+
+    code = _index_symbol(symbol)
+    start = _format_start(start_date)
+
+    rows_by_date: dict[str, dict] = {}
+    end = ""
+    for _ in range(_INDEX_MAX_PAGES):
+        data, _host = _index_kline_call(f"{code},day,,{end},{_INDEX_PAGE_BARS},")
+        node = data.get(code)
+        if not isinstance(node, dict):
+            raise AstockError(f"腾讯指数K线 {code} 的返回里没有该代码节点，格式可能已变")
+        items = node.get("day")
+        if not isinstance(items, list):
+            raise AstockError(f"腾讯指数K线 {code} 的返回里没有 day 列表，格式可能已变")
+        if not items:
+            break
+        try:
+            for item in items:
+                day = _g._v39_src_date(item[0])
+                if end and day > end:
+                    raise AstockError(
+                        f"腾讯指数K线 {code} 请求 end={end} 却返回了 {day}，结果不可信")
+                rows_by_date[day] = {
+                    "date": day,
+                    "open": _g._v39_req_num(item[1], "open"),
+                    "high": _g._v39_req_num(item[3], "high"),
+                    "low": _g._v39_req_num(item[4], "low"),
+                    "close": _g._v39_req_num(item[2], "close"),
+                    "volume": _g._v39_req_num(item[5], "volume"),
+                }
+        except AstockError:
+            raise
+        except (ValueError, TypeError, IndexError, KeyError) as exc:
+            raise AstockError(f"腾讯指数K线 {code} 行格式改变: {exc}") from exc
+
+        earliest = min(rows_by_date)
+        # 已覆盖 start，或源端这一页本来就不满（没有更早的数据了）→ 停止
+        if earliest <= start or len(items) < _INDEX_PAGE_BARS:
+            break
+        end = (_dt.date.fromisoformat(earliest) - _dt.timedelta(days=1)).isoformat()
+    else:
+        raise AstockError(
+            f"腾讯指数K线 {code} 分页超过 {_INDEX_MAX_PAGES} 页仍未覆盖 {start}，已放弃")
+
+    if not rows_by_date:
+        raise AstockError(f"腾讯指数K线 {code} 在 {start} 之后 0 根（未上市/区间内无交易日/代码有误）")
+
+    rows = [rows_by_date[k] for k in sorted(rows_by_date) if k >= start]
+    if not rows:
+        raise AstockError(f"腾讯指数K线 {code} 在 {start} 之后 0 根（未上市/区间内无交易日/代码有误）")
+
+    frame = pd.DataFrame(rows)
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame.dropna(subset=["date"]).set_index("date").sort_index()
+    frame = frame[~frame.index.duplicated(keep="last")]
+    frame.index.name = "date"
+    return frame[["open", "high", "low", "close", "volume"]]
 
 
 # ---------------------------------------------------------------------------

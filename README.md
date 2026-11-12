@@ -138,7 +138,15 @@ python cli.py 600519 --start 20200101 --json
     "label": "Bull",
     "confidence": 0.7,
     "as_of": "2026-10-16",
-    "definition": "simple_moving_average"
+    "definition": "simple_moving_average",
+    "index": {
+      "label": "Shock",
+      "confidence": 0.5,
+      "as_of": "2026-10-16",
+      "definition": "ma20_ma60_return_volatility",
+      "source": "tencent_index:sh000300",
+      "bars": 1662
+    }
   },
   "recommendation": {
     "status": "ok",
@@ -342,6 +350,31 @@ python cli.py 600519 --start 20200101 --json
 > `stale=true` 时 `diagnostics.warnings` 必定包含一条降级说明。
 > 消费方应把 `stale=true` 视为"结论时效性下降"，而不是普通告警。
 
+### market_regime
+
+`label / confidence / as_of / definition` 四个字段的含义与历史版本**完全一致**
+（输入是**个股自身**的日线），未做任何改动。
+
+`index`（P1-3，additive，`schema_version` 仍为 `1.0`）是**沪深 300 指数**的
+市场环境判定，只展示、**不参与 action / 仓位 / `regime_win_rates`**：
+
+| 键 | 含义 |
+|---|---|
+| `label` | `Bull` / `Bear` / `Shock`（与个股 regime 同一套标签） |
+| `confidence` | 置信度（0–1） |
+| `as_of` | 指数日线最后一根的日期 |
+| `definition` | 恒为 `ma20_ma60_return_volatility`：与个股 regime **同一判定规则**、不同输入 |
+| `source` | 数据来源，当前为 `tencent_index:sh000300` |
+| `bars` | 参与判定的指数日线根数（< 60 时不给标签） |
+
+> 指数日线取不到（断网 / WAF / 数据不足 60 根）时，`index` 六个键**全部为显式
+> `null`**，并在 `diagnostics.warnings` 追加一条说明；**CLI 正常返回**，`action`
+> 与原有 `market_regime` 不受任何影响。`--no-regime` 时 `index.definition = "disabled"`。
+>
+> 指数与个股标签**允许不同**（指数走弱而个股强势是正常现象）。本字段目前只用于
+> 展示与后续研究；任何"用指数 regime 替换个股 regime / 改 action"的提案都需要
+> 单独 PR 与 A/B 证据（见 `docs/P1_EVIDENCE_PLAN.md` §3.4 的验收门槛）。
+
 ### diagnostics
 
 - **warnings**: 可读中文告警数组。P0-4 起逐通道失败也会写入，例如
@@ -523,7 +556,7 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
   "request": { "code": "600519", "type": "stock", "type_hint": "auto", "start": null, "opt": "grid", "jobs": 1, "fast": true },
   "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false, "is_suspended": false, "limit_up": 1542.53, "limit_down": 1262.07, "quote_stale": false, "status_source": "tencent_quote" },
   "data": { "bars": 1643, "start": "2020-01-02 00:00:00", "end": "2026-10-16 00:00:00", "last_close": 1329.0, "source": "cache", "from_cache": true, "stale": false, "cache_last_date": "2026-10-16", "lag_days": 0, "expected_date": "2026-10-16", "requested_source": "sina", "window_note": null },
-  "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility" },
+  "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility", "index": { "label": "Shock", "confidence": 0.5, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility", "source": "tencent_index:sh000300", "bars": 1662 } },
   "recommendation": {
     "status": "ok",
     "action": "hold",
