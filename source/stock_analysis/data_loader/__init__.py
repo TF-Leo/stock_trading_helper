@@ -19,3 +19,10 @@ from stock_analysis.data_loader.meta import (
     resample_stock_data,
     last_fetch_info,
 )
+# P1-2（issue #36）：日级资金流**只读缓存**（绝不触网），供 CLI 组装 evidence.flow。
+from stock_analysis.data_loader.flow import (
+    build_flow_block,
+    empty_flow_block,
+    flow_evidence,
+    summarize_flow,
+)

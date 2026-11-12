@@ -440,6 +440,40 @@ python cli.py 600519 --start 20200101 --json
   exposure, vs_buy_hold, note}`。`method` 如实标注近似口径（当前 `trailing_250_point_estimate`），
   **不是 walk-forward**。`trade_count=0` 时 `note` 必说明原因（如 `status=no_edge`）
 
+### evidence.flow（P1-2，issue #36）
+
+日级主力资金流**上下文**，`schema_version` 仍为 `1.0`（additive）。
+数据来自东财 §4.5（最近 120 个交易日），但 **CLI 主路径绝不触网**：
+
+1. 收盘后运行 `python tools/precompute_flow.py`（逐票串行、相邻请求 ≥1s、失败重试后继续），
+   写入 `source/stock_analysis/data/flow/<code>.json`（`data/` 已在 `.gitignore`）；
+2. CLI / 盘前 cron 只读这份缓存。缓存缺失或过期时 `flow.available=false` + warning，
+   CLI 正常返回，**不会为了资金流多发一个请求**。
+
+**只展示、不改决策**：`evidence.flow` 不参与 `action`、`status`、`position_fraction`、
+`entry_zone`、`target_position` 的任何计算；A/B 对照中 `recommendation` 逐键一致。
+
+| 键 | 含义 |
+|---|---|
+| `available` | 缓存可用且至少有一行；不可用时其余数值键为 `null` |
+| `code` | 6 位纯数字代码 |
+| `source` | 当前为 `eastmoney_push2his` |
+| `as_of` | 摘要实际用到的**最后一根资金流日期**（不是文件时间） |
+| `fetched_at` | 预计算写入缓存的时间 |
+| `rows` | 本次摘要用到的行数（`--as-of` 时可能小于缓存总行数） |
+| `pub_lag_days` | 恒为 `1`：当日资金流收盘后发布；`--as-of d` 只使用 `date < d` 的行 |
+| `main_net_5d` | 最近 5 个交易日主力净流入之和，**单位元**（东财原始口径） |
+| `main_net_20d` | 最近 20 个交易日主力净流入之和；不足 20 行时为 `null`，不缩短窗口冒充 |
+| `direction` | `inflow` / `outflow` / `flat`（由 5 日净额符号判定） |
+| `direction_basis` | `main_net_5d_sign`；5 日不可用时退回 `main_net_20d_sign` |
+| `stale` | 缓存末日早于「期望最新交易日」；判定只读本地磁盘交易日历，缺失时退回周末推算 |
+| `expected_date` / `expected_source` | 期望交易日及其口径（`calendar_cache` / `estimate`） |
+| `reason` | 不可用原因：`cache_missing` / `cache_invalid` / `no_rows_as_of` / `fund_not_supported` / `data_source_error` |
+
+> 基金（含 ETF）没有个股资金流（上游 §4.5 不覆盖），固定返回
+> `available=false, reason="fund_not_supported"`，且**不追加 warning**，避免每次基金运行刷屏。
+> 股票缓存缺失/过期会在 `diagnostics.warnings` 给出一条可操作的提示，但不改变任何决策字段。
+
 ### data.execution（v2.0 新增字段）
 
 `{signal_bar, fill, slippage_bps, commission_bps}` —— 本次结论对应的成交假设。
@@ -454,6 +488,7 @@ python cli.py 600519 --start 20200101 --json
 - `evidence.n_trials = 0`、`significant = false`、`consensus.family = null`、`triggers = []`
 - `evidence.edge` 七键齐全（值全 `null`）、`evidence.signal_stats` 展开到 5 个 horizon 子键（值 `null`）、
   `evidence.decision_replay` 七键齐全、`recommendation.signal` 十三键齐全、`data.execution` 四键齐全
+- `evidence.flow` 十五键齐全（`available=false, reason="data_source_error"`，数值键全 `null`）
 - `recommendation.horizon_days = [null, null]`、`stop_loss/take_profit/stop_method = null`、`position_fraction = 0.0`
 - `data.bars/start/end/last_close` 在"数据太短"时是**已知真实值**（如 `bars=23`），与 `invalidation` 文本一致；拉取彻底失败时才为 `0 / "" / null`
 - `candidates = []`（没有候选才是正确语义，不是缺字段）

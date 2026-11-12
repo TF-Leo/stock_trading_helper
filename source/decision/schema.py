@@ -273,6 +273,12 @@ def execution_block(config=None) -> dict:
     }
 
 
+def _null_flow(code):
+    """P1-2（issue #36）：错误路径的 ``evidence.flow`` —— 键与成功路径一致，值显式 null。"""
+    from stock_analysis.data_loader.flow import empty_flow_block
+    return empty_flow_block(code=code, reason="data_source_error")
+
+
 def create_error_response(status, message, code, data_type, type_hint='auto',
                           bars=0, start=None, end=None, last_close=None,
                           fetch_info=None, elapsed=0.0, warnings=None,
@@ -396,6 +402,9 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'buy_hold_baseline': {'total_return': None, 'annual_return': None},
             'regime_win_rates': {'Bull': None, 'Bear': None, 'Shock': None},
             'triggers': [],
+            # P1-2（issue #36）additive：错误路径与成功路径键同构（G35）。
+            # 取数阶段失败，资金流上下文不可得 → 显式 null，不读缓存。
+            'flow': _null_flow(code),
         },
         'candidates': [],
         'diagnostics': {
