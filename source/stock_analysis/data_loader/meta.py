@@ -193,21 +193,38 @@ def _write_cache(df, cache_file, label):
 CACHE_OVERLAP_DAYS = 40       # 近端回看天数（覆盖春节等长假，保证有重叠交易日）
 OVERLAP_PRICE_TOL = 0.01      # 重叠段价格容差（元；4 位小数舍入）
 OVERLAP_VOLUME_TOL = 100.0    # 重叠段成交量容差（股；腾讯按整手取整，上游 #57）
-# 源间噪声 vs 复权基准变化（2026-11-12，PR #9 最后一次逻辑修正）
+# 源间噪声 vs 复权基准变化（2026-11-12，PR #9 最终判据修正）
 #
-# 判据不再是「任一重叠日超差 = 基准已变」。实盘 600519 缓存历史来自新浪，腾讯
-# 全量重取在 6041 个重叠交易日里有 12 天（0.2%）价格差 0.1–0.72 元 —— 这是两个
-# 数据源的舍入/口径噪声，不是除权导致的 qfq 整体重算。旧布尔判定把这种缓存整体
-# 替换成腾讯 6040 根，丢掉新浪独有的 2007-09-04（策略由唐奇安变 CMF）。
+# 判据不能是「任一重叠日超差 = 基准已变」，也不能是「最大相对差 >0.5% = 基准已变」：
+# 后者仍会被**单个异常日**绑架。实盘 600519 缓存历史来自新浪，腾讯全量重取在
+# 6040 个重叠交易日里只有 12 天（0.199%）价格差 0.1–0.72 元；其中 2011-12-13
+# 相对差 0.6155%、2011-12-15 0.5527% —— 两天就足以把整段判成「系统性平移」，
+# 于是整体替换成腾讯 6040 根，丢掉新浪独有的 2007-09-04（策略由唐奇安变 CMF）。
 #
-#   consistent   : 所有重叠日价格差 <= OVERLAP_PRICE_TOL 且成交量差 <= OVERLAP_VOLUME_TOL
-#   source_noise : 超差日期占比 <= OVERLAP_NOISE_MAX_EXCEED_PCT（1%）且
-#                  超差日最大相对差 |Δ|/|缓存价| <= OVERLAP_NOISE_MAX_REL（0.5%）
+# 真正的系统性复权基准变化（除权后 qfq 整体重算）会让**大多数**日期同时超差，
+# 而不是 6040 天里的 12 天。因此价格基准改用**分布判据**：
+#
+#   frac_price = OHLC 逐项超差占比（超差项数 / 4×重叠日数；价格超差 = 绝对差 > 0.01）
+#   p95_rel    = 逐日相对价格差 |Δ|/|缓存价| 的 95 分位
+#                （只对价格超差日取值，其余日按 0 计入；重叠 <20 日时退回 max，
+#                 小样本下 95 分位几乎恒为 0，用 max 才不会漏判）
+#
+#   consistent   : 价格、成交量全部在容差内
+#   source_noise : frac_price <= 1% 且 p95_rel <= 0.5%
 #                  —— 少数日子的源间差异，旧历史仍属同一基准，取并集并保留旧值
-#   basis_changed: 超差占比 >1% 或最大相对差 >0.5%（系统性平移，如除权后整体 ×0.98）
+#   basis_changed: frac_price > 1% 或 p95_rel > 0.5%（系统性平移，如除权后 ×0.98）
 #   no_overlap   : 无共同交易日
-OVERLAP_NOISE_MAX_EXCEED_PCT = 1.0   # 超差日期占比上限（百分数）
-OVERLAP_NOISE_MAX_REL = 0.005        # 超差日最大相对价格差上限（0.5%）
+#
+# 成交量与价格基准**分开判断**（成交量没有复权基准，只有单位/口径问题）：
+#   frac_vol = 成交量超差日数 / 重叠日数   （超差 = 绝对差 > 100 股）
+#     frac_vol > 10%      → 成交量单位/尺度变化，新 tail 不能与旧序列混用，
+#                           同样判 basis_changed（走整体替换）
+#     0 < frac_vol <= 10% → 只 warning（数据质量提示），不改变价格基准分类
+#   成交量超差日不并入 frac_price。
+OVERLAP_NOISE_MAX_PRICE_FRAC = 0.01  # OHLC 逐项超差占比上限（1%）
+OVERLAP_NOISE_MAX_REL = 0.005        # 相对价格差 95 分位上限（0.5%）
+OVERLAP_VOLUME_SCALE_FRAC = 0.10     # 成交量超差日占比超过 10% → 尺度变化
+OVERLAP_MIN_SAMPLE = 20              # 重叠日少于此值：p95 退回 max
 # 冷启动下限：1990-01-01 早于 A 股任一标的上市日，等价「全量」。
 # 用 YYYYMMDD 是因为 eastmoney/sina 通道收这个格式（astock 侧会转成 1990-01-01）。
 FULL_HISTORY_START = '19900101'
@@ -230,23 +247,47 @@ def _prepare_indexed_frame(raw):
 def _overlap_stats(cached, fresh):
     """重叠交易日的超差统计（向量化）。
 
-    返回 dict：
-      * ``common``  —— 重叠交易日数；
-      * ``exceed``  —— 价格（任一 OHLC）或成交量超差的日数；
-      * ``max_rel`` —— 超差日的最大相对价格差 ``|Δ| / |cache 价|``（无超差为 0）。
+    价格与成交量**分别**统计（成交量没有复权基准，不能并入价格超差占比）：
+
+      * ``common``       —— 重叠交易日数；
+      * ``price_exceed`` —— 价格超差日数（任一 OHLC 绝对差 > 0.01，或任一侧 NaN）；
+      * ``vol_exceed``   —— 成交量超差日数（绝对差 > 100 股，或任一侧 NaN）；
+      * ``frac_price``   —— OHLC 逐项超差占比（超差项数 / 4×重叠日数）。按列而非
+                            按日统计，才能区分「4% 的日期只有一列差 1%」（1% 项，
+                            源噪声）与「5% 的日期各列都差 1%」（>1% 项，系统性）；
+      * ``p95_rel``      —— 逐日相对价格差 |Δ|/|缓存价| 的 95 分位；
+      * ``max_rel``      —— 价格超差日的最大相对差（无超差为 0）；
+      * ``frac_vol``     —— vol_exceed / common；
+      * ``max_vol_abs`` / ``max_vol_rel`` —— 成交量超差日的最大绝对/相对差；
+      * ``exceed``       —— 兼容旧调用方的别名，等于 price_exceed。
+
+    ``p95_rel`` 的口径：在**全部重叠日**上取 95 分位，非超差日按 0 计入 ——
+    这样 6040 天里 12 天（0.2%）的源间噪声落在右侧 5% 尾部之外，p95 仍为 0，
+    不会被单个异常日绑架。重叠样本 <20 日时 95 分位几乎恒等于最大值，改为
+    直接取 max，避免小样本下 p95 退化成 0 而漏判基准变化。
 
     相对差只在超过**绝对**容差的日子上计算：未超容差的日子不参与，避免低价股
     因为 0.005 元的正常舍入就被判成「相对差 1%」。
     任一侧 NaN 视为超差且相对差 = inf（无法验证的基准不能并入旧序列）。
     """
+    empty = {
+        'common': 0, 'price_exceed': 0, 'vol_exceed': 0, 'exceed': 0,
+        'price_cells': 0, 'price_cells_bad': 0,
+        'frac_price': 0.0, 'p95_rel': 0.0, 'max_rel': 0.0,
+        'frac_vol': 0.0, 'max_vol_abs': 0.0, 'max_vol_rel': 0.0,
+        'price_nan': 0,
+    }
     common = cached.index.intersection(fresh.index)
     if len(common) == 0:
-        return {'common': 0, 'exceed': 0, 'max_rel': 0.0}
+        return empty
 
     a = cached.loc[common]
     b = fresh.loc[common]
-    bad = pd.Series(False, index=common)
+    price_bad = pd.Series(False, index=common)
+    price_nan = pd.Series(False, index=common)
     rel = pd.Series(0.0, index=common)
+    price_cells = 0          # OHLC 逐项比较的样本数（= 4 × 重叠日）
+    price_cells_bad = 0
 
     for col in ('open', 'high', 'low', 'close'):
         if col not in cached.columns or col not in fresh.columns:
@@ -256,32 +297,86 @@ def _overlap_stats(cached, fresh):
         diff = (ca - cb).abs()
         nan = ca.isna() | cb.isna()
         over = diff > OVERLAP_PRICE_TOL
-        bad = bad | nan | over
+        price_bad = price_bad | nan | over
+        price_nan = price_nan | nan
+        price_cells += int(len(common))
+        price_cells_bad += int((nan | over).sum())
         with np.errstate(divide='ignore', invalid='ignore'):
             day_rel = diff / ca.abs()
         day_rel = day_rel.where(over & ~nan, 0.0)
         day_rel = day_rel.mask(nan | ((ca.abs() == 0) & over), np.inf)
         rel = np.maximum(rel, day_rel.fillna(0.0))
 
+    vol_bad = pd.Series(False, index=common)
+    vol_rel = pd.Series(0.0, index=common)
+    vol_abs = pd.Series(0.0, index=common)
     if 'volume' in cached.columns and 'volume' in fresh.columns:
         va = pd.to_numeric(a['volume'], errors='coerce').astype(float)
         vb = pd.to_numeric(b['volume'], errors='coerce').astype(float)
-        bad = bad | va.isna() | vb.isna() | ((va - vb).abs() > OVERLAP_VOLUME_TOL)
+        vol_abs = (va - vb).abs()
+        vnan = va.isna() | vb.isna()
+        vol_bad = vnan | (vol_abs > OVERLAP_VOLUME_TOL)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            day_vrel = vol_abs / va.abs()
+        day_vrel = day_vrel.where(vol_bad & ~vnan, 0.0)
+        day_vrel = day_vrel.mask(vnan | ((va.abs() == 0) & vol_bad), np.inf)
+        vol_rel = day_vrel.fillna(0.0)
 
-    exceed = int(bad.sum())
+    n = int(len(common))
+    price_exceed = int(price_bad.sum())
+    vol_exceed = int(vol_bad.sum())
+    rel_values = rel.to_numpy(dtype=float)
+
+    if price_exceed == 0:
+        max_rel = p95_rel = 0.0
+    else:
+        max_rel = float(np.max(rel_values))
+        if n < OVERLAP_MIN_SAMPLE:
+            p95_rel = max_rel
+        else:
+            # 'higher'：取不低于 95% 位置的那个实际观测值，边界（恰好 5% 的日期
+            # 超差）不会被线性插值稀释。
+            p95_rel = float(np.quantile(rel_values, 0.95, method='higher'))
+
+    if vol_exceed == 0:
+        max_vol_abs = max_vol_rel = 0.0
+    else:
+        max_vol_abs = float(vol_abs.to_numpy()[vol_bad.to_numpy()].max())
+        max_vol_rel = float(vol_rel.to_numpy()[vol_bad.to_numpy()].max())
+
     return {
-        'common': int(len(common)),
-        'exceed': exceed,
-        'max_rel': float(rel.max()) if exceed else 0.0,
+        'common': n,
+        'price_exceed': price_exceed,
+        'vol_exceed': vol_exceed,
+        'exceed': price_exceed,          # 兼容旧调用方
+        'price_cells': price_cells,
+        'price_cells_bad': price_cells_bad,
+        'frac_price': (price_cells_bad / price_cells) if price_cells else 0.0,
+        'p95_rel': p95_rel,
+        'max_rel': max_rel,
+        'frac_vol': vol_exceed / n,
+        'max_vol_abs': max_vol_abs,
+        'max_vol_rel': max_vol_rel,
+        'price_nan': int(price_nan.sum()),
     }
 
 
 def _classify_overlap(cached, fresh, stats=None):
     """重叠段分类：'consistent' / 'source_noise' / 'basis_changed' / 'no_overlap'。
 
-    旧实现是布尔 ``_overlap_matches``：只要有一天差 >0.01 就判「基准已变」，
-    把两个数据源之间 0.2% 的噪声误当成除权重算，导致旧缓存被整体替换、独有
-    历史根丢失。现按**超差占比 + 最大相对差**区分源间噪声与系统性基准平移。
+    旧实现按「任一超差日」判基准变化，后来按「超差占比 + 最大相对差」，两者都
+    会被**单个异常日**绑架（12/6040 的源间噪声里有两天相对差 0.55–0.62%）。
+    现按**分布判据**：大多数日期同时超差才是系统性复权基准变化。
+
+    价格基准：
+      * frac_price > 1%  或
+      * p95_rel > 0.5%   或
+      * 存在无法验证的价格 NaN（相对差 inf）
+      → basis_changed；否则 source_noise。
+
+    成交量尺度（与价格基准分开）：
+      * frac_vol > 10% → 成交量单位/口径变化，tail 不能与旧序列混用 → basis_changed；
+      * 0 < frac_vol <= 10% → 只 warning，不改变价格基准分类。
 
     ``stats``（可选 dict）会被填入 ``_overlap_stats`` 的统计，供调用方打日志。
     """
@@ -290,14 +385,38 @@ def _classify_overlap(cached, fresh, stats=None):
         stats.update(s)
     if s['common'] == 0:
         return 'no_overlap'
-    if s['exceed'] == 0:
+    if s['price_exceed'] == 0 and s['vol_exceed'] == 0:
         return 'consistent'
-    # 用整数百分比比较，避开 1/100 这类浮点边界误差（恰好 1% 应判 source_noise）
-    within_ratio = (s['exceed'] * 100.0
-                    <= OVERLAP_NOISE_MAX_EXCEED_PCT * s['common'])
-    if within_ratio and s['max_rel'] <= OVERLAP_NOISE_MAX_REL:
-        return 'source_noise'
-    return 'basis_changed'
+
+    # 用整数比较，避开 1/100、10/100 这类浮点边界误差：
+    #   frac_price > 1%  <=>  price_cells_bad * 100 > price_cells
+    #   frac_vol   > 10% <=>  vol_exceed * 10      > common
+    price_frac_changed = (s['price_cells_bad'] * 100 > s['price_cells']) \
+        if s['price_cells'] else False
+    price_rel_changed = (not np.isfinite(s['p95_rel'])
+                         or s['p95_rel'] > OVERLAP_NOISE_MAX_REL)
+    vol_scale_changed = s['vol_exceed'] * 10 > s['common']
+    if (price_frac_changed or price_rel_changed or vol_scale_changed
+            or s['price_nan'] > 0):
+        return 'basis_changed'
+    return 'source_noise'
+
+
+def _log_overlap_verdict(label, cls, s, stage=''):
+    """把完整判据打到 stderr（可审计：分类不靠猜）。"""
+    def _pct(v):
+        return 'inf' if not np.isfinite(v) else f'{v:.3%}'
+
+    print(f"[INFO] {label} {stage}重叠判据：重叠 {s['common']} 日；"
+          f"价格超差 {s['price_exceed']} 日（frac_price={_pct(s['frac_price'])}），"
+          f"p95_rel={_pct(s['p95_rel'])}，max_rel={_pct(s['max_rel'])}；"
+          f"成交量超差 {s['vol_exceed']} 日（frac_vol={_pct(s['frac_vol'])}）；"
+          f"分类={cls}", file=sys.stderr)
+    if 0 < s['vol_exceed'] and s['frac_vol'] <= OVERLAP_VOLUME_SCALE_FRAC:
+        print(f"[WARN] {label} 成交量异常 {s['vol_exceed']} 日"
+              f"（最大绝对差 {s['max_vol_abs']:.0f} 股、最大相对差 "
+              f"{_pct(s['max_vol_rel'])}），仅数据质量提示，不改变价格基准分类",
+              file=sys.stderr)
 
 
 def _merge_with_cache(cached, fresh, label, cls='consistent'):
@@ -393,6 +512,7 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
             if incremental:
                 cls_stats = {}
                 cls = _classify_overlap(_stale_cache, full, cls_stats)
+                _log_overlap_verdict(f'stock_{symbol}', cls, cls_stats, '增量段')
                 if cls in ('consistent', 'source_noise'):
                     full, cache_rows_kept = _merge_with_cache(
                         _stale_cache, full, f'stock_{symbol}', cls)
@@ -405,7 +525,9 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
                     reason = ('重叠段复权基准已变' if cls == 'basis_changed'
                               else '与旧缓存无重叠')
                     print(f"[WARN] {symbol} 增量{reason}（分类={cls}，"
-                          f"重叠 {cls_stats['common']} 日、超差 {cls_stats['exceed']} 日），"
+                          f"重叠 {cls_stats['common']} 日、价格超差 "
+                          f"{cls_stats['price_exceed']} 日、成交量超差 "
+                          f"{cls_stats['vol_exceed']} 日），"
                           f"改为从缓存首日 "
                           f"{pd.Timestamp(_stale_cache.index[0]).date()} 全量重取", file=sys.stderr)
                     raw2, used2 = None, None
@@ -430,13 +552,19 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
                             return _apply_start(_stale_cache, start_date)
                         recon_stats = {}
                         recon = _classify_overlap(_stale_cache, fresh_full, recon_stats)
+                        _log_overlap_verdict(f'stock_{symbol}', recon, recon_stats,
+                                             '全量重取段')
                         if recon == 'basis_changed':
                             # 系统性平移（除权/分红后 qfq 整体重算）：新基准才是正确
                             # 基准，整体采用新结果，绝不把旧基准混进序列。
                             print(f"[WARN] {symbol} 全量重取与旧缓存重叠段不一致"
                                   f"（复权基准已变，分类={recon}，重叠 "
-                                  f"{recon_stats['common']} 日、超差 {recon_stats['exceed']} 日、"
-                                  f"最大相对差 {recon_stats['max_rel']:.4%}），"
+                                  f"{recon_stats['common']} 日、价格超差 "
+                                  f"{recon_stats['price_exceed']} 日、成交量超差 "
+                                  f"{recon_stats['vol_exceed']} 日、"
+                                  f"frac_price={recon_stats['frac_price']:.4%}、"
+                                  f"p95_rel={recon_stats['p95_rel']:.4%}、"
+                                  f"frac_vol={recon_stats['frac_vol']:.4%}），"
                                   f"采用新基准并整体替换旧缓存",
                                   file=sys.stderr)
                             full = fresh_full

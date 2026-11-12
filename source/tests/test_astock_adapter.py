@@ -767,7 +767,7 @@ def _shift_days(frame, days, delta):
 
 
 def test_classify_overlap_four_way_and_percentage_boundary():
-    """三分类 + 百分比边界：恰好 1% 是源噪声，略超 1% 是基准变化。"""
+    """四分类 + 占比/分布边界：1% 项以内是源噪声，超过是基准变化。"""
     from stock_analysis.data_loader import meta
 
     dates = pd.bdate_range("2020-01-01", periods=100)
@@ -781,47 +781,75 @@ def test_classify_overlap_four_way_and_percentage_boundary():
                          base=1000.0, step=0.0)
     assert meta._classify_overlap(cached, other) == "no_overlap"
 
-    # 恰好 1%（1/100）、相对差 0.1%（1.0/1000）→ source_noise
+    # 1 天（4/400 项 = 1%，不大于 1%）、相对差 0.1% → source_noise
     one = _shift_days(cached, [dates[10]], 1.0)
     stats = {}
     assert meta._classify_overlap(cached, one, stats) == "source_noise"
-    assert stats["common"] == 100 and stats["exceed"] == 1
+    assert stats["common"] == 100 and stats["price_exceed"] == 1
+    assert stats["frac_price"] == pytest.approx(0.01)
     assert stats["max_rel"] == pytest.approx(1.0 / 999.0)  # low 列基数 999
 
-    # 略超 1%（2/100）→ basis_changed
+    # 2 天（8/400 项 = 2%）→ basis_changed
     two = _shift_days(cached, [dates[10], dates[20]], 1.0)
     assert meta._classify_overlap(cached, two) == "basis_changed"
 
-    # 占比恰好 1%，但相对差 10%（>0.5%）→ 系统性平移，basis_changed
+    # 单个异常日（1/100）即使相对差 10% 也不再判系统性平移 —— 这正是
+    # 6041→6040 事故里「被单日绑架」的形态；个别异常日只算源噪声。
     big = _shift_days(cached, [dates[10]], 100.0)
-    assert meta._classify_overlap(cached, big) == "basis_changed"
+    assert meta._classify_overlap(cached, big) == "source_noise"
+
+    # 但超差日期足够多（2/100 = 2% > 1%）且相对差 10% → 系统性平移
+    many_big = _shift_days(cached, [dates[10], dates[20]], 100.0)
+    assert meta._classify_overlap(cached, many_big) == "basis_changed"
 
 
 def test_source_noise_full_refetch_merges_union_and_keeps_old_values(
         tmp_path, monkeypatch, capsys):
-    """12/6040 源间噪声 + 源端缺 2007-09-04 → source_noise 并集，旧值不回写。"""
+    """真实形状：6041 缓存 / 6040 全量、12 天价格噪声（最大相对差 0.62%，
+    但 p95=0）、9 天成交量噪声（最大 48%）→ source_noise 并集，旧值不回写。
+
+    这是 PR #9 的核心事故形状：max 判据会因为 2011-12-13(0.6155%) /
+    2011-12-15(0.5527%) 两天把整段判成 basis_changed，整体替换后丢掉
+    2007-09-04，策略由唐奇安变 CMF。
+    """
     from stock_analysis.data_loader import meta
 
     monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
     cache_dates = pd.bdate_range("2001-08-27", periods=6041)
-    cached = _write_cache(tmp_path, cache_dates)
+    cached = _ohlcv_frame(cache_dates, base=10.0, step=0.02)  # 低价→高价，贴近实盘
+    cached.to_csv(tmp_path / "stock_600519_qfq.csv")
     cache_file = tmp_path / "stock_600519_qfq.csv"
 
     drop_day = pd.Timestamp("2007-09-04")  # 腾讯缺失、新浪独有
     assert drop_day in cache_dates
     fresh_dates = cache_dates.drop(drop_day)                 # 全量重取 6040 行
     fresh = cached.loc[fresh_dates].copy()
-    noise_days = fresh_dates[[100, 600, 1100, 1600, 2100, 2600,
-                             3100, 3600, 4100, 4600, 5100, 5600]]
-    deltas = [0.10, 0.12, 0.15, 0.18, 0.20, 0.24,
-              0.30, 0.36, 0.42, 0.50, 0.60, 0.72]
+
+    # 12 天价格噪声：绝对差 0.011–0.72 元，最大相对差 0.6207%（>0.5% 上限），
+    # 但只占重叠日的 0.2%，落在 p95 的右侧尾部之外。
+    noise_idx = [100, 500, 900, 1500, 2000, 2500, 3000, 3500,
+                 4000, 4475, 4800, 5300]
+    deltas = [0.011, 0.012, 0.013, 0.014, 0.015, 0.016, 0.017, 0.018,
+              0.019, 0.55, 0.02, 0.72]
+    noise_days = [fresh_dates[i] for i in noise_idx]
     for day, delta in zip(noise_days, deltas):
         fresh.loc[day, _PX] = fresh.loc[day, _PX] + delta
 
+    # 9 天成交量噪声（源端口径差，最大 48%）：比例低于 10% → 只 warning。
+    vol_idx = [300, 1300, 2300, 3300, 4300, 5000, 5500, 5800, 5900]
+    vol_factors = [1.48, 1.31, 1.20, 1.10, 1.40, 1.05, 1.25, 1.35, 1.15]
+    vol_days = [fresh_dates[i] for i in vol_idx]
+    for day, factor in zip(vol_days, vol_factors):
+        fresh.loc[day, "volume"] = fresh.loc[day, "volume"] * factor
+
     stats = {}
     assert meta._classify_overlap(cached, fresh, stats) == "source_noise"
-    assert stats["common"] == 6040 and stats["exceed"] == 12
-    assert stats["max_rel"] <= meta.OVERLAP_NOISE_MAX_REL
+    assert stats["common"] == 6040
+    assert stats["price_exceed"] == 12 and stats["vol_exceed"] == 9
+    assert stats["frac_price"] == pytest.approx(12 / 6040, abs=1e-6)
+    assert stats["p95_rel"] == 0.0                       # 分布判据：不被单日绑架
+    assert stats["max_rel"] > meta.OVERLAP_NOISE_MAX_REL  # 0.6207% > 0.5%
+    assert stats["frac_vol"] == pytest.approx(9 / 6040)
 
     new_day = pd.bdate_range(cache_dates[-1] + pd.Timedelta(days=1), periods=1)[0]
     near = _ohlcv_frame([new_day])  # 近端窗口与旧缓存无重叠 → 触发全量重取
@@ -851,6 +879,10 @@ def test_source_noise_full_refetch_merges_union_and_keeps_old_values(
     assert info["cache_rows_kept"] == 1              # 只有 2007-09-04 旧缓存独有
     assert "重叠分类=source_noise" in err
     assert "保留旧缓存 1 行" in err
+    # 完整判据 + 成交量 warning 都打到 stderr
+    assert "frac_price=" in err and "p95_rel=" in err and "frac_vol=" in err
+    assert "分类=source_noise" in err
+    assert "成交量异常 9 日" in err and "不改变价格基准分类" in err
 
     # 重叠日保留旧缓存值（源噪声不混进新浪基准），不是源端的新值
     noise_day = noise_days[0]
@@ -861,6 +893,78 @@ def test_source_noise_full_refetch_merges_union_and_keeps_old_values(
     assert len(written) == 6041
     assert drop_day in written.index
     assert written.loc[noise_day, "close"] == pytest.approx(cached.loc[noise_day, "close"])
+
+
+def test_volume_scale_change_is_basis_changed():
+    """成交量整体 ÷100（frac_vol=100% >10%）→ 尺度变化，tail 不能混用。"""
+    from stock_analysis.data_loader import meta
+
+    dates = pd.bdate_range("2020-01-01", periods=200)
+    cached = _ohlcv_frame(dates, base=100.0, step=1.0)
+    scaled = cached.copy()
+    scaled["volume"] = scaled["volume"] / 100.0
+
+    stats = {}
+    assert meta._classify_overlap(cached, scaled, stats) == "basis_changed"
+    assert stats["price_exceed"] == 0          # 价格完全一致
+    assert stats["vol_exceed"] == 200
+    assert stats["frac_vol"] == pytest.approx(1.0)
+    assert stats["frac_price"] == 0.0
+
+    # 反向：成交量噪声 <=10% 时只提示，不改变价格基准分类
+    small = cached.copy()
+    small.loc[dates[:20], "volume"] = small.loc[dates[:20], "volume"] * 1.2
+    stats2 = {}
+    assert meta._classify_overlap(cached, small, stats2) == "source_noise"
+    assert stats2["vol_exceed"] == 20
+    assert stats2["frac_vol"] == pytest.approx(0.10)   # 恰好 10% → 不触发尺度变化
+
+
+def test_p95_rel_boundary_distribution_not_max():
+    """p95 分布边界：5% 的日期相对差 1% → p95>0.5%；4% → p95=0。"""
+    from stock_analysis.data_loader import meta
+
+    dates = pd.bdate_range("2020-01-01", periods=100)
+    cached = _ohlcv_frame(dates, base=1000.0, step=0.0)  # 恒价 1000
+
+    # 5% 的日期 close 相对差 1%（绝对值 10 元 > 0.01）→ 落在 95% 位置
+    five = cached.copy()
+    five.loc[dates[:5], "close"] = five.loc[dates[:5], "close"] * 1.01
+    stats5 = {}
+    assert meta._classify_overlap(cached, five, stats5) == "basis_changed"
+    assert stats5["p95_rel"] == pytest.approx(0.01)
+    assert stats5["p95_rel"] > meta.OVERLAP_NOISE_MAX_REL
+
+    # 4% 的日期 close 相对差 1% → 落在右侧 5% 尾部之外，p95=0；
+    # OHLC 逐项超差占比 = 4/400 = 1%（恰好在 1% 上限内）→ source_noise
+    four = cached.copy()
+    four.loc[dates[:4], "close"] = four.loc[dates[:4], "close"] * 1.01
+    stats4 = {}
+    assert meta._classify_overlap(cached, four, stats4) == "source_noise"
+    assert stats4["p95_rel"] == 0.0
+    assert stats4["frac_price"] == pytest.approx(0.01)
+
+
+def test_small_overlap_sample_uses_max_for_p95():
+    """重叠 <20 日时 p95 退回 max：15 天里 1 天相对差 0.6% → p95=0.6%。"""
+    from stock_analysis.data_loader import meta
+
+    dates = pd.bdate_range("2020-01-01", periods=15)
+    cached = _ohlcv_frame(dates, base=1000.0, step=0.0)
+    fresh = cached.copy()
+    fresh.loc[dates[3], "close"] = fresh.loc[dates[3], "close"] * 1.006
+
+    stats = {}
+    cls = meta._classify_overlap(cached, fresh, stats)
+    assert stats["common"] == 15
+    assert stats["price_exceed"] == 1
+    assert stats["p95_rel"] == pytest.approx(0.006)   # 退回 max，而不是 95 分位
+    assert stats["max_rel"] == pytest.approx(0.006)
+    # 15 天里 1 天超差 → OHLC 项占比 1/60 > 1% → 仍判基准变化
+    assert cls == "basis_changed"
+
+    # 小样本但价格全在容差内 → consistent（不受小样本影响）
+    assert meta._classify_overlap(cached, cached.copy()) == "consistent"
 
 
 def test_basis_changed_systematic_shift_replaces_full(tmp_path, monkeypatch, capsys):
