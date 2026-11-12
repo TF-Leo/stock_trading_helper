@@ -11,5 +11,10 @@
 #     python tools/precompute_valuation.py 600519 002415
 #
 # 上游固定版：a-stock-data v3.10.4 §6.5（baostock 不支持北交所）。
+#
+# requests：预计算入口用 `stock_analysis.data_sources._astock_generated.norm_ticker`
+# 规范化代码，该模块顶层 `import requests`（与主 requirements.txt 同版本）。
+# 缺它时报「代码无法解析：No module named 'requests'」，issue #52 实测踩过。
 
 baostock==0.9.4
+requests==2.32.5
