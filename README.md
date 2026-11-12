@@ -558,6 +558,52 @@ python cli.py 600519 --start 20200101 --json
 > 且**不追加 warning**（上游 §6.5 只覆盖沪深个股）。股票缓存缺失/过期会给出
 > 一条可操作提示，但不改变任何决策字段。
 
+### 前向台账（P1，issue #56）：每日记录 + 20 交易日结算
+
+回放历史得不出资金流方向与置信度校准的结论（R3 §8.2：资金流只有 79 个决策日、
+置信度校准回放成本约 8s/票/日）。唯一出路是**从今天起把建议冻住**，等 20 个
+交易日后用真实行情结算。台账由 `tools/forward_log.py` 驱动，逻辑在
+`source/stock_analysis/forward_ledger.py`：
+
+```bash
+python tools/forward_log.py record                 # 收盘后跑；默认 14 只自选
+python tools/forward_log.py record --codes 002415,601066 --ledger-only
+python tools/forward_log.py evaluate               # 结算已到期记录（每日跑）
+python tools/forward_log.py report                 # 汇总；--json 输出机读
+```
+
+写入 `source/stock_analysis/data/forward/<YYYY-MM-DD>.json`（`data/` 已在
+`.gitignore`）。**同一天重复跑覆盖同 code，不追加**；按 CLI 返回的
+`data.end`（最后一根行情日）分文件，因此周末/节假日跑会落在上一个交易日。
+
+每条记录的键集合固定，取不到就写 `null` 并在 `missing` 里记原因
+（`cache_missing` / `cli_failed` / `field_absent_in_cli_output` 等），
+**不省略键、不猜**：
+
+| 组 | 键 |
+|---|---|
+| 决策 | `as_of` `code` `action` `status` `confidence` `position_fraction` `entry_zone` `stop_loss` `take_profit` `horizon_days` `target_position` |
+| 信号 | `signal.position_state` |
+| 资金面 | `flow.{available,source,caliber,net_5d,net_20d,as_of,main_net_5d,main_net_20d}` |
+| 估值 | `valuation.{available,pe_percentile_3y,pb_percentile_3y,ps_percentile_3y,as_of}` |
+| 市况 | `market_regime.{label,confidence}` / `index_regime.{label,confidence}` |
+| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` |
+| 结算 | `settled.{ret_20d,hit,settle_date,entry_date,entry_open,exit_open,horizon_days,price_source}` 或 `null` + `settle_reason` |
+
+结算口径：`open_{d+1+20} / open_{d+1} − 1`，用**前复权**开盘价（分红送转在比值里
+自然抵消）。「交易日」以该票自己的行情索引为准（停牌日无开盘价，不能成交）。
+`buy` 记 `ret > 0`、`sell` 记 `ret < 0`；`hold` / `avoid` / `insufficient_data`
+没有方向，**不参与命中率与校准**。价格取不到时 `settled=null` + `settle_reason`
+（`no_price_data` / `not_matured` / `no_bars_as_of`），**不缩短持有期、不猜**。
+
+`report` 给出：已到期条数、方向命中率、按 `confidence` 分箱的校准（含 Brier）、
+按 `action` / `flow.caliber` / `flow.available` / `valuation.pb` 分位的分层命中率 ——
+供 `docs/P1_EVIDENCE_PLAN.md` §3.6.3 的 C 路径（Brier 改善 ≥0.02，需 ≥200 条已到期记录）使用。
+`confidence` 在这里的操作性定义是「该方向判断正确的概率」。
+
+> 旧 `evidence/forward_log.csv` / `forward_eval.csv` 仍照常写（同一份 CLI 输出派生，
+> 不重复跑 CLI）；JSON 台账是 issue #56 的正式口径。
+
 ### data.execution（v2.0 新增字段）
 
 `{signal_bar, fill, slippage_bps, commission_bps}` —— 本次结论对应的成交假设。
