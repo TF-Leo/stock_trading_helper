@@ -858,57 +858,13 @@ def _restrict_to_listing(feats, data) -> None:
         feats["elig"][key] = feats["elig"][key] & listing
 
 
-def _random_selector_fast(feats, counts, width, bought, mode, seed):
-    """等暴露度随机对照（与 R6 语义一致，但按 reps 抽样，避免 O(reps×pool)）。
+def _random_selector(feats, counts, width, bought, mode, seed):
+    """等暴露度随机对照（**直接复用 R6 的向量化实现**，语义完全一致）。
 
-    * ``iid``：每窗从当日可选池随机抽 ``counts[k]`` 只；
-    * ``turnover``：保留上一窗 ``counts[k]-bought[k]`` 只，再随机补 ``bought[k]`` 只。
+    R6 的 ``_random_selector`` 用 ``argpartition`` 按 rep 向量化抽样，在 5,471 只
+    票的池子上仍然可行；自己再写一套 Python 循环版只会更慢且引入口径漂移。
     """
-    width = int(width)
-    counts = list(counts)
-    bought = list(bought) if bought is not None else [0] * len(counts)
-    rng = np.random.default_rng(seed)
-    state = {"prev": np.full(width, -1, dtype=int)}
-
-    def selector(d, k, reps, _rng):
-        n = int(counts[k]) if k < len(counts) else 0
-        out = np.full((reps, width), -1, dtype=int)
-        pool = np.flatnonzero(feats["elig"]["pool"][d])
-        if n <= 0 or pool.size == 0:
-            state["prev"] = np.full(width, -1, dtype=int)
-            return out
-        take = min(n, pool.size, width)
-        prev = state["prev"]
-        if mode == "iid":
-            for rep in range(reps):
-                pick = rng.choice(pool.size, size=take, replace=False)
-                out[rep, :take] = pool[pick]
-            state["prev"] = out[0].copy()
-            return out
-        nb = int(bought[k]) if k < len(bought) else 0
-        keep = max(min(take - nb, width), 0)
-        pos = np.searchsorted(pool, prev)
-        pos_c = np.clip(pos, 0, pool.size - 1)
-        valid_old = (prev >= 0) & (pos < pool.size) & (pool[pos_c] == prev)
-        old = prev[valid_old]
-        for rep in range(reps):
-            if old.size:
-                kk = min(keep, old.size)
-                kept = rng.choice(old, size=kk, replace=False)
-            else:
-                kept = np.array([], dtype=int)
-            out[rep, :kept.size] = kept
-            n_new = min(nb, width - kept.size, pool.size - kept.size)
-            if n_new > 0:
-                cand = pool[~np.isin(pool, kept)]
-                if cand.size:
-                    pick = rng.choice(cand.size, size=min(n_new, cand.size),
-                                      replace=False)
-                    out[rep, kept.size:kept.size + pick.size] = cand[pick]
-        state["prev"] = out[0].copy()
-        return out
-
-    return selector
+    return _r6()._random_selector(feats, counts, width, bought=bought, mode=mode)
 
 
 def _ew_baseline(data, feats, horizon, args):
@@ -1130,14 +1086,14 @@ def cmd_analyze(args) -> int:
     for i, res in enumerate(results):
         for mode in ("iid", "turnover"):
             key = f"{res['id']}:{mode}"
-            selector = _random_selector_fast(
-                feats, res["window_counts"], args.top_n, res["window_bought"],
-                mode, args.seed + 1000 + i * 7 + (0 if mode == "iid" else 3))
+            seed = args.seed + 1000 + i * 7 + (0 if mode == "iid" else 3)
+            selector = _random_selector(feats, res["window_counts"],
+                                        args.top_n, res["window_bought"],
+                                        mode, seed)
             t0 = time.time()
             factors, diag = r6.run_schedule(data, feats, res["horizon"], selector,
                                             args.top_n, reps=args.random_reps,
-                                            seed=args.seed + 1000 + i * 7
-                                            + (0 if mode == "iid" else 3))
+                                            seed=seed)
             lo, hi = res["eval_lo"], res["eval_hi"]
             mt = r6.metrics_from_factors(factors, data["dates"], lo, hi)
             random_dists[key] = {"ann": mt["ann_return"], "sharpe": mt["sharpe"],
@@ -1310,6 +1266,9 @@ def cmd_analyze(args) -> int:
     pd.DataFrame(yearly_rows).to_csv(os.path.join(paths.out, "yearly.csv"),
                                      index=False)
     r6._print_results(results, ew_res, idx_res, random_controls, wf, n_trials)
+    # R6 的 _print_results 把产物路径写死成 evidence/p2/out；本工具的产物在
+    # <data-dir>/out，这里补一行正确的。
+    print(f"实际产物目录：{paths.out}")
     print(f"\n偏差量级：无偏等权 {bias['unbiased_ew_ann']*100:.2f}% / "
           f"幸存者子集 {bias['survivor_subset_ew_ann']*100:.2f}% "
           f"({bias['survivor_minus_unbiased_pp']:+.2f}pp) / "
