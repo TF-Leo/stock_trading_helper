@@ -62,6 +62,9 @@ __all__ = [
     "clear_state",
     "failure_budget",
     "run_with_deadline",
+    "http_timeout_for_budget",
+    "DEFAULT_HTTP_CONNECT_TIMEOUT",
+    "DEFAULT_HTTP_READ_TIMEOUT",
     "count_requests",
     "normalize_batch_args",
 ]
@@ -337,6 +340,10 @@ def run_with_deadline(func, timeout, *args, **kwargs):
     超时后**放弃的线程仍可能在跑**（Python 无法强杀线程），因此调用方必须
     **不再发起新的请求**（本项目的用法：超时即终止该票，回退缓存），
     这样进程内最多只有一个遗留请求在飞，不违反上游「串行」的防封铁律。
+
+    使用点（issue #67 D2）：研究路径按**整票**套一次；生产路径
+    ``data_loader/bars.py::_DataSourcePool.fetch`` 按**单通道**套一次
+    （剩余预算），保证「单通道阻塞」也吃不满整票预算。
     """
     import threading
 
@@ -356,10 +363,44 @@ def run_with_deadline(func, timeout, *args, **kwargs):
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
-        raise TencentBudgetExceeded(f"取数超过 {timeout:.1f}s 预算，已放弃该票")
+        raise TencentBudgetExceeded(f"取数超过 {timeout:.1f}s 预算，已放弃本次取数")
     if "error" in box:
         raise box["error"]
     return box.get("value")
+
+
+# ---------------------------------------------------------------------------
+# 单次 HTTP 超时 × 预算（issue #67 D2）
+# ---------------------------------------------------------------------------
+#: 生成物 ``_astock_generated._ASTOCK_HTTP_TIMEOUT`` 的默认 (connect, read)。
+#: 预算充足时保持原值不变（20s 预算下 5+15 正好用满一个请求的最坏耗时）。
+DEFAULT_HTTP_CONNECT_TIMEOUT = 5.0
+DEFAULT_HTTP_READ_TIMEOUT = 15.0
+
+
+def http_timeout_for_budget(remaining, connect=DEFAULT_HTTP_CONNECT_TIMEOUT,
+                            read=DEFAULT_HTTP_READ_TIMEOUT):
+    """把单次 HTTP 超时收敛到「该通道剩余预算」之内。
+
+    D2（issue #67）实测：预算 3s 时单请求仍是 ``(5, 15)``，一个挂死入口光
+    connect + read 就能吃掉 20s，与预算完全错配。规则：
+
+    * 预算充足（``remaining ≥ connect + read``）→ 原样返回默认值，不改变
+      正常取数的容错能力；
+    * 预算收紧 → connect 占剩余预算的 1/3、read 吃掉其余 2/3，
+      保证 ``connect + read ≤ remaining``（Python 浮点误差量级）。
+
+    返回 ``(connect, read)``，单位秒；调用方须保证 ``remaining > 0``
+    （渠道池进入通道前已判定）。这是**协作式**上限：requests 对 DNS
+    / 半开连接偶有不严格遵守 read timeout 的情况，所以调用方仍必须用
+    :func:`run_with_deadline` 兜底墙钟（见 D2 修复说明）。
+    """
+    remaining = max(0.0, float(remaining))
+    # 极小预算（< 0.2s）下不再施加 0.1s 下限，否则 connect + read 会超出预算。
+    floor = min(0.1, remaining / 2.0)
+    connect = min(float(connect), max(floor, remaining / 3.0))
+    read = min(float(read), max(floor, remaining - connect))
+    return (connect, read)
 
 
 @contextlib.contextmanager

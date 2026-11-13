@@ -319,7 +319,8 @@ R5 抓 300 只日线时真实触发整域限流（`docs/P1_EVIDENCE_V2.md` §2.2
 |---|---|---|
 | 状态镜像 | `data_sources/tencent_throttle.py` | 冷却状态落 `source/stock_analysis/data/state/tencent_cooldown.json`（gitignore），带过期时间；`tmp` + `os.replace` 原子写，`fcntl.flock` 串行化读-改-写（并发进程不会互相覆盖） |
 | 入口闸门 | `astock.fetch_daily` / `fetch_index_daily` | 取数前 `sync_process_state()` 把磁盘冷却并入进程内字典；三入口全冷却时抛 `TencentThrottled`，**一个请求都不发**；取数后 `flush_process_state()` 立即落盘 |
-| 渠道池预算 | `data_loader/bars.py::_DataSourcePool` | 单票总耗时 ≤ `DATA_SOURCE_TICKER_BUDGET_SECONDS`（默认 20s），超预算停止尝试剩余通道（attempt 带 `budget_exhausted`），调用方回退缓存并 `degraded`；主源连续 3 只失败后**本轮剩余票把备胎排到最前**，新一轮 `reset_primary_block()` 重新判定 |
+| 渠道池预算 | `data_loader/bars.py::_DataSourcePool` | 单票总耗时 ≤ `DATA_SOURCE_TICKER_BUDGET_SECONDS`（默认 20s）：**每个通道调用**都套 `run_with_deadline`（剩余预算），单通道阻塞也会被放弃，不再只约束「通道之间」；超预算停止尝试剩余通道（attempt 带 `budget_exhausted`），调用方回退缓存并 `degraded`；主源连续 3 只失败后**本轮剩余票把备胎排到最前**，新一轮 `reset_primary_block()` 重新判定 |
+| 单次 HTTP 超时 | `tencent_throttle.http_timeout_for_budget` → `astock.fetch_daily(budget=…)` | 取数时把生成物的 `_ASTOCK_HTTP_TIMEOUT` 收敛到剩余预算内（预算 3s → `(1.0, 2.0)`；预算 ≥20s 保持默认 `(5, 15)`），退出还原默认值。避免「预算 3s、单请求 20s」错配 |
 | 批量预算 | `tools/context_ic.py fetch` | `--batch-size ≤ 20`、`--batch-pause ≥ 20s`（超限夹取并打印）；`--ticker-budget`（默认 20s）；`--primary-block-after`（默认 3）；`manifest.json` 记录 `price_sources` / `price_source_counts` / `price_budget` / `tencent_cooldown` |
 
 **备胎混源约束（第 4 条）**：`price_sources` 逐票记录 `tencent_qfq` / `baostock_qfq`。
@@ -329,6 +330,13 @@ R5 抓 300 只日线时真实触发整域限流（`docs/P1_EVIDENCE_V2.md` §2.2
 
 运维：手动解除冷却 = 删除 `tencent_cooldown.json`（或
 `tencent_throttle.clear_state()`）；`DATA_SOURCE_TICKER_BUDGET_SECONDS` 可临时放大预算。
+
+**预算的边界（issue #67 D2）**：Python 无法强杀线程，`run_with_deadline` 的上限是
+**协作式**的——超时后调用线程立刻返回（回退缓存、`degraded`），被放弃的取数线程
+转为 daemon 自行结束。它的单次 HTTP 超时在取数窗口内已被压到预算量级，因此
+遗留请求不会拖过「剩余预算 + 一个请求」；最坏情况（DNS / 半开连接不遵守
+read timeout）仍靠 HTTP timeout 兜底。实测：3s 预算 + 12s 阻塞通道 → 3.01s
+（修复前 12.01s）；20s 预算 + 45s 挂死 → 20.01s。
 
 ### 5.2 延迟与盘前窗口
 

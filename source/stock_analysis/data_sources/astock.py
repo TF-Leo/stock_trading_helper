@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -109,7 +110,30 @@ def _normalize_adjust(adjust) -> str:
     return value
 
 
-def fetch_daily(symbol: str, start_date=None, adjust="qfq") -> pd.DataFrame:
+_DEFAULT_HTTP_TIMEOUT = _g._ASTOCK_HTTP_TIMEOUT
+
+
+@contextlib.contextmanager
+def _http_timeout(timeout):
+    """取数期间把生成物的 ``_ASTOCK_HTTP_TIMEOUT`` 收敛到 ``timeout``，退出还原。
+
+    生成物没有「每次调用传超时」的入口（``_tencent_kline_call`` 直接读模块级
+    常量），而本项目的取数按上游防封铁律**串行**执行，因此用「进程级常量 +
+    finally 还原」实现。
+
+    还原目标是**进程启动时的默认值**（而不是进入时的当前值）：被预算放弃的
+    线程可能还握着「收紧后」的常量在跑，若还原成「当前值」会把它永久留在进程
+    全局里，连累日历 / 指数 / 快照这些不走预算的调用。墙钟上限由调用方
+    ``run_with_deadline`` 兜底（见 :func:`tencent_throttle.run_with_deadline`）。
+    """
+    _g._ASTOCK_HTTP_TIMEOUT = timeout
+    try:
+        yield
+    finally:
+        _g._ASTOCK_HTTP_TIMEOUT = _DEFAULT_HTTP_TIMEOUT
+
+
+def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.DataFrame:
     """拉取腾讯日线，按**比例口径**做前/后复权。
 
     ``start_date`` 为 ``None`` / 空字符串时返回**全量历史**（下限
@@ -128,6 +152,11 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq") -> pd.DataFrame:
     ``adjust=''`` 时返回腾讯原始价（不做复权）。
     失败（网络/限流/空数据/格式变化/因子不可用）抛 :class:`AstockError`，
     绝不返回空壳或把未复权价冒充复权价。
+
+    ``budget``（秒，可选）：调用方剩余的时间预算。给出时，本次 HTTP 的
+    ``(connect, read)`` 会被 :func:`tencent_throttle.http_timeout_for_budget`
+    收敛到预算内（issue #67 D2：避免「预算 3s、单请求 20s」错配）。这是
+    **协作式**上限，墙钟仍由调用方的 ``run_with_deadline`` 兜底。
     """
     if str(os.getenv(FORCE_FAIL_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
         raise AstockError(f"{FORCE_FAIL_ENV}=1：腾讯源被强制失败（降级演练）")
@@ -149,8 +178,15 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq") -> pd.DataFrame:
         raise TencentThrottled(
             f"腾讯 K 线整域冷却中（{_throttle.cooling_summary()}），本次未发起请求")
 
+    request_timeout = (None if budget is None
+                       else _throttle.http_timeout_for_budget(budget))
+    timeout_scope = (contextlib.nullcontext() if request_timeout is None
+                     else _http_timeout(request_timeout))
+
     try:
-        frame = _g.tencent_kline(digits, period="day", adjust=fetch_adjust, start=start)
+        with timeout_scope:
+            frame = _g.tencent_kline(digits, period="day", adjust=fetch_adjust,
+                                     start=start)
     except ValueError as exc:
         # 参数错误（区间过长 / 北交所 / 代码不存在）与来源格式错误区分开
         raise AstockError(f"腾讯K线参数错误({digits}): {exc}") from exc

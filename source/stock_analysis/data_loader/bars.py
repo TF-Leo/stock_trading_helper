@@ -15,6 +15,10 @@ from threading import Lock
 from typing import Callable, Optional
 
 from stock_analysis.data_sources import astock as _astock_source
+from stock_analysis.data_sources.tencent_throttle import (
+    TencentBudgetExceeded,
+    run_with_deadline,
+)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
@@ -341,6 +345,9 @@ class _DataSourcePool:
         last_err = None
         # issue #13 第 5 条：单票总耗时预算。从本票开始计时，超预算立刻停止尝试
         # 剩余通道（不再为「注定失败」的通道各付一次超时），由调用方回退缓存。
+        # issue #67（D2 验收退回）：预算此前只约束「通道之间」，**正在阻塞的单个
+        # 通道**可以吃掉任意长的墙钟（3s 预算实测 12.01s）。现在每个通道调用都
+        # 套 ``run_with_deadline``（剩余预算），单票墙钟不超过预算 + 线程调度误差。
         deadline = time.monotonic() + self.ticker_budget_seconds
         budget_hit = False
         for state in candidates:
@@ -357,7 +364,9 @@ class _DataSourcePool:
                       f"预算，停止尝试剩余通道（{state.name} 未调用）", file=sys.stderr)
                 break
             try:
-                df = state.fetcher(symbol, start_date, adjust)
+                df = run_with_deadline(
+                    state.fetcher, remaining, symbol, start_date, adjust,
+                    budget=remaining)
                 if df is None or df.empty:
                     raise RuntimeError(f"{state.name} 返回空数据")
                 self._mark_success(state)
@@ -365,6 +374,18 @@ class _DataSourcePool:
                 self._publish_attempts(attempts)
                 self._note_primary_result(state, ok=True)
                 return df, state.name
+            except TencentBudgetExceeded as err:
+                # 单通道自己吃满了剩余预算（网络挂死 / read timeout 比预算还长）。
+                # 不判通道故障（可能是前面通道已耗掉大半预算导致的「饿死」），
+                # 但要让主源连败计数看见它——腾讯挂死时要尽快把备胎排到前面。
+                budget_hit = True
+                last_err = err
+                attempts.append(_attempt(state.name, False, error=err))
+                self._publish_attempts(attempts)
+                self._note_primary_result(state, ok=False, error=err)
+                print(f"[WARN] {symbol} 通道 {state.name} 单次取数超过剩余预算 "
+                      f"{remaining:.2f}s，已放弃（剩余通道不再尝试）", file=sys.stderr)
+                continue
             except Exception as err:
                 last_err = err
                 cooldown, removed = self._mark_failure(state, err)
@@ -432,16 +453,21 @@ def _normalize_daily_df(df):
     return normalized
 
 
-def _fetch_from_astock_tencent(symbol, start_date, adjust):
+def _fetch_from_astock_tencent(symbol, start_date, adjust, budget=None):
     """a-stock-data 腾讯 K 线（固定快照；§1.2 原始价 + §1.6 比例前复权）。
 
     返回 DatetimeIndex + OHLCV；meta 的 `_normalize_daily_df` 会把索引还原成
     `date` 列后走与其它通道完全相同的规范化/缓存路径。
+
+    ``budget``：渠道池剩余预算（秒）；腾讯侧据此把单次 HTTP 的 (connect, read)
+    收敛到预算内（issue #67 D2）。
     """
-    return _astock_source.fetch_daily(symbol, start_date=start_date, adjust=adjust)
+    return _astock_source.fetch_daily(
+        symbol, start_date=start_date, adjust=adjust, budget=budget)
 
 
-def _fetch_from_eastmoney(symbol, start_date, adjust):
+def _fetch_from_eastmoney(symbol, start_date, adjust, budget=None):
+    _ = budget  # akshare 不接受 per-call 超时；墙钟由渠道池 run_with_deadline 兜底
     if ak is None:
         raise RuntimeError("akshare未安装，无法在线拉取(eastmoney)")
     df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, adjust=adjust)
@@ -450,7 +476,8 @@ def _fetch_from_eastmoney(symbol, start_date, adjust):
     return _normalize_daily_df(df)
 
 
-def _fetch_from_sina_stock(symbol, start_date, adjust):
+def _fetch_from_sina_stock(symbol, start_date, adjust, budget=None):
+    _ = budget  # 同上：超时控制不在 akshare 内
     if ak is None:
         raise RuntimeError("akshare未安装，无法在线拉取(sina_stock)")
     sina_symbol = _to_exchange_symbol(symbol)
@@ -460,7 +487,8 @@ def _fetch_from_sina_stock(symbol, start_date, adjust):
     return _normalize_daily_df(df)
 
 
-def _fetch_from_sina_fund(symbol, start_date, adjust):
+def _fetch_from_sina_fund(symbol, start_date, adjust, budget=None):
+    _ = budget
     if ak is None:
         raise RuntimeError("akshare未安装，无法在线拉取(sina_fund)")
     _ = adjust

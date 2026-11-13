@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -398,6 +399,158 @@ def test_budget_failure_falls_back_to_cache_and_marks_degraded(tmp_path, monkeyp
     assert info["source"] == "cache"
     assert info["degraded_reason"] and "回退" in info["degraded_reason"]
     assert pool.budget_timeouts >= 1
+
+
+# ---------------------------------------------------------------------------
+# 4b) issue #67 D2：单通道阻塞也受预算约束（墙钟 ≤ 预算 + 小容差）
+# ---------------------------------------------------------------------------
+def test_single_channel_hang_is_capped_by_budget():
+    """预算 3s + 单通道阻塞 12s → 墙钟 ≤ 3s（修复前实测 12.01s，4 倍预算）。"""
+    release = threading.Event()
+
+    def hang(*a, **k):
+        release.wait(12)
+        return _toy(5)
+
+    pool = _pool([("astock_tencent", hang)], budget=3.0)
+    started = time.monotonic()
+    try:
+        df, used = pool.fetch("600519", "20200101", "qfq")
+    finally:
+        release.set()
+    wall = time.monotonic() - started
+
+    assert df is None and used is None
+    assert wall <= 3.0 + 0.5, f"单通道阻塞吃满预算：墙钟 {wall:.2f}s > 3s"
+    assert pool.budget_timeouts == 1
+    timed_out = [a for a in pool.last_attempts
+                 if a.get("error_class") == "TencentBudgetExceeded"]
+    assert timed_out and timed_out[0]["source"] == "astock_tencent"
+    # 超预算不判通道故障（可能是被前面通道「饿死」），所以不冷却、不剔除。
+    assert timed_out[0]["cooldown"] is False and timed_out[0]["removed"] is False
+
+
+def test_hung_channel_cannot_block_remaining_channels():
+    """单通道挂死时，剩余通道的预算判定照旧：一个都不许再调用。"""
+    release = threading.Event()
+    calls = []
+
+    def hang(*a, **k):
+        calls.append("hang")
+        release.wait(12)
+        return _toy(5)
+
+    def backup(*a, **k):
+        calls.append("backup")
+        return _toy(5)
+
+    pool = _pool([("astock_tencent", hang), ("eastmoney", backup)], budget=3.0)
+    started = time.monotonic()
+    try:
+        df, used = pool.fetch("600519", "20200101", "qfq")
+    finally:
+        release.set()
+    wall = time.monotonic() - started
+
+    assert df is None and used is None
+    assert calls == ["hang"], calls
+    assert wall <= 3.0 + 0.5
+    assert pool.budget_timeouts == 1
+
+
+def test_hung_channel_falls_back_to_cache_within_budget(tmp_path, monkeypatch):
+    """生产路径（meta）：单通道挂死 + 预算 3s → 墙钟受限、回退缓存、degraded。"""
+    from stock_analysis.data_loader import meta
+
+    cache = tmp_path / "stock_600519_qfq.csv"
+    stale = _toy(10, start="2020-01-01")
+    stale.to_csv(cache, index_label="date")
+    monkeypatch.setattr(meta, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(meta, "_expected_latest_trade_date",
+                        lambda: pd.Timestamp("2026-11-13").date())
+
+    release = threading.Event()
+
+    def hang(*a, **k):
+        release.wait(12)
+        raise RuntimeError("挂死通道不应走到这里")
+
+    pool = _pool([("astock_tencent", hang)], budget=3.0)
+    monkeypatch.setattr(meta, "_STOCK_DATA_SOURCE_POOL", pool)
+
+    started = time.monotonic()
+    try:
+        df = meta.get_stock_daily("600519", start_date="20200101")
+    finally:
+        release.set()
+    wall = time.monotonic() - started
+    info = meta.last_fetch_info()
+
+    assert df is not None and len(df) > 0
+    assert wall <= 3.0 + 0.5, f"生产路径墙钟 {wall:.2f}s > 3s 预算"
+    assert info["degraded"] is True
+    assert info["source"] == "cache"
+    assert info["degraded_reason"] and "回退" in info["degraded_reason"]
+    assert pool.budget_timeouts == 1
+
+
+def test_http_timeout_for_budget_keeps_default_when_roomy():
+    """预算充足时不动默认 (5, 15)：不削弱正常取数的容错。"""
+    assert throttle.http_timeout_for_budget(20.0) == (5.0, 15.0)
+    assert throttle.http_timeout_for_budget(600.0) == (5.0, 15.0)
+
+
+def test_http_timeout_for_budget_fits_inside_budget():
+    """预算收紧时 connect + read ≤ 剩余预算（避免「预算 3s、单请求 20s」错配）。"""
+    for remaining in (3.0, 1.0, 0.3, 0.05):
+        connect, read = throttle.http_timeout_for_budget(remaining)
+        assert connect + read <= remaining + 1e-9, (remaining, connect, read)
+        assert connect > 0 and read > 0
+    assert throttle.http_timeout_for_budget(3.0) == (1.0, 2.0)
+
+
+def test_fetch_daily_clamps_http_timeout_to_budget(monkeypatch, clean_throttle):
+    """``fetch_daily(budget=…)`` 在取数窗口内收紧 HTTP 超时，退出后还原默认值。"""
+    seen = {}
+    default = generated._ASTOCK_HTTP_TIMEOUT
+
+    def fake_tencent_kline(*args, **kwargs):
+        seen["timeout"] = generated._ASTOCK_HTTP_TIMEOUT
+        days = pd.bdate_range("2020-01-01", periods=3)
+        return pd.DataFrame({
+            "date": days.strftime("%Y-%m-%d"),
+            "open": [1.0, 1.0, 1.0], "high": [2.0, 2.0, 2.0],
+            "low": [0.5, 0.5, 0.5], "close": [1.5, 1.5, 1.5],
+            "volume": [100.0, 100.0, 100.0],
+        })
+
+    monkeypatch.setattr(generated, "tencent_kline", fake_tencent_kline)
+    frame = astock.fetch_daily("600519", start_date="20200101", adjust="",
+                               budget=3.0)
+
+    assert not frame.empty
+    assert seen["timeout"] == (1.0, 2.0)
+    assert generated._ASTOCK_HTTP_TIMEOUT == default, "取数结束后必须还原默认超时"
+
+
+def test_fetch_daily_without_budget_keeps_default_http_timeout(monkeypatch,
+                                                              clean_throttle):
+    seen = {}
+
+    def fake_tencent_kline(*args, **kwargs):
+        seen["timeout"] = generated._ASTOCK_HTTP_TIMEOUT
+        days = pd.bdate_range("2020-01-01", periods=3)
+        return pd.DataFrame({
+            "date": days.strftime("%Y-%m-%d"),
+            "open": [1.0, 1.0, 1.0], "high": [2.0, 2.0, 2.0],
+            "low": [0.5, 0.5, 0.5], "close": [1.5, 1.5, 1.5],
+            "volume": [100.0, 100.0, 100.0],
+        })
+
+    monkeypatch.setattr(generated, "tencent_kline", fake_tencent_kline)
+    astock.fetch_daily("600519", start_date="20200101", adjust="")
+
+    assert seen["timeout"] == generated._ASTOCK_HTTP_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
