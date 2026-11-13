@@ -33,6 +33,16 @@ R8 §5.2 实测：baostock 并发取数会在**正好 2,000 行**处静默截断
 5. 末根日期与预期结束日（在市 = 窗口末，退市 = ``outDate``）的工作日间隔
    超过 60 个工作日判失败、超过 5 个工作日记 warning。
 
+防挂死（2026-11-13 事故后加）
+-----------------------------
+* 查询 / 登出 / 登录分别有 90s / 30s / 45s 的 SIGALRM 硬超时；
+  ``socket.setdefaulttimeout(90)`` 兜底（baostock 不暴露 socket timeout）。
+* 任何失败都**强制关闭 socket** 再重登 —— baostock 的 ``send_msg`` 会吞掉
+  SIGALRM 异常，绝不能指望它的 ``logout()`` 自己返回。
+* 任一次阻塞失败后 ``bs.logout`` + ``bs.login`` + 重试该票（最多 3 次）。
+* 进度看门狗：``--watchdog-seconds``（默认 600s）内没有任何票完成，就保存
+  manifest 并以退出码 4 退出，让外层直接重跑续跑，**不再静默挂死**。
+
 退市退出口径（R8 §6，预注册写死）
 --------------------------------
 * 退出价 = 最后一个 ``tradestatus == 1`` 交易日的收盘价（前复权），
@@ -53,11 +63,14 @@ R8 §5.2 实测：baostock 并发取数会在**正好 2,000 行**处静默截断
     python tools/build_universe.py validate --reconcile 10
 
 退出码：0 = 成功/无校验错误；1 = 校验发现错误；2 = 参数或依赖错误；
+        3 = 重新登录失败（断点已保存，可重跑续）；
+        4 = 进度看门狗触发（断点已保存，可重跑续）；
         130 = 被中断（断点已保存，重跑同一命令即可续）。
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -102,7 +115,13 @@ KNOWN_MERGERS = {
 
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF = (2.0, 4.0, 8.0)
+# 每次阻塞式网络原语（查询 / 登出 / 登录）都有独立的进程内硬超时。
+# 2026-11-13 事故：baostock 的 send_msg 会吞掉 SIGALRM 异常，若随后调用
+# 未加超时的 bs.logout()，recv() 会永久阻塞（5h43m / 31s CPU / ESTAB 0 字节）。
 REQUEST_TIMEOUT_S = 90
+LOGOUT_TIMEOUT_S = 30
+LOGIN_TIMEOUT_S = 45
+WATCHDOG_SECONDS = 600  # 10 分钟没有任何票完成 → 保存断点并以非 0 退出
 GAP_HARD_WEEKDAYS = 60
 GAP_WARN_WEEKDAYS = 5
 TRUNCATION_ROWS = 2000  # R8 实测的并发截断形态
@@ -178,6 +197,14 @@ class RequestTimeout(RuntimeError):
     pass
 
 
+class WatchdogFired(RuntimeError):
+    pass
+
+
+class SessionError(RuntimeError):
+    """重新登录失败：保存断点并让外层续跑，而不是原地卡死。"""
+
+
 class QueryError(RuntimeError):
     def __init__(self, code: str, msg: str):
         super().__init__(f"baostock error_code={code} {msg}")
@@ -196,7 +223,7 @@ def _deadline(seconds: float):
         return
 
     def _handler(signum, frame):  # noqa: ARG001
-        raise RequestTimeout(f"单请求超过 {seconds:.0f}s")
+        raise RequestTimeout(f"单请求超过 {seconds:g}s")
 
     old = signal.signal(signal.SIGALRM, _handler)
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -205,6 +232,72 @@ def _deadline(seconds: float):
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old)
+
+
+def _watchdog_check(last_progress_ts: float, limit_s: float,
+                    where: str = "") -> None:
+    """进度看门狗：超过 ``limit_s`` 没有任何票完成就抛 WatchdogFired。
+
+    在**主循环**里检查（不引入线程，保持单线程取数）；配合下面的逐原语
+    硬超时，任何一次阻塞最长也只有数十秒，主循环必然能重新拿到控制权。
+    """
+    if limit_s <= 0:
+        return
+    idle = time.time() - last_progress_ts
+    if idle > limit_s:
+        raise WatchdogFired(
+            f"{idle / 60:.1f} 分钟没有任何票完成（阈值 {limit_s / 60:.1f} 分钟）"
+            + (f"，位置：{where}" if where else ""))
+
+
+# ---------------------------------------------------------------------------
+# socket 兜底超时 / baostock 会话修复
+#
+# why：baostock 不暴露 socket timeout；``util.socketutil.send_msg`` 里的
+# ``while True: recv()`` 没有任何超时，且它会 ``except Exception`` 吞掉
+# SIGALRM 抛出的 RequestTimeout。事故路径正是：查询超时被吞 → 未包装的
+# ``bs.logout()`` 在坏 socket 上 ``recv()`` 永久阻塞。
+# 对策：① 全局 socket 默认超时；② 每次 login 后给生产 socket 显式设超时；
+# ③ login / logout 本身也用 SIGALRM 硬超时；④ 任何失败都强制关 socket。
+# ---------------------------------------------------------------------------
+def _install_socket_default_timeout(seconds: float = REQUEST_TIMEOUT_S) -> None:
+    import socket
+    socket.setdefaulttimeout(seconds)
+
+
+def _bs_context():
+    try:
+        import baostock.common.context as conx
+    except ImportError:
+        return None
+    return conx
+
+
+def _set_bs_socket_timeout(seconds: float = REQUEST_TIMEOUT_S) -> None:
+    conx = _bs_context()
+    sock = getattr(conx, "default_socket", None) if conx is not None else None
+    if sock is not None:
+        try:
+            sock.settimeout(seconds)
+        except OSError:
+            pass
+
+
+def _close_bs_socket() -> None:
+    """坏会话的 socket 直接关掉（不依赖 baostock 的优雅 logout）。"""
+    conx = _bs_context()
+    if conx is None:
+        return
+    sock = getattr(conx, "default_socket", None)
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    try:
+        conx.default_socket = None
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -359,18 +452,44 @@ def _to_float(value: Any) -> float | None:
 # ---------------------------------------------------------------------------
 # baostock 取数（单会话 + 掉线重登）
 # ---------------------------------------------------------------------------
-def bs_login(bs) -> None:
-    result = bs.login()
-    if str(result.error_code) != "0":
-        raise RuntimeError(
-            f"baostock 登录失败 {result.error_code} {result.error_msg}")
+def bs_login(bs, timeout_s: float = LOGIN_TIMEOUT_S) -> None:
+    """登录；有硬超时，失败时强制关掉半开 socket。"""
+    try:
+        with _deadline(timeout_s):
+            result = bs.login()
+        if str(getattr(result, "error_code", "")) != "0":
+            raise RuntimeError(
+                f"baostock 登录失败 {getattr(result, 'error_code', '?')} "
+                f"{getattr(result, 'error_msg', '')}")
+    except BaseException:
+        _close_bs_socket()
+        raise
+    # 兜底：即使 defaulttimeout 被库绕开，生产 socket 也必须有超时。
+    _set_bs_socket_timeout(REQUEST_TIMEOUT_S)
+
+
+def bs_logout(bs, timeout_s: float = LOGOUT_TIMEOUT_S) -> None:
+    """登出；**永不挂死**。超时/异常都强制关闭 socket，随后可重新登录。"""
+    try:
+        with _deadline(timeout_s):
+            bs.logout()
+    except Exception as exc:  # noqa: BLE001
+        log(f"  [session] logout 未完成（{type(exc).__name__}: {exc}），强制关闭 socket")
+    finally:
+        _close_bs_socket()
 
 
 def _fetch_once(bs, code: str, start: str, end: str, adjust: str,
-                max_rows: int) -> tuple[list[str], list[list[str]], float]:
-    """一次查询（含读行）；返回 ``(fields, rows, seconds)``。"""
+                max_rows: int, timeout_s: float = REQUEST_TIMEOUT_S,
+                ) -> tuple[list[str], list[list[str]], float]:
+    """一次查询（含读行）；返回 ``(fields, rows, seconds)``。
+
+    ``query_history_k_data_plus`` 与后续每一页 ``rs.next()`` 都在同一个
+    SIGALRM 窗口内，任何一次网络阻塞超过 ``timeout_s`` 都会抛
+    RequestTimeout（注意：baostock 内部可能把它吞成 error_code）。
+    """
     began = time.time()
-    with _deadline(REQUEST_TIMEOUT_S):
+    with _deadline(timeout_s):
         rs = bs.query_history_k_data_plus(
             code, FIELDS, start_date=start, end_date=end,
             frequency="d", adjustflag=adjust)
@@ -407,10 +526,7 @@ def query_stock_basic(bs) -> list[dict[str, Any]]:
             last = exc
             log(f"  [retry {attempt + 1}/{RETRY_ATTEMPTS}] 主表查询失败："
                 f"{type(exc).__name__}: {exc}")
-            try:
-                bs.logout()
-            except Exception:  # noqa: BLE001
-                pass
+            bs_logout(bs)
             time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
             bs_login(bs)
     else:
@@ -434,13 +550,24 @@ def query_stock_basic(bs) -> list[dict[str, Any]]:
 
 
 def _fetch_with_retry(bs, stock: dict[str, Any], req_start: str, req_end: str,
-                      adjust: str, max_rows: int) -> tuple[list[str], list[list[str]], list[str], dict[str, Any]]:
+                      adjust: str, max_rows: int,
+                      timeout_s: float = REQUEST_TIMEOUT_S,
+                      backoff: tuple[float, ...] = RETRY_BACKOFF,
+                      on_attempt=None,
+                      ) -> tuple[list[str], list[list[str]], list[str], dict[str, Any]]:
+    """逐票取数：超时/校验失败 → 关 socket → 重登 → 重试，最多 RETRY_ATTEMPTS 次。
+
+    ``on_attempt`` 在每次尝试开始时调用（主循环用它跑进度看门狗）。
+    """
     last: Exception | None = None
     for attempt in range(RETRY_ATTEMPTS):
+        if on_attempt is not None:
+            on_attempt()
         _FETCH_STATE["requests"] += 1
         try:
             fields, rows, seconds = _fetch_once(
-                bs, stock["code"], req_start, req_end, adjust, max_rows)
+                bs, stock["code"], req_start, req_end, adjust, max_rows,
+                timeout_s=timeout_s)
             _FETCH_STATE["request_seconds"] += seconds
             errors, warnings, info = validate_series(
                 fields, rows, code=stock["code"], req_start=req_start,
@@ -455,12 +582,13 @@ def _fetch_with_retry(bs, stock: dict[str, Any], req_start: str, req_end: str,
             last = exc
             log(f"  [retry {attempt + 1}/{RETRY_ATTEMPTS}] {stock['code']}："
                 f"{type(exc).__name__}: {exc}")
+            bs_logout(bs)
+            time.sleep(backoff[min(attempt, len(backoff) - 1)])
             try:
-                bs.logout()
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
-            bs_login(bs)
+                bs_login(bs)
+            except Exception as login_exc:  # noqa: BLE001
+                raise SessionError(
+                    f"重新登录失败（{type(login_exc).__name__}: {login_exc}）") from login_exc
     raise RuntimeError(f"{type(last).__name__}: {last}")
 
 
@@ -530,6 +658,53 @@ def entry_is_done(manifest: dict[str, Any], code: str) -> bool:
         return False
     size = entry.get("csv_bytes")
     return bool(size) and os.path.getsize(path) == size
+
+
+def _adopt_existing_csv(stock: dict[str, Any], req_start_s: str, req_end_s: str,
+                        adjust: str, max_rows: int) -> dict[str, Any] | None:
+    """把「CSV 已落盘但 manifest 没记住」的票接管为 ok，避免重复抓取。
+
+    2026-11-13 事故：进程挂死时 manifest 每 25 票才落一次盘，磁盘上多出 17 个
+    已完成 CSV（sh.600692–sh.600710）却没有 entry。接管前用与 fetch 相同的
+    ``validate_series`` 复核；不合规就返回 None，让主循环重新抓。
+    """
+    path = csv_path(stock["code"])
+    if not os.path.exists(path):
+        return None
+    try:
+        frame = pd.read_csv(path, dtype={"date": str, "code": str})
+    except Exception:  # noqa: BLE001
+        return None
+    if list(frame.columns) != FIELDS.split(",") or len(frame) == 0:
+        return None
+    fields = list(frame.columns)
+    rows = frame.astype(object).where(pd.notna(frame), "").values.tolist()
+    errors, warnings, _info = validate_series(
+        fields, rows, code=stock["code"], req_start=req_start_s, req_end=req_end_s,
+        ipo_date=stock["ipo"], out_date=stock["out"] or None, max_rows=max_rows)
+    if errors:
+        return None
+    dates = [str(r[fields.index("date")]) for r in rows]
+    return {
+        "status": "ok",
+        "adopted": True,
+        "name": stock["name"],
+        "ipo_date": stock["ipo"],
+        "out_date": stock["out"] or None,
+        "request_start": req_start_s,
+        "request_end": req_end_s,
+        "adjustflag": adjust,
+        "rows": len(frame),
+        "first": dates[0],
+        "last": dates[-1],
+        "csv_bytes": os.path.getsize(path),
+        "csv_md5": _md5(path),
+        "fetch_seconds": None,
+        "fetched_at": None,
+        "adopted_at": datetime.now().isoformat(timespec="seconds"),
+        "warnings": warnings,
+        "delisted": delisted_meta(fields, rows, stock["out"] or None),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +793,7 @@ def cmd_fetch(args) -> int:
     manifest["run"] = {"started_at": began_at, "pid": os.getpid(),
                        "argv": sys.argv[1:]}
 
+    _install_socket_default_timeout(REQUEST_TIMEOUT_S)
     bs_login(bs)
     try:
         all_stocks = query_stock_basic(bs)
@@ -651,18 +827,25 @@ def cmd_fetch(args) -> int:
 
         entries = manifest.setdefault("entries", {})
         failures = manifest.setdefault("failures", [])
-        done = skipped = ok = failed = 0
+        skipped = adopted = ok = failed = 0
         selected_codes = {s["code"] for s in selected}
 
         # 只保留本次选中的失败记录，避免多次 --limit 演练互相污染。
         manifest["failures"] = [f for f in failures if f.get("code") in selected_codes]
         failures = manifest["failures"]
 
+        last_progress_ts = time.time()
+
+        def _tick(where: str = "") -> None:
+            _watchdog_check(last_progress_ts, args.watchdog_seconds, where)
+
         try:
             for i, stock in enumerate(selected, 1):
                 code = stock["code"]
+                _tick(f"开始处理 {code}")
                 if not args.force and entry_is_done(manifest, code):
                     skipped += 1
+                    last_progress_ts = time.time()
                     if i % 25 == 0 or i == len(selected):
                         log(f"  进度 {i}/{len(selected)}（跳过已完成 {skipped}，"
                             f"新取 {ok}，失败 {failed}）")
@@ -678,12 +861,36 @@ def cmd_fetch(args) -> int:
                 if req_start > req_end:
                     entries[code] = {"status": "skipped_out_of_window",
                                      "ipo": stock["ipo"], "out_date": stock["out"]}
+                    last_progress_ts = time.time()
                     continue
+
+                # 磁盘上已有合规 CSV、但 manifest 没记住（挂死时的孤儿文件）→ 接管，不重抓。
+                if not args.force:
+                    try:
+                        adopted_entry = _adopt_existing_csv(
+                            stock, req_start_s, req_end_s, args.adjustflag, args.max_rows)
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"  [warn] {code} 接管既有 CSV 失败，改走重新抓取："
+                            f"{type(exc).__name__}: {exc}")
+                        adopted_entry = None
+                    if adopted_entry is not None:
+                        entries[code] = adopted_entry
+                        adopted += 1
+                        last_progress_ts = time.time()
+                        if i % 25 == 0 or i == len(selected):
+                            save_manifest(manifest)
+                            log(f"  进度 {i}/{len(selected)}（跳过 {skipped}，"
+                                f"接管 {adopted}，成功 {ok}，失败 {failed}，"
+                                f"请求 {_FETCH_STATE['requests']}）")
+                        if args.pause:
+                            time.sleep(args.pause)
+                        continue
 
                 try:
                     fields, rows, warnings, info = _fetch_with_retry(
                         bs, stock, req_start_s, req_end_s, args.adjustflag,
-                        args.max_rows)
+                        args.max_rows,
+                        on_attempt=lambda c=code: _tick(f"重试 {c}"))
                     n_rows, n_bytes, digest = save_series(code, fields, rows)
                     exit_meta = delisted_meta(fields, rows, stock["out"] or None)
                     entry = {
@@ -709,6 +916,17 @@ def cmd_fetch(args) -> int:
                     ok += 1
                     if warnings:
                         log(f"  [warn] {code}: {'; '.join(warnings)}")
+                except WatchdogFired:
+                    raise
+                except SessionError as exc:
+                    log(f"[FATAL] {code}: {exc}；保存断点后以退出码 3 退出")
+                    manifest["run"]["session_error_at"] = datetime.now().isoformat(
+                        timespec="seconds")
+                    manifest["run"]["session_error"] = str(exc)
+                    _finalize_stats(manifest, started, selected, skipped, ok,
+                                    failed, adopted)
+                    save_manifest(manifest)
+                    return 3
                 except Exception as exc:  # noqa: BLE001
                     failed += 1
                     entries[code] = {
@@ -725,40 +943,48 @@ def cmd_fetch(args) -> int:
                                      "error": f"{type(exc).__name__}: {exc}"})
                     log(f"[FAIL] {code} {stock['name']}: {type(exc).__name__}: {exc}")
 
+                last_progress_ts = time.time()
                 if i % 25 == 0 or i == len(selected):
                     save_manifest(manifest)
-                    log(f"  进度 {i}/{len(selected)}（跳过 {skipped}，成功 {ok}，"
-                        f"失败 {failed}，请求 {_FETCH_STATE['requests']}）")
+                    log(f"  进度 {i}/{len(selected)}（跳过 {skipped}，接管 {adopted}，"
+                        f"成功 {ok}，失败 {failed}，请求 {_FETCH_STATE['requests']}）")
                 if args.pause:
                     time.sleep(args.pause)
+        except WatchdogFired as exc:
+            log(f"[WATCHDOG] {exc}；保存断点后以退出码 4 退出（重跑同一命令即可续）")
+            manifest["run"]["watchdog_at"] = datetime.now().isoformat(timespec="seconds")
+            manifest["run"]["watchdog_reason"] = str(exc)
+            _finalize_stats(manifest, started, selected, skipped, ok, failed, adopted)
+            save_manifest(manifest)
+            return 4
         except KeyboardInterrupt:
             log("[INTERRUPT] 收到 Ctrl-C，保存断点后退出")
             manifest["run"]["interrupted_at"] = datetime.now().isoformat(timespec="seconds")
-            _finalize_stats(manifest, started, selected, skipped, ok, failed)
+            _finalize_stats(manifest, started, selected, skipped, ok, failed, adopted)
             save_manifest(manifest)
             return 130
 
-        _finalize_stats(manifest, started, selected, skipped, ok, failed)
+        _finalize_stats(manifest, started, selected, skipped, ok, failed, adopted)
         save_manifest(manifest)
         wall = time.time() - started
         manifest["run"]["finished_at"] = datetime.now().isoformat(timespec="seconds")
-        log(f"==== fetch 结束：选中 {len(selected)}，跳过 {skipped}，成功 {ok}，"
-            f"失败 {failed}，请求 {_FETCH_STATE['requests']}，墙钟 {wall / 60:.1f} 分钟 ====")
+        log(f"==== fetch 结束：选中 {len(selected)}，跳过 {skipped}，接管 {adopted}，"
+            f"成功 {ok}，失败 {failed}，请求 {_FETCH_STATE['requests']}，"
+            f"墙钟 {wall / 60:.1f} 分钟 ====")
         if failures:
             log("失败票：")
             for f in failures:
                 log(f"  - {f['code']} {f.get('name', '')}: {f['error']}")
         return 0 if (not failures or not args.strict) else 1
     finally:
-        try:
-            bs.logout()
-        except Exception:  # noqa: BLE001
-            pass
+        # 退出路径也必须用带 30s 超时的 logout：坏 socket 上裸 bs.logout()
+        # 会在 recv() 永久阻塞（见 §0.1 的事故路径）。
+        bs_logout(bs)
 
 
 def _finalize_stats(manifest: dict[str, Any], started: float,
                     selected: list[dict[str, Any]], skipped: int, ok: int,
-                    failed: int) -> None:
+                    failed: int, adopted: int = 0) -> None:
     entries = manifest.get("entries", {})
     ok_entries = [e for e in entries.values() if e.get("status") == "ok"]
     durations = [e.get("fetch_seconds") for e in ok_entries
@@ -766,6 +992,7 @@ def _finalize_stats(manifest: dict[str, Any], started: float,
     manifest["stats"] = {
         "selected": len(selected),
         "skipped_resume": skipped,
+        "adopted_existing": adopted,
         "fetched_ok": ok,
         "failed": failed,
         "entries_ok_total": len(ok_entries),
@@ -795,6 +1022,17 @@ def cmd_validate(args) -> int:
     if not selected_codes:
         selected_codes = sorted(entries)
 
+    stock_by_code = {s["code"]: s for s in universe.get("stocks", [])}
+    unregistered: list[str] = []
+    if args.existing_only:
+        disk_codes = sorted(os.path.basename(p)[:-4]
+                            for p in glob.glob(os.path.join(CSV_DIR, "*.csv")))
+        ok_codes = [c for c in selected_codes
+                    if entries.get(c, {}).get("status") == "ok"]
+        codes_to_check = sorted(set(disk_codes) | set(ok_codes))
+    else:
+        codes_to_check = selected_codes
+
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     missing: list[str] = []
@@ -807,12 +1045,29 @@ def cmd_validate(args) -> int:
     delisted_checked = 0
     exit_reason_counts: dict[str, int] = {}
 
-    for code in selected_codes:
+    for code in codes_to_check:
         entry = entries.get(code)
         path = csv_path(code)
         if not entry:
-            missing.append(code)
-            continue
+            if args.existing_only and os.path.exists(path):
+                # 磁盘上有 CSV 但 manifest 没有记录（挂死时 last-write 之前落盘的孤儿）
+                unregistered.append(code)
+                stock = stock_by_code.get(code, {})
+                window = universe.get("window") or {}
+                req_start = max(_parse_date(window.get("start") or DEFAULT_START),
+                                _parse_date(stock.get("ipo")) or _parse_date(DEFAULT_START))
+                req_end = _parse_date(window.get("end") or DEFAULT_END)
+                d_out = _parse_date(stock.get("out"))
+                if d_out and d_out < req_end:
+                    req_end = d_out
+                entry = {"status": "ok", "unregistered": True,
+                         "request_start": req_start.isoformat(),
+                         "request_end": req_end.isoformat(),
+                         "out_date": stock.get("out") or None,
+                         "rows": None, "first": None, "last": None}
+            else:
+                missing.append(code)
+                continue
         if entry.get("status") != "ok":
             if entry.get("status") == "failed":
                 errors.append({"code": code, "kind": "fetch_failed",
@@ -843,10 +1098,11 @@ def cmd_validate(args) -> int:
             errors.append({"code": code, "kind": "duplicate_dates"})
         if dates != sorted(dates):
             errors.append({"code": code, "kind": "dates_not_sorted"})
-        if n != int(entry.get("rows") or -1):
+        if entry.get("rows") is not None and n != int(entry["rows"]):
             errors.append({"code": code, "kind": "row_count_mismatch",
                            "detail": f"csv={n} manifest={entry.get('rows')}"})
-        if dates[0] != entry.get("first") or dates[-1] != entry.get("last"):
+        if entry.get("first") is not None and (
+                dates[0] != entry.get("first") or dates[-1] != entry.get("last")):
             errors.append({"code": code, "kind": "boundary_mismatch",
                            "detail": f"csv={dates[0]}..{dates[-1]} "
                                      f"manifest={entry.get('first')}..{entry.get('last')}"})
@@ -871,11 +1127,12 @@ def cmd_validate(args) -> int:
             old = entry.get("delisted") or {}
             reason = (recomputed or {}).get("exit_reason")
             exit_reason_counts[reason] = exit_reason_counts.get(reason, 0) + 1
-            for key in ("exit_price", "last_tradestatus1_date", "exit_reason"):
-                if (recomputed or {}).get(key) != old.get(key):
-                    errors.append({"code": code, "kind": "delisted_mismatch",
-                                   "detail": f"{key}: csv={recomputed.get(key) if recomputed else None} "
-                                             f"manifest={old.get(key)}"})
+            if old:
+                for key in ("exit_price", "last_tradestatus1_date", "exit_reason"):
+                    if (recomputed or {}).get(key) != old.get(key):
+                        errors.append({"code": code, "kind": "delisted_mismatch",
+                                       "detail": f"{key}: csv={recomputed.get(key) if recomputed else None} "
+                                                 f"manifest={old.get(key)}"})
 
     # 覆盖率（对照 universe.json 的窗口内清单）
     universe_codes = {s["code"] for s in universe.get("stocks", [])}
@@ -895,7 +1152,9 @@ def cmd_validate(args) -> int:
         "manifest_updated_at": manifest.get("updated_at"),
         "selection": selected,
         "checked_codes": checked,
+        "codes_considered": len(codes_to_check),
         "selected_codes": len(selected_codes),
+        "unregistered_csv": unregistered,
         "universe_in_window": len(universe_codes),
         "not_selected_count": len(not_selected),
         "rows_total": rows_total,
@@ -924,8 +1183,11 @@ def cmd_validate(args) -> int:
 
     write_json(args.report or REPORT_PATH, report)
 
-    print(f"校验票数 {checked}/{len(selected_codes)}；窗口内全池 {len(universe_codes)}，"
-          f"未选中 {len(not_selected)}")
+    print(f"校验票数 {checked}/{len(codes_to_check)}（选中 {len(selected_codes)}）；"
+          f"窗口内全池 {len(universe_codes)}，未选中 {len(not_selected)}")
+    if unregistered:
+        print(f"磁盘有 CSV 但 manifest 无记录：{len(unregistered)} 只"
+              f"（{' '.join(unregistered[:10])}{' …' if len(unregistered) > 10 else ''}）")
     print(f"行数合计 {rows_total:,}；每票行数 min={report['rows_per_code']['min']} "
           f"p10={report['rows_per_code']['p10']} median={report['rows_per_code']['median']} "
           f"p90={report['rows_per_code']['p90']} max={report['rows_per_code']['max']}")
@@ -968,6 +1230,7 @@ def _reconcile(selected_codes: list[str], entries: dict[str, Any],
 
     matched = 0
     mismatches: list[dict[str, Any]] = []
+    _install_socket_default_timeout(REQUEST_TIMEOUT_S)
     bs_login(bs)
     try:
         for code in picks:
@@ -1005,10 +1268,7 @@ def _reconcile(selected_codes: list[str], entries: dict[str, Any],
             log(f"  [reconcile] {code} OK rows={len(frame)} "
                 f"{frame['date'].iloc[0]}..{frame['date'].iloc[-1]}")
     finally:
-        try:
-            bs.logout()
-        except Exception:  # noqa: BLE001
-            pass
+        bs_logout(bs)
 
     return {"checked": len(picks), "matched": matched,
             "codes": picks, "errors": mismatches}
@@ -1179,6 +1439,68 @@ def cmd_selftest(args) -> int:  # noqa: ARG001
           config_hash("2018-01-01", "2026-11-12", "2", MAX_ROWS)
           == config_hash("2018-01-01", "2026-11-12", "2", MAX_ROWS))
 
+    # 13. 单请求硬超时真的能打断阻塞调用（SIGALRM）
+    if hasattr(signal, "SIGALRM"):
+        began = time.time()
+        timed_out = False
+        try:
+            with _deadline(0.3):
+                time.sleep(5)
+        except RequestTimeout:
+            timed_out = True
+        elapsed = time.time() - began
+        check("deadline_fires", timed_out and elapsed < 2.0,
+              f"timed_out={timed_out} elapsed={elapsed:.2f}s")
+    else:
+        check("deadline_fires", True, "无 SIGALRM，跳过")
+
+    # 14. 进度看门狗
+    watchdog_raised = ""
+    try:
+        _watchdog_check(time.time() - 700, 600, "selftest")
+    except WatchdogFired as exc:
+        watchdog_raised = str(exc)
+    quiet_ok = True
+    try:
+        _watchdog_check(time.time(), 600)
+        _watchdog_check(time.time() - 10 ** 6, 0)  # 0 = 关闭
+    except WatchdogFired:
+        quiet_ok = False
+    check("watchdog_fires", bool(watchdog_raised), watchdog_raised)
+    check("watchdog_quiet_and_disable", quiet_ok, "")
+
+    # 15. 查询超时 → 强制 logout → 重新登录 → 重试 3 次后抛错（桩 bs，不联网）
+    class _HangBS:
+        def __init__(self):
+            self.logins = 0
+            self.logouts = 0
+
+        def login(self):
+            self.logins += 1
+            return type("R", (), {"error_code": "0", "error_msg": ""})()
+
+        def logout(self):
+            self.logouts += 1
+
+        def query_history_k_data_plus(self, *a, **k):  # noqa: ARG002
+            time.sleep(5)
+
+    hang = _HangBS()
+    began = time.time()
+    raised = ""
+    try:
+        _fetch_with_retry(hang, {"code": "sh.000001", "ipo": "2000-01-01", "out": ""},
+                          "2024-01-01", "2024-12-31", "2", MAX_ROWS,
+                          timeout_s=0.2, backoff=(0.0, 0.0, 0.0))
+    except Exception as exc:  # noqa: BLE001
+        raised = type(exc).__name__
+    elapsed = time.time() - began
+    check("ticket_timeout_relogin_retry",
+          raised == "RuntimeError" and hang.logins == RETRY_ATTEMPTS
+          and hang.logouts == RETRY_ATTEMPTS and elapsed < 3.0,
+          f"raised={raised} logins={hang.logins} logouts={hang.logouts} "
+          f"elapsed={elapsed:.2f}s")
+
     passed = sum(1 for _n, ok, _d in checks if ok)
     for name, ok, detail in checks:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if not ok else ""))
@@ -1209,6 +1531,8 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--force", action="store_true", help="忽略断点全部重取")
     fetch.add_argument("--pause", type=float, default=0.0,
                        help="每票之间额外休眠秒数（默认 0）")
+    fetch.add_argument("--watchdog-seconds", type=float, default=WATCHDOG_SECONDS,
+                       help="超过 N 秒没有任何票完成就保存断点并非 0 退出（0=关闭）")
     fetch.add_argument("--strict", action="store_true",
                        help="有任何失败票时返回非零退出码")
     fetch.set_defaults(func=cmd_fetch)
@@ -1216,6 +1540,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate = sub.add_parser("validate", help="离线复核（可抽样联网对账）")
     validate.add_argument("--reconcile", type=int, default=0,
                           help="联网抽 N 票与 baostock 直查对账（默认 0）")
+    validate.add_argument("--existing-only", action="store_true",
+                          help="只校验磁盘上已存在的 CSV（续跑中复核用；不把未取票记为错误）")
     validate.add_argument("--report", default=REPORT_PATH)
     validate.set_defaults(func=cmd_validate)
 
