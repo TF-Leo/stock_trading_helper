@@ -300,7 +300,7 @@ CLI JSON                                      source/cli.py:492-600
 | 数据源 | 上游口径 | 对本项目的含义 |
 |---|---|---|
 | 东财 `push2`/`datacenter`/`reportapi` 等 | 每秒 >5 次 / 单 IP 并发 ≥10 / 1 分钟 ≥200 / 5 分钟 ≥300 → 封；实测 2026-06-30 有 1 小时 45000+ 请求 → **IP 级封禁 20+ 小时**（§数据源优先级 & 东财防封） | 现有 akshare 东财通道没有统一节流；批量研究/预热时最危险。新接入东财端点必须走串行 + ≥1s 间隔 + 会话复用（上游 `em_get()`） |
-| 腾讯 K 线 | 单入口约 600 次后返回空 JSON；三入口轮换、失败冷却 120s（§1.2）；**连续 5000+ 次后整域返回空**（§1.2 实测案例） | 不是封 IP，但批量回补会撞限流。**issue #13 已实现**跨进程冷却 + 请求预算（见 §5.1.1） |
+| 腾讯 K 线 | 单入口约 600 次后返回空 JSON；三入口轮换、失败冷却 120s（§1.2）；**连续 5000+ 次后整域返回空**（§1.2 实测案例） | 不是封 IP，但批量回补会撞限流。**issue #13 已实现**跨进程冷却 + 请求预算（见 §5.1.1）；**issue #69 把 WAF 501 与限流分开**（见 §5.1.2） |
 | 腾讯实时报价 | 不封 IP；但僵尸报价/停牌会返回 200 + 定格数据，需 `is_stale`（§1.1） | 不能把「有返回」当「数据新鲜」 |
 | mootdx | TCP 7709；2026-09 起 K 线/盘口/逐笔返回空；海外 IP 通常全部超时（§1.7、FAQ） | **不要为行情引入 mootdx**；财务/F10 才可能用 |
 | baostock | TCP 登录；不支持北交所（§6.5、§6.6） | 引入即增加一个 TCP 依赖与登录失败路径 |
@@ -337,6 +337,54 @@ R5 抓 300 只日线时真实触发整域限流（`docs/P1_EVIDENCE_V2.md` §2.2
 遗留请求不会拖过「剩余预算 + 一个请求」；最坏情况（DNS / 半开连接不遵守
 read timeout）仍靠 HTTP timeout 兜底。实测：3s 预算 + 12s 阻塞通道 → 3.01s
 （修复前 12.01s）；20s 预算 + 45s 挂死 → 20.01s。
+
+### 5.1.2 腾讯 WAF 501 与限流分开处理（issue #69，P1）
+
+**这是两种不同的失败，不能共用同一个冷却。**（2026-11-13 实测，见 issue #69）
+
+| 失败 | 判定 | 冷却 | 行为 |
+|---|---|---|---|
+| 限流 | HTTP 429，或 200 + 空响应（无 `data`） | **120s**（`tencent_cooldown.json` 的 `hosts` 段） | 三入口全冷却时 `fetch_daily` **不发请求**，抛 `TencentThrottled`；到期自动恢复 |
+| WAF | **HTTP 501 且响应体含 JS 挑战特征**（`location.href` / `btoa`） | **1800s**（`waf.hosts` 段；`TENCENT_WAF_COOLDOWN_SECONDS` 可覆盖，建议 1800–3600s） | 一次探测即中止（不再轮询三入口），抛 `TencentWafBlocked`；冷却期内**一个请求都不发**，渠道池 attempts 记 `waf_blocked` / `cooldown` |
+
+实现（全部在适配层，**生成物仍与快照逐字节一致**）：
+
+| 层 | 位置 | 行为 |
+|---|---|---|
+| 识别 | `tencent_throttle.wrap_http_for_waf` ← `astock._waf_guard()` | 在本轮 `tencent_kline` 调用期间包一层 `_v39_http`：501 + 挑战页 → `WafBlocked`。它**不继承** `RuntimeError`，所以上游生成物 `_tencent_kline_call` 的 `except RuntimeError`（记 120s 限流、换下一个入口）不会把它吞掉 |
+| 持久化 | `tencent_throttle.mark_waf` | 写 `tencent_cooldown.json` 的 `waf.hosts` 段（与限流段 `hosts` 互不覆盖，`schema_version=2`）；`fcntl.flock` 串行化读-改-写 |
+| 闸门 | `astock.fetch_daily` | 取数前 `waf_hosts_cooling()` → 直接抛 `TencentWafBlocked`；到期后自动放行**一次**探测，成功即恢复正常，失败重新写长冷却 |
+| 渠道池 | `data_loader/bars.py` | WAF → 该通道本轮 `cooldown_until` 用 WAF 剩余秒数；attempts 带 `waf_blocked: true`，后续票以 `ok=null, cooldown=true` 跳过（不再调用 fetcher） |
+
+**不误伤**：WAF 长冷却只约束个股 `fqkline`。指数 `newfqkline`（`fetch_index_daily`）
+与腾讯报价（`web.sqt.gtimg.cn`，`fetch_quote`）不读 `waf` 段，WAF 期间照常可用。
+若指数 `newfqkline` 自己撞 501，仍按既有 120s 顺延/换路径处理，不写 WAF 段。
+
+**运维排查（三入口 + 挑战页）**：
+
+```bash
+# 个股 K 线（fqkline）—— WAF 时返回 501 + 挑战页
+for h in https://web.ifzq.gtimg.cn https://proxy.finance.qq.com/ifzqgtimg https://ifzq.gtimg.cn; do
+  echo "== $h"
+  curl -sS -m 10 -o /tmp/tencent_waf.html -w "HTTP %{http_code} %{size_download}B\n" \
+    "$h/appstock/app/fqkline/get?param=sh600519,day,,,1,"
+  grep -Eq 'location\.href|btoa' /tmp/tencent_waf.html && echo "  -> JS challenge (WAF)" \
+    || echo "  -> no challenge marker"
+done
+
+# 指数（newfqkline）—— 预期 200 且是 JSON
+curl -sS -m 10 -o /dev/null -w "newfqkline HTTP %{http_code}\n" \
+  'https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get?param=sh000300,day,,,5,'
+
+# 报价 —— 预期 200
+curl -sS -m 10 -o /dev/null -w "quote HTTP %{http_code}\n" \
+  'https://web.sqt.gtimg.cn/q=sh600519'
+```
+
+看当前冷却：`python -c "from stock_analysis.data_sources import tencent_throttle as t; print(t.load_state())"`。
+手动解除：删除 `source/stock_analysis/data/state/tencent_cooldown.json`（或
+`tencent_throttle.clear_state()`，限流与 WAF 一起清）。临时调短/调长：
+`TENCENT_WAF_COOLDOWN_SECONDS=3600`。
 
 ### 5.2 延迟与盘前窗口
 

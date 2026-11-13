@@ -15,6 +15,7 @@ from threading import Lock
 from typing import Callable, Optional
 
 from stock_analysis.data_sources import astock as _astock_source
+from stock_analysis.data_sources import tencent_throttle as _tencent_throttle
 from stock_analysis.data_sources.tencent_throttle import (
     TencentBudgetExceeded,
     run_with_deadline,
@@ -126,7 +127,7 @@ class EmptyDataError(RuntimeError):
 
 
 def _attempt(source, ok, error=None, cooldown=False, removed=False,
-             cooldown_seconds=None, budget_exhausted=False):
+             cooldown_seconds=None, budget_exhausted=False, waf_blocked=False):
     record = {
         'source': _safe_source_name(source),
         'ok': ok,
@@ -141,6 +142,10 @@ def _attempt(source, ok, error=None, cooldown=False, removed=False,
     # 避免既有调用方按固定键集合比对时被新增键打破）。
     if budget_exhausted:
         record['budget_exhausted'] = True
+    # issue #69：WAF（501 挑战页）与限流是两类失败。只有 WAF 条目带此键，
+    # 普通成功/失败/冷却的键集合保持不变。
+    if waf_blocked:
+        record['waf_blocked'] = True
     return record
 
 
@@ -164,14 +169,22 @@ def format_attempt_warnings(attempts):
         if any_ok and item.get('error_class') == 'EmptyDataError':
             continue
         if item.get('ok') is None:
-            reason = '已从渠道池剔除' if item.get('removed') else '冷却中'
+            if item.get('removed'):
+                reason = '已从渠道池剔除'
+            elif item.get('waf_blocked'):
+                reason = 'WAF 长冷却中'
+            else:
+                reason = '冷却中'
             lines.append(f"{source} {reason}，本轮跳过")
             continue
         detail = ' '.join(
             str(x) for x in (item.get('error_class'), item.get('error_text')) if x)
         msg = f"{source} 失败：{detail or '未知错误'}"
         flags = []
-        if item.get('cooldown'):
+        if item.get('waf_blocked'):
+            seconds = item.get('cooldown_seconds')
+            flags.append(f"WAF 长冷却 {seconds}s" if seconds else "WAF 长冷却")
+        elif item.get('cooldown'):
             seconds = item.get('cooldown_seconds')
             flags.append(f"本轮已冷却 {seconds}s" if seconds else "本轮已冷却")
         if item.get('removed'):
@@ -219,6 +232,8 @@ class _SourceState:
     total_successes: int = 0
     disabled: bool = False
     failure_timestamps: list[float] = field(default_factory=list)
+    # issue #69：本轮该通道的冷却是 WAF（长冷却）而不是限流（短冷却）。
+    waf_blocked: bool = False
 
 
 class _DataSourcePool:
@@ -286,29 +301,45 @@ class _DataSourcePool:
         with self._lock:
             state.total_successes += 1
             state.consecutive_failures = 0
+            state.waf_blocked = False
 
     def _mark_failure(self, state, err):
-        """记录失败；返回 (是否进入冷却, 是否被剔除) 供 attempts 使用。"""
+        """记录失败；返回 (是否进入冷却, 是否被剔除, 冷却秒数)。"""
         now = time.time()
-        transient = self._is_transient_failure(err)
+        waf = isinstance(err, _astock_source.TencentWafBlocked)
+        transient = waf or self._is_transient_failure(err)
+        cooldown_seconds = None
         with self._lock:
             state.total_failures += 1
             state.consecutive_failures += 1
             state.failure_timestamps.append(now)
             cutoff = now - self._failure_window_seconds
             state.failure_timestamps = [ts for ts in state.failure_timestamps if ts >= cutoff]
-            if transient:
+            if waf:
+                # issue #69：WAF 冷却按持久化状态里的剩余秒数记（默认 1800s），
+                # 而不是渠道池的 120s 限流冷却。冷却期内该通道直接跳过，不发请求。
+                remaining = _tencent_throttle.waf_remaining(now)
+                if remaining <= 0:
+                    remaining = _tencent_throttle.waf_cooldown_seconds()
+                cooldown_seconds = max(1, int(round(remaining)))
+                state.cooldown_until = now + cooldown_seconds
+                state.waf_blocked = True
+            elif transient:
+                cooldown_seconds = self._cooldown_seconds
                 state.cooldown_until = now + self._cooldown_seconds
             frequent_failures = len(state.failure_timestamps) >= self._max_total_failures
             should_disable = state.consecutive_failures >= self._max_consecutive_failures or frequent_failures
             if should_disable:
                 state.disabled = True
-        if transient:
+        if waf:
+            print(f"[WARN] 数据源 {state.name} 命中 WAF，长冷却 {cooldown_seconds}s: {err}",
+                  file=sys.stderr)
+        elif transient:
             print(f"[WARN] 数据源 {state.name} 触发冷却 {self._cooldown_seconds}s: {err}",
                   file=sys.stderr)
         if should_disable:
             print(f"[WARN] 数据源 {state.name} 失败过多，已从渠道池移除", file=sys.stderr)
-        return transient, should_disable
+        return transient, should_disable, cooldown_seconds
 
     def _publish_attempts(self, attempts):
         with self._lock:
@@ -334,10 +365,12 @@ class _DataSourcePool:
                     error=RuntimeError('已从渠道池剔除'), removed=True))
             elif cooling:
                 remaining = max(0, int(round(state.cooldown_until - now)))
+                label = 'WAF 长冷却中' if state.waf_blocked else '冷却中'
                 attempts.append(_attempt(
                     state.name, None,
-                    error=RuntimeError(f'冷却中（剩余 {remaining}s）'),
-                    cooldown=True, cooldown_seconds=remaining))
+                    error=RuntimeError(f'{label}（剩余 {remaining}s）'),
+                    cooldown=True, cooldown_seconds=remaining,
+                    waf_blocked=state.waf_blocked))
         if not candidates:
             self._publish_attempts(attempts)
             print("[WARN] 渠道池无可用数据源（均在冷却或已剔除）", file=sys.stderr)
@@ -388,11 +421,12 @@ class _DataSourcePool:
                 continue
             except Exception as err:
                 last_err = err
-                cooldown, removed = self._mark_failure(state, err)
+                cooldown, removed, cooldown_seconds = self._mark_failure(state, err)
                 attempts.append(_attempt(
                     state.name, False, error=err,
                     cooldown=cooldown, removed=removed,
-                    cooldown_seconds=self._cooldown_seconds if cooldown else None))
+                    cooldown_seconds=cooldown_seconds,
+                    waf_blocked=isinstance(err, _astock_source.TencentWafBlocked)))
                 self._note_primary_result(state, ok=False, error=err)
         if not budget_hit and last_err is not None and time.monotonic() > deadline:
             # 预算在**最后一个**通道上被用尽：没有「剩余通道」可跳过，但整票耗时

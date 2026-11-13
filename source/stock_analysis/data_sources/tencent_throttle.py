@@ -31,6 +31,23 @@ R5 抓 300 只日线时**真实触发腾讯整域限流**：第 47 只后三个�
 并发进程用 ``fcntl.flock`` 串行化「读-改-写」：否则后写的进程会用自己那份
 （可能更旧的）字典覆盖先写者的冷却，等于没冷却。没有 ``fcntl`` 的平台
 （Windows）退化为无锁，仍靠 ``os.replace`` 保证文件本身不会被读到半截。
+
+WAF 与限流是两种不同失败（issue #69）
+-------------------------------------
+同一个 ``tencent_cooldown.json`` 里现在有**两段互不干扰**的冷却：
+
+* ``hosts`` —— 限流（429 / 空响应）：默认 120s，三入口全冷却时
+  :func:`all_hosts_cooling` 让调用方一个请求都不发；
+* ``waf.hosts`` —— WAF（HTTP 501 + JS 挑战页）：默认 1800s
+  （``TENCENT_WAF_COOLDOWN_SECONDS`` 可覆盖），只约束**个股 K 线**
+  （``astock.fetch_daily``）。指数 ``newfqkline`` 与腾讯报价在 WAF 期间仍
+  可用，因此 :func:`waf_hosts_cooling` **不并入** ``hosts``，否则会把指数
+  一起误伤。
+
+识别入口是 :func:`wrap_http_for_waf`：包一层生成物的 ``_v39_http``，只在
+「501 + 挑战页特征」时抛 :class:`WafBlocked`。它刻意不继承 ``RuntimeError``，
+这样上游 ``_tencent_kline_call`` 的 ``except RuntimeError``（按 120s 限流处理
+并换下一个入口）不会把一次 WAF 探测放大成三次。
 """
 from __future__ import annotations
 
@@ -44,6 +61,18 @@ __all__ = [
     "STATE_PATH_ENV",
     "BUDGET_ENV",
     "DEFAULT_COOLDOWN_SECONDS",
+    "WAF_COOLDOWN_ENV",
+    "DEFAULT_WAF_COOLDOWN_SECONDS",
+    "WAF_STATUS_CODE",
+    "WafBlocked",
+    "waf_cooldown_seconds",
+    "is_waf_challenge",
+    "wrap_http_for_waf",
+    "mark_waf",
+    "active_waf_hosts",
+    "waf_hosts_cooling",
+    "waf_remaining",
+    "waf_summary",
     "DEFAULT_FAILURE_BUDGET_SECONDS",
     "MAX_BATCH_SIZE",
     "MIN_BATCH_PAUSE_SECONDS",
@@ -75,7 +104,52 @@ STATE_PATH_ENV = "TENCENT_COOLDOWN_PATH"
 #: 与上游 ``_TENCENT_HOST_COOLDOWN`` 保持一致（SKILL.md 第 1234 行）。
 DEFAULT_COOLDOWN_SECONDS = 120.0
 
-SCHEMA_VERSION = 1
+#: WAF（issue #69）与限流是**两类不同失败**：限流是上游「请求太多」的短时背压，
+#: 120s 后重试往往就好；WAF 是腾讯边缘把整条个股 K 线路径拦成 501 挑战页，
+#: 几分钟内重试只会继续撞墙。默认冷却 30 分钟，可用环境变量覆盖（建议 1800–3600s）。
+WAF_COOLDOWN_ENV = "TENCENT_WAF_COOLDOWN_SECONDS"
+DEFAULT_WAF_COOLDOWN_SECONDS = 1800.0
+WAF_STATUS_CODE = 501
+#: 挑战页特征；命中任一即认定为 JS 挑战，而不是普通 501 错误页。
+WAF_CHALLENGE_MARKERS = ("location.href", "btoa")
+
+#: v1 只有限流段；v2 增加 ``waf`` 段。旧文件缺 ``waf`` 键时按空处理，可无缝读取。
+SCHEMA_VERSION = 2
+
+
+class WafBlocked(Exception):
+    """腾讯 K 线 HTTP 501 + JS 挑战页（WAF），本次调用立即中止。
+
+    刻意**不继承** ``RuntimeError``：上游生成物 ``_tencent_kline_call`` 用
+    ``except RuntimeError`` 把失败入口记成 120s 限流并换下一个入口；WAF 必须
+    跳出这个循环，否则会把一次 WAF 探测放大成三次，并把长冷却写成短冷却。
+    """
+
+
+def waf_cooldown_seconds() -> float:
+    """WAF 冷却秒数：``TENCENT_WAF_COOLDOWN_SECONDS`` 优先，非法值回默认。"""
+    raw = str(os.getenv(WAF_COOLDOWN_ENV, "") or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_WAF_COOLDOWN_SECONDS
+    except ValueError:
+        value = DEFAULT_WAF_COOLDOWN_SECONDS
+    # 下限防止误配成 0 秒（等于没有 WAF 冷却），上限防止写成一个不受控的封锁。
+    return min(max(value, 60.0), 86400.0)
+
+
+def is_waf_challenge(status, text) -> bool:
+    """HTTP 501 **且**响应体含 JS 挑战特征 → WAF。
+
+    429 / 空响应 / 普通 501 错误页都不算：限流与 WAF 必须分开处理（issue #69）。
+    """
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return False
+    if code != WAF_STATUS_CODE:
+        return False
+    body = str(text or "")
+    return any(marker in body for marker in WAF_CHALLENGE_MARKERS)
 
 
 def _now(now=None) -> float:
@@ -130,44 +204,76 @@ class _FileLock:
         return False
 
 
+def _clean_until_map(raw, now) -> dict:
+    """把 ``{host: until}`` 里**仍有效**的条目留下；非法值直接丢弃。"""
+    clean = {}
+    if isinstance(raw, dict):
+        for host, until in raw.items():
+            try:
+                value = float(until)
+            except (TypeError, ValueError):
+                continue
+            if value > now:
+                clean[str(host)] = value
+    return clean
+
+
 def load_state(now=None) -> dict:
-    """读磁盘冷却状态；**过期条目一律剔除**，损坏/缺失返回空结构（不抛）。
+    """读磁盘状态；**过期条目一律剔除**，损坏/缺失返回空结构（不抛）。
 
     返回 ``{"hosts": {host: until_epoch}, "last_reason": str | None,
-    "updated_at": str | None, "pid": int | None}``。
+    "updated_at": str | None, "pid": int | None, "waf_hosts": {...},
+    "waf_reason": str | None, "waf_updated_at": str | None}``。
+    ``hosts`` 是限流段（120s），``waf_hosts`` 是 WAF 段（1800s），二者互不覆盖。
     """
     now = _now(now)
     try:
         with open(state_path(), "r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except Exception:
-        return {"hosts": {}, "last_reason": None, "updated_at": None, "pid": None}
+        return {"hosts": {}, "last_reason": None, "updated_at": None, "pid": None,
+                "waf_hosts": {}, "waf_reason": None, "waf_updated_at": None}
     if not isinstance(payload, dict):
-        return {"hosts": {}, "last_reason": None, "updated_at": None, "pid": None}
-    raw_hosts = payload.get("hosts")
-    hosts = {}
-    if isinstance(raw_hosts, dict):
-        for host, until in raw_hosts.items():
-            try:
-                value = float(until)
-            except (TypeError, ValueError):
-                continue
-            if value > now:
-                hosts[str(host)] = value
+        return {"hosts": {}, "last_reason": None, "updated_at": None, "pid": None,
+                "waf_hosts": {}, "waf_reason": None, "waf_updated_at": None}
+    waf = payload.get("waf")
+    if not isinstance(waf, dict):
+        waf = {}
     return {
-        "hosts": hosts,
+        "hosts": _clean_until_map(payload.get("hosts"), now),
         "last_reason": payload.get("last_reason"),
         "updated_at": payload.get("updated_at"),
         "pid": payload.get("pid"),
+        "waf_hosts": _clean_until_map(waf.get("hosts"), now),
+        "waf_reason": waf.get("last_reason"),
+        "waf_updated_at": waf.get("updated_at"),
     }
 
 
-def _write_state(hosts, reason=None, now=None) -> None:
-    """原子写：同目录 tmp 文件 + ``os.replace``（读者永远看不到半截 JSON）。"""
+def _waf_block(state) -> dict:
+    """从 :func:`load_state` 结果取出可直接写回的 ``waf`` 段。"""
+    return {"hosts": dict(state.get("waf_hosts") or {}),
+            "last_reason": state.get("waf_reason"),
+            "updated_at": state.get("waf_updated_at")}
+
+
+def _write_state(hosts, reason=None, now=None, waf=None) -> None:
+    """原子写：同目录 tmp 文件 + ``os.replace``（读者永远看不到半截 JSON）。
+
+    ``waf`` 为 ``None`` 时保留磁盘上已有的 WAF 段（限流写回不得误删长冷却）。
+    """
     now = _now(now)
     path = state_path()
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
+    if waf is None:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+            existing = existing.get("waf") if isinstance(existing, dict) else {}
+        except Exception:
+            existing = {}
+        waf = existing if isinstance(existing, dict) else {}
     payload = {
         "schema_version": SCHEMA_VERSION,
         "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(
@@ -175,6 +281,12 @@ def _write_state(hosts, reason=None, now=None) -> None:
         "hosts": {host: until for host, until in sorted(hosts.items())},
         "last_reason": reason,
         "pid": os.getpid(),
+        "waf": {
+            "hosts": {host: until for host, until in sorted(
+                _clean_until_map(waf.get("hosts"), now).items())},
+            "last_reason": waf.get("last_reason"),
+            "updated_at": waf.get("updated_at"),
+        },
     }
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
@@ -224,10 +336,11 @@ def mark_hosts(hosts, seconds=DEFAULT_COOLDOWN_SECONDS, reason=None, now=None) -
             process[host] = until
     path = state_path()
     with _FileLock(_lock_path(path)):
-        merged = load_state(now)["hosts"]
+        state = load_state(now)
+        merged = state["hosts"]
         for host in names:
             merged[host] = max(float(merged.get(host, 0.0)), until)
-        _write_state(merged, reason=reason, now=now)
+        _write_state(merged, reason=reason, now=now, waf=_waf_block(state))
     return merged
 
 
@@ -253,14 +366,15 @@ def flush_process_state(reason=None, now=None) -> dict:
         return {}
     path = state_path()
     with _FileLock(_lock_path(path)):
-        merged = load_state(now)["hosts"]
+        state = load_state(now)
+        merged = state["hosts"]
         changed = False
         for host, until in alive.items():
             if float(merged.get(host, 0.0)) < until:
                 merged[host] = until
                 changed = True
         if changed:
-            _write_state(merged, reason=reason, now=now)
+            _write_state(merged, reason=reason, now=now, waf=_waf_block(state))
         return dict(merged)
 
 
@@ -291,7 +405,7 @@ def cooling_summary(now=None) -> str:
 
 
 def clear_state() -> None:
-    """删除状态文件与锁文件（测试 / 运维手动解除冷却用）。"""
+    """删除状态文件与锁文件（测试 / 运维手动解除冷却用，限流与 WAF 一起清）。"""
     for path in (state_path(), _lock_path(state_path())):
         try:
             os.remove(path)
@@ -299,6 +413,140 @@ def clear_state() -> None:
             pass
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# WAF（issue #69）：HTTP 501 + JS 挑战页，与 429/空响应限流分开
+# ---------------------------------------------------------------------------
+def _kline_hosts() -> list[str]:
+    from . import _astock_generated as generated
+
+    return [str(host) for host in
+            (getattr(generated, "TENCENT_KLINE_HOSTS", ()) or ())]
+
+
+def _tencent_host_for(url) -> str | None:
+    text = str(url or "")
+    for host in _kline_hosts():
+        if text.startswith(host):
+            return host
+    return None
+
+
+def _response_from_error(exc):
+    """``_v39_http`` 把 ``requests.HTTPError`` 包成 RuntimeError；取回原始响应。"""
+    cause = getattr(exc, "__cause__", None)
+    return getattr(cause, "response", None)
+
+
+def _response_is_waf(response) -> bool:
+    if response is None:
+        return False
+    return is_waf_challenge(getattr(response, "status_code", None),
+                            getattr(response, "text", ""))
+
+
+def _enter_waf(url, response, cause=None):
+    """记录长冷却并抛出 :class:`WafBlocked`（不再尝试其余入口）。"""
+    host = _tencent_host_for(url) or _tencent_host_for(
+        getattr(response, "url", ""))
+    seconds = waf_cooldown_seconds()
+    # 实测三个入口同时 501（issue #69）；一个确认的挑战页即判定整条个股 K 线
+    # 路径被 WAF 拦截，给全部入口记长冷却，避免下一个进程再逐个撞三次。
+    mark_waf(seconds=seconds, reason=f"HTTP {WAF_STATUS_CODE} + JS challenge")
+    raise WafBlocked(
+        "腾讯 K 线 WAF 封锁（HTTP 501 挑战页"
+        + (f"：{host}" if host else "")
+        + f"），已进入 {int(seconds)}s 长冷却") from cause
+
+
+def wrap_http_for_waf(http_call):
+    """包一层 HTTP 调用：只在「501 + 挑战页」时改抛 :class:`WafBlocked`。
+
+    * 429 / 空响应 / 普通 5xx 原样返回或原样重抛，仍走上游的 120s 限流冷却；
+    * 挑战页可能以 501 响应返回（``allow_status`` 场景），也可能被
+      ``_v39_http`` 的 ``raise_for_status`` 包装成 RuntimeError —— 两种都识别。
+    """
+    def _wrapped(url, *args, **kwargs):
+        # 只对腾讯 K 线入口做 WAF 判定：同一个上下文里还可能调新浪复权因子
+        # 等其它 ``_v39_http`` 使用者，不能把它们的普通 501 当成腾讯 WAF。
+        is_kline_host = bool(_tencent_host_for(url))
+        try:
+            response = http_call(url, *args, **kwargs)
+        except RuntimeError as exc:
+            response = _response_from_error(exc)
+            if is_kline_host and _response_is_waf(response):
+                _enter_waf(url, response, cause=exc)
+            raise
+        if is_kline_host and _response_is_waf(response):
+            _enter_waf(url, response)
+        return response
+
+    return _wrapped
+
+
+def mark_waf(hosts=None, seconds=None, reason=None, now=None) -> dict:
+    """把 WAF 长冷却写入磁盘（``waf.hosts`` 段），返回合并后的 WAF 冷却。
+
+    ``hosts`` 缺省为三个 K 线入口；``seconds`` 缺省读
+    :func:`waf_cooldown_seconds`。**不写入**限流段 ``hosts``，因此指数
+    ``newfqkline`` 与腾讯报价不会被个股 WAF 误伤。
+    """
+    now = _now(now)
+    seconds = waf_cooldown_seconds() if seconds is None else float(seconds)
+    until = now + max(0.0, seconds)
+    names = [str(host) for host in
+             (hosts if hosts is not None else _kline_hosts())]
+    path = state_path()
+    with _FileLock(_lock_path(path)):
+        state = load_state(now)
+        waf_hosts = dict(state["waf_hosts"])
+        for host in names:
+            waf_hosts[host] = max(float(waf_hosts.get(host, 0.0)), until)
+        updated = datetime.fromtimestamp(now, timezone.utc).isoformat(
+            timespec="seconds")
+        _write_state(
+            state["hosts"], reason=state["last_reason"], now=now,
+            waf={"hosts": waf_hosts, "last_reason": reason,
+                 "updated_at": updated})
+    return waf_hosts
+
+
+def active_waf_hosts(now=None) -> dict:
+    """当前仍在 WAF 长冷却中的入口 → 到期时间戳（磁盘口径）。"""
+    return load_state(now)["waf_hosts"]
+
+
+def waf_hosts_cooling(now=None) -> bool:
+    """三个 K 线入口是否**全部**处于 WAF 长冷却（到期后允许一次探测）。"""
+    now = _now(now)
+    hosts = _kline_hosts()
+    if not hosts:
+        return False
+    active = load_state(now)["waf_hosts"]
+    return all(float(active.get(host, 0.0)) > now for host in hosts)
+
+
+def waf_remaining(now=None) -> float:
+    """WAF 长冷却剩余秒数；未处于整域 WAF 冷却时返回 ``0.0``。"""
+    now = _now(now)
+    if not waf_hosts_cooling(now):
+        return 0.0
+    active = load_state(now)["waf_hosts"]
+    return max(0.0, max(active.values()) - now)
+
+
+def waf_summary(now=None) -> str:
+    """人读的 WAF 冷却摘要；未处于 WAF 冷却时返回 ``"无 WAF 冷却"``。"""
+    now = _now(now)
+    active = load_state(now)["waf_hosts"]
+    if not active:
+        return "无 WAF 冷却"
+    parts = []
+    for host, until in sorted(active.items(), key=lambda item: -item[1]):
+        name = host.split("//", 1)[-1]
+        parts.append(f"{name} 剩余 {max(0, int(round(until - now)))}s")
+    return "；".join(parts)
 
 
 # ---------------------------------------------------------------------------
