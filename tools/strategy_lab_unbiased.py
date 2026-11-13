@@ -297,7 +297,7 @@ def _frame_from(fields: list[str], rows: list[list[str]]) -> pd.DataFrame:
 
 def _save_two(paths: Paths, code: str, fields: list[str],
               rows: list[list[str]], r9_start: str = DEFAULT_START,
-              ) -> tuple[int, int, str, int, int, str]:
+              ) -> tuple[int, int, str, int, int, str, str, str]:
     """落两份：``csv/`` = R9 口径（截到 ``r9_start``），``val/`` = 含预热 + 估值。
 
     ``csv/`` 必须与 R9 逐字节一致（md5 校验），所以**剔除预热期**；
@@ -305,9 +305,16 @@ def _save_two(paths: Paths, code: str, fields: list[str],
     """
     frame = _frame_from(fields, rows)
     base_cols = BASE_FIELDS.split(",")
-    base = frame[base_cols]
+    # **先按日期截断、再做数值转换**：pandas 的 dtype 推断看的是整列。预热期里
+    # 若有停牌行（volume 为空），整列会被推成 float64，写出 ``2983070.0``；
+    # 而 R9 的区间没有这些行，写的是 ``2983070`` —— md5 就对不上了（实测 5 只）。
+    # 因此 csv/ 的 dtype 推断必须在与 R9 完全相同的行子集上做。
+    di = fields.index("date")
     if r9_start:
-        base = base[base["date"].astype(str) >= r9_start].reset_index(drop=True)
+        cut_rows = [r for r in rows if str(r[di]) >= r9_start]
+    else:
+        cut_rows = rows
+    base = _frame_from(fields, cut_rows)[base_cols]
     p_base = os.path.join(paths.csv, f"{code}.csv")
     tmp = p_base + ".tmp"
     base.to_csv(tmp, index=False)
@@ -320,7 +327,8 @@ def _save_two(paths: Paths, code: str, fields: list[str],
     val.to_csv(tmp, index=False)
     os.replace(tmp, p_val)
     return (base_rows, base_bytes, base_md5, len(val),
-            os.path.getsize(p_val), _md5(p_val))
+            os.path.getsize(p_val), _md5(p_val),
+            str(base["date"].iloc[0]), str(base["date"].iloc[-1]))
 
 
 def _fetch_with_retry(bs, bu, stock: dict, req_start: str, req_end: str,
@@ -493,8 +501,8 @@ def cmd_fetch(args) -> int:
                         args.adjustflag, args.max_rows,
                         on_attempt=lambda c=code: _tick(f"重试 {c}"))
                     (n_rows, n_bytes, digest, n_val_rows, n_val_bytes,
-                     val_digest) = _save_two(paths, code, fields, rows,
-                                             r9_start=args.start)
+                     val_digest, base_first, base_last) = _save_two(
+                        paths, code, fields, rows, r9_start=args.start)
                     bi = [fields.index(c) for c in BASE_FIELDS.split(",")]
                     base_fields = BASE_FIELDS.split(",")
                     base_rows = [[r[j] for j in bi] for r in rows]
@@ -509,8 +517,11 @@ def cmd_fetch(args) -> int:
                         "request_end": req_end.isoformat(),
                         "adjustflag": args.adjustflag,
                         "rows": n_rows,
-                        "first": base_rows[0][base_fields.index("date")],
-                        "last": base_rows[-1][base_fields.index("date")],
+                        # first/last 描述**落盘的 csv/**（已截到 args.start），
+                        # 不是请求区间（含预热）；否则 verify 的 first 比对必然
+                        # 误判，manifest 也与实际文件不符。
+                        "first": base_first,
+                        "last": base_last,
                         "csv_bytes": n_bytes,
                         "csv_md5": digest,
                         "val_rows": n_val_rows,
@@ -600,6 +611,58 @@ def _finalize(manifest: dict, started: float, selected: list, skipped: int,
 # ---------------------------------------------------------------------------
 # 2) verify：与参考 manifest 逐票比对 md5
 # ---------------------------------------------------------------------------
+def _classify_mismatch(bs, code: str, path: str, ref_entry: dict,
+                       start: str, end: str) -> tuple[str, float | None]:
+    """md5 不一致时判定原因（联网，唯一严谨的做法）。
+
+    R9 manifest 只存 md5，没有价格，离线无法区分「qfq 快照漂移」与「取数错误」。
+    判定分两步：
+
+    1. **本文件与 baostock 当前返回是否逐值相同**。若相同，说明我们的取数没有
+       问题，差异只可能来自「R9 快照（2026-11-13）与今天不同」。
+    2. 再看本文件的**行数/首末日**是否与 R9 一致：一致 → ``qfq_snapshot_drift``
+       （R9 日志 §3 已列明：前复权是快照，后续除权会让整段价格整体平移）；
+       不一致 → ``other``（真问题，需重抓）。
+
+    若本文件与当前返回**不**相同 → ``reproduce_failed``，说明我们落盘的内容与
+    数据源不符，是真错误。
+    """
+    try:
+        frame = pd.read_csv(path, dtype={"date": str, "code": str})
+    except Exception:  # noqa: BLE001
+        return "other", None
+    shape_ok = (len(frame) == ref_entry.get("rows")
+                and str(frame["date"].iloc[0]) == ref_entry.get("first")
+                and str(frame["date"].iloc[-1]) == ref_entry.get("last"))
+    if bs is None:
+        return "unclassified", None
+    try:
+        rs = bs.query_history_k_data_plus(
+            code, "date,close", start_date=start, end_date=end,
+            frequency="d", adjustflag="2")
+        cur = {}
+        while rs.error_code == "0" and rs.next():
+            r = rs.get_row_data()
+            try:
+                cur[str(r[0])] = float(r[1])
+            except (TypeError, ValueError):
+                continue
+    except Exception:  # noqa: BLE001
+        return "unclassified", None
+    ours = dict(zip(frame["date"].astype(str), pd.to_numeric(frame["close"],
+                                                             errors="coerce")))
+    common = [d for d in ours if d in cur and np.isfinite(ours[d])]
+    if len(common) < 50:
+        return "unclassified", None
+    ratios = np.array([ours[d] / cur[d] for d in common if cur[d] > 0])
+    spread = float(np.nanmax(ratios) - np.nanmin(ratios))
+    if spread < 1e-9:
+        # 与当前数据源逐值一致 → 我们的取数正确，差异来自 R9 快照
+        return ("qfq_snapshot_drift" if shape_ok else "other"), float(
+            np.nanmean(ratios))
+    return "reproduce_failed", float(np.nanmean(ratios))
+
+
 def cmd_verify(args) -> int:
     paths = Paths(args.data_dir)
     if not os.path.exists(paths.manifest):
@@ -613,8 +676,20 @@ def cmd_verify(args) -> int:
 
     files = {os.path.basename(p)[:-4]: p
              for p in glob.glob(os.path.join(paths.csv, "*.csv"))}
+    bs = None
+    if args.check_drift:
+        try:
+            import baostock as _bs  # noqa: PLC0415
+            bu = _load_bu()
+            bu._install_socket_default_timeout(bu.REQUEST_TIMEOUT_S)
+            bu.bs_login(_bs)
+            bs = _bs
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] 联网判定不可用（{type(exc).__name__}: {exc}）；"
+                  f"不一致票将标记 unclassified", file=sys.stderr)
     rows = []
     match = mismatch = missing_ref = not_on_disk = 0
+    drift = repro_failed = 0
     detail = []
     codes = sorted(set(entries) | set(files) | set(ref or {}))
     for code in codes:
@@ -638,10 +713,23 @@ def cmd_verify(args) -> int:
             match += 1
         else:
             mismatch += 1
+            # 区分「qfq 快照漂移」与「真错误」：R9 日志 §3 已列明，前复权是
+            # 2026-11-13 的快照，之后若有除权，整段价格会被**整体平移**。
+            # 判定：行数/首末日一致、且本文件的 close 与参考的比值是**常数**
+            # （>0 且各日相同到 1e-6）→ 属于快照漂移，不是取数错误。
+            reason, factor = _classify_mismatch(
+                bs, code, path, r,
+                str(r.get("first") or DEFAULT_START),
+                str(r.get("last") or DEFAULT_END))
             detail.append({"code": code, "md5_ok": md5 == r.get("csv_md5"),
                            "rows": [entry.get("rows"), r.get("rows")],
                            "first": [entry.get("first"), r.get("first")],
-                           "last": [entry.get("last"), r.get("last")]})
+                           "last": [entry.get("last"), r.get("last")],
+                           "reason": reason, "qfq_factor": factor})
+            if reason == "qfq_snapshot_drift":
+                drift += 1
+            elif reason == "reproduce_failed":
+                repro_failed += 1
         rows.append({"code": code, "md5": md5, "ref_md5": r.get("csv_md5"),
                      "rows": entry.get("rows"), "same": same})
 
@@ -660,12 +748,20 @@ def cmd_verify(args) -> int:
         "manifest_failed": sum(1 for e in entries.values()
                                if e.get("status") == "failed"),
         "md5_match": match, "md5_mismatch": mismatch,
+        "mismatch_qfq_snapshot_drift": drift,
+        "mismatch_reproduce_failed": repro_failed,
+        "mismatch_other": mismatch - drift - repro_failed,
         "not_on_disk_or_not_ok": not_on_disk, "missing_in_reference": missing_ref,
         "rows_total": sum(int(e.get("rows") or 0) for e in ok_entries),
         "bytes_total": sum(int(e.get("csv_bytes") or 0) for e in ok_entries),
         "delisted_checked": len(delisted), "exit_reason_counts": reasons,
         "mismatch_detail": detail[:50],
     }
+    if bs is not None:
+        try:
+            _load_bu().bs_logout(bs)
+        except Exception:  # noqa: BLE001
+            pass
     _write_json(paths.report, report)
     print(json.dumps({k: v for k, v in report.items()
                       if k not in ("mismatch_detail",)},
@@ -1355,6 +1451,8 @@ def build_parser():
     v = sub.add_parser("verify", parents=[common],
                        help="离线逐票比对 md5 与参考 manifest")
     v.add_argument("--reference", default=None)
+    v.add_argument("--check-drift", action="store_true",
+                   help="对 md5 不一致的票联网判定是 qfq 快照漂移还是真错误")
     v.set_defaults(func=cmd_verify)
 
     a = sub.add_parser("analyze", parents=[common],
