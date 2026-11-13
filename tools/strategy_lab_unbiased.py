@@ -78,6 +78,12 @@ SUPER_FIELDS = BASE_FIELDS + ",turn,peTTM,pbMRQ,psTTM"
 VALUE_COLUMNS = ("turn", "peTTM", "pbMRQ", "psTTM")
 
 DEFAULT_START = "2018-01-01"
+#: 取数区间**额外向前多取**一段作为指标预热期（R6 用 2016-06-01 起、评估从
+#: 2018-01 起，预留 252+ 根）。R9 数据集从 2018-01-02 开始，直接用它评估会让
+#: ``xsmom``（需 252+21 根）在 2018 全年无票可选，且各候选有效起点不一致，
+#: 与 R6 不可比。实测加长区间**不改变** baostock 前复权数值（见报告 §2.4），
+#: 因此可以「多取预热、落盘时截到 DEFAULT_START」，md5 仍可与 R9 逐字节比对。
+WARMUP_START = "2016-06-01"
 DEFAULT_END = "2026-11-12"
 INDEX_CODE = "sh.000300"
 INDEX_FILE = "sh000300.csv"
@@ -290,10 +296,18 @@ def _frame_from(fields: list[str], rows: list[list[str]]) -> pd.DataFrame:
 
 
 def _save_two(paths: Paths, code: str, fields: list[str],
-              rows: list[list[str]]) -> tuple[int, int, str, int, int, str]:
+              rows: list[list[str]], r9_start: str = DEFAULT_START,
+              ) -> tuple[int, int, str, int, int, str]:
+    """落两份：``csv/`` = R9 口径（截到 ``r9_start``），``val/`` = 含预热 + 估值。
+
+    ``csv/`` 必须与 R9 逐字节一致（md5 校验），所以**剔除预热期**；
+    ``val/`` 保留预热期，供 ``build_features`` 计算 252 日窗口。
+    """
     frame = _frame_from(fields, rows)
     base_cols = BASE_FIELDS.split(",")
     base = frame[base_cols]
+    if r9_start:
+        base = base[base["date"].astype(str) >= r9_start].reset_index(drop=True)
     p_base = os.path.join(paths.csv, f"{code}.csv")
     tmp = p_base + ".tmp"
     base.to_csv(tmp, index=False)
@@ -417,8 +431,9 @@ def cmd_fetch(args) -> int:
         # ---- 基准指数（沪深 300，非复权价格指数）----
         idx_path = os.path.join(paths.index, INDEX_FILE)
         if not os.path.exists(idx_path) or args.force:
+            idx_start = args.warmup_start or args.start
             fields, rows, _ = _fetch_once_super(
-                bs, INDEX_CODE, args.start, args.end, "3", MAX_ROWS,
+                bs, INDEX_CODE, idx_start, args.end, "3", MAX_ROWS,
                 bu.REQUEST_TIMEOUT_S)
             idx_cols = ["date", "open", "high", "low", "close", "volume", "amount"]
             frame = pd.DataFrame(rows, columns=fields)[idx_cols]
@@ -457,8 +472,10 @@ def cmd_fetch(args) -> int:
                              f"新取 {ok}，失败 {failed}）")
                     continue
 
-                req_start = max(_parse_date(args.start),
-                                _parse_date(stock["ipo"]) or _parse_date(args.start))
+                # 请求从预热起点开始（指标需要 252+ 根），落盘时 csv/ 截到 args.start
+                warm = _parse_date(args.warmup_start) or _parse_date(args.start)
+                req_start = max(warm,
+                                _parse_date(stock["ipo"]) or warm)
                 req_end = _parse_date(args.end)
                 if stock["out"]:
                     d_out = _parse_date(stock["out"])
@@ -476,7 +493,8 @@ def cmd_fetch(args) -> int:
                         args.adjustflag, args.max_rows,
                         on_attempt=lambda c=code: _tick(f"重试 {c}"))
                     (n_rows, n_bytes, digest, n_val_rows, n_val_bytes,
-                     val_digest) = _save_two(paths, code, fields, rows)
+                     val_digest) = _save_two(paths, code, fields, rows,
+                                             r9_start=args.start)
                     bi = [fields.index(c) for c in BASE_FIELDS.split(",")]
                     base_fields = BASE_FIELDS.split(",")
                     base_rows = [[r[j] for j in bi] for r in rows]
@@ -684,10 +702,13 @@ def load_unbiased(paths: Paths, start: str, end: str):
     if not os.path.exists(idx_path):
         raise RuntimeError(f"缺少指数缓存 {idx_path}")
     index = pd.read_csv(idx_path, parse_dates=["date"]).set_index("date").sort_index()
+    # 日历必须覆盖**预热期**：特征（xsmom 需 252+21 根、MA200 需 200 根）在
+    # 评估起点之前就要有数据。评估窗口由 feats["eval_start"] 控制，不靠裁日历。
+    # 指数本身从 2016-06 起有数据（fetch 按 warmup-start 取）。
     dates = pd.DatetimeIndex(index.index)
-    dates = dates[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
+    dates = dates[dates <= pd.Timestamp(end)]
     if len(dates) < 300:
-        raise RuntimeError(f"评估日历过短：{len(dates)} 天")
+        raise RuntimeError(f"日历过短：{len(dates)} 天")
 
     excluded_merger = []
     frames, val_frames, kept = {}, {}, []
@@ -703,23 +724,19 @@ def load_unbiased(paths: Paths, start: str, end: str):
         p_val = os.path.join(paths.val, f"{code}.csv")
         if not os.path.exists(p_base):
             continue
+        # 价格矩阵优先用 val/：它含预热期，且是 csv/ 的超集（同样的 R9 字段 +
+        # 估值）。csv/ 只用于 md5 校验与 R9 口径核对，不参与特征计算。
+        src = p_val if os.path.exists(p_val) else p_base
         try:
-            df = pd.read_csv(p_base, parse_dates=["date"]).set_index("date")
+            df = pd.read_csv(src, parse_dates=["date"]).set_index("date")
         except Exception:  # noqa: BLE001
             continue
         if not {"open", "close"}.issubset(df.columns) or len(df) < 60:
             continue
         df = df[~df.index.duplicated(keep="last")].sort_index()
-        frames[code] = df.reindex(dates)
-        if os.path.exists(p_val):
-            try:
-                vdf = pd.read_csv(p_val, parse_dates=["date"]).set_index("date")
-                vdf = vdf[~vdf.index.duplicated(keep="last")].sort_index()
-                val_frames[code] = vdf.reindex(dates)
-            except Exception:  # noqa: BLE001
-                val_frames[code] = None
-        else:
-            val_frames[code] = None
+        aligned = df.reindex(dates)
+        frames[code] = aligned
+        val_frames[code] = aligned
         kept.append(code)
     if not kept:
         raise RuntimeError("没有任何可用日线")
@@ -739,7 +756,7 @@ def load_unbiased(paths: Paths, start: str, end: str):
             if vf is None or col not in vf.columns:
                 stack.append(np.full(len(dates), np.nan))
             else:
-                stack.append(pd.to_numeric(vf[col], errors="coerce")
+                stack.append(pd.to_numeric(vf.get(col), errors="coerce")
                              .to_numpy(dtype=float))
         mat[col] = np.column_stack(stack)
     mat["tradestatus"] = np.nan_to_num(mat["tradestatus"], nan=0.0)
@@ -1313,7 +1330,10 @@ def build_parser():
 
     f = sub.add_parser("fetch", parents=[common],
                        help="联网重建无偏池（baostock 串行）")
-    f.add_argument("--start", default=DEFAULT_START)
+    f.add_argument("--start", default=DEFAULT_START,
+                   help="R9 口径起点（csv/ 落盘与 md5 校验的起点）")
+    f.add_argument("--warmup-start", default=WARMUP_START,
+                   help="实际请求起点（指标预热；默认 2016-06-01，与 R6 同）")
     f.add_argument("--end", default=DEFAULT_END)
     f.add_argument("--limit", type=int, default=None)
     f.add_argument("--codes", default=None)
