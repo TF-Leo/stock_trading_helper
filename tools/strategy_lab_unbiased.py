@@ -938,7 +938,13 @@ def _current_constituent_ew(data, feats, horizon, args, codes):
     """「当前沪深 300 成分」等权（复现 R6 的幸存者偏差口径）。"""
     r6 = _r6()
     idx = {c: j for j, c in enumerate(data["codes"])}
-    cols = np.array([idx[c] for c in codes if c in idx], dtype=int)
+    # R6 的 universe.json 里是 6 位代码（``000001``），本池是 baostock 格式
+    # （``sz.000001``）；两种都接受，否则当前成分对照会静默变成空集。
+    normalized = []
+    for c in codes:
+        c = str(c)
+        normalized.append(c if "." in c else _bs_code(c))
+    cols = np.array([idx[c] for c in normalized if c in idx], dtype=int)
     if cols.size == 0:
         return None
     mask = np.zeros(len(data["codes"]), dtype=bool)
