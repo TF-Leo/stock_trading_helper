@@ -15,6 +15,10 @@ from threading import Lock
 from typing import Callable, Optional
 
 from stock_analysis.data_sources import astock as _astock_source
+from stock_analysis.data_sources.tencent_throttle import (
+    TencentBudgetExceeded,
+    run_with_deadline,
+)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
@@ -26,6 +30,9 @@ DATA_SOURCE_COOLDOWN_SECONDS = int(os.getenv("DATA_SOURCE_COOLDOWN_SECONDS", "12
 DATA_SOURCE_MAX_CONSECUTIVE_FAILURES = int(os.getenv("DATA_SOURCE_MAX_CONSECUTIVE_FAILURES", "3"))
 DATA_SOURCE_MAX_TOTAL_FAILURES = int(os.getenv("DATA_SOURCE_MAX_TOTAL_FAILURES", "8"))
 DATA_SOURCE_FAILURE_WINDOW_SECONDS = int(os.getenv("DATA_SOURCE_FAILURE_WINDOW_SECONDS", "600"))
+# issue #13 第 5 条：单票全通道失败的总耗时上限。R5 实测「三入口 × 19 分页窗口」
+# 在限流时能把一只票拖到分钟级；20s 内必出结论，超时回退缓存并标 degraded。
+DEFAULT_TICKER_BUDGET_SECONDS = 20.0
 RATE_LIMIT_KEYWORDS = (
     "429", "too many", "frequency", "limit", "反爬", "频率", "限制", "forbidden",
 )
@@ -119,7 +126,7 @@ class EmptyDataError(RuntimeError):
 
 
 def _attempt(source, ok, error=None, cooldown=False, removed=False,
-             cooldown_seconds=None):
+             cooldown_seconds=None, budget_exhausted=False):
     record = {
         'source': _safe_source_name(source),
         'ok': ok,
@@ -130,6 +137,10 @@ def _attempt(source, ok, error=None, cooldown=False, removed=False,
     }
     if cooldown and cooldown_seconds:
         record['cooldown_seconds'] = int(cooldown_seconds)
+    # issue #13 第 5 条：只有超预算时才有这个键（成功/普通失败的 record 键集合不变，
+    # 避免既有调用方按固定键集合比对时被新增键打破）。
+    if budget_exhausted:
+        record['budget_exhausted'] = True
     return record
 
 
@@ -222,6 +233,27 @@ class _DataSourcePool:
         # P0-4：最近一次 fetch 的逐通道尝试明细（含成功 / 失败 / 冷却 / 剔除）。
         # 用属性而不是改返回值，保持既有 `df, used = pool.fetch(...)` 调用不变。
         self.last_attempts = []
+        # issue #13 第 3/5 条：单票时间预算 + 「主源连败 → 本轮优先备胎」。
+        #   * ticker_budget_seconds：单票所有通道的总耗时上限，超时立刻放弃该票
+        #     （调用方回退缓存并标 degraded），不让一只票把整轮拖成乘法级耗时。
+        #   * _primary_blocked_until：主源（腾讯）连续失败达到阈值后，本轮剩余票
+        #     不再先试主源，直接把备胎排到最前——避免「每票都重试三入口」把
+        #     一次限流放大三倍。新的一轮（调用 reset_primary_block）重新判定。
+        self.ticker_budget_seconds = float(
+            os.getenv("DATA_SOURCE_TICKER_BUDGET_SECONDS",
+                      str(DEFAULT_TICKER_BUDGET_SECONDS)))
+        self.primary_source_name = None
+        self.primary_block_after = int(os.getenv(
+            "DATA_SOURCE_PRIMARY_BLOCK_AFTER", "3"))
+        self.primary_consecutive_failures = 0
+        self.primary_blocked_reason = None
+        self.budget_timeouts = 0
+
+    def reset_primary_block(self):
+        """开始新一轮抓取：清除「主源本轮停用」状态（连续计数也归零）。"""
+        with self._lock:
+            self.primary_consecutive_failures = 0
+            self.primary_blocked_reason = None
 
     def _is_transient_failure(self, err):
         msg = str(err).lower()
@@ -237,9 +269,17 @@ class _DataSourcePool:
                 self._cursor = 0
             ordered = available[self._cursor:] + available[:self._cursor]
             self._cursor = (self._cursor + 1) % len(available)
+            primary = self.primary_source_name
+            blocked = bool(self.primary_blocked_reason)
+        # 主源本轮已停用：把它排到最后，让备胎先试（不是剔除，主源仍可兜底）。
+        if blocked and primary:
+            ordered.sort(key=lambda s: 1 if s.name == primary else 0)
         if preferred:
             rank = {name: i for i, name in enumerate(preferred)}
-            ordered.sort(key=lambda s: rank.get(s.name, len(rank)))
+            # 稳定排序：blocked 的优先级高于 preferred，否则 preferred 会
+            # 把主源又提回第一位，等于没停用。
+            if not blocked:
+                ordered.sort(key=lambda s: rank.get(s.name, len(rank)))
         return ordered
 
     def _mark_success(self, state):
@@ -303,15 +343,49 @@ class _DataSourcePool:
             print("[WARN] 渠道池无可用数据源（均在冷却或已剔除）", file=sys.stderr)
             return None, None
         last_err = None
+        # issue #13 第 5 条：单票总耗时预算。从本票开始计时，超预算立刻停止尝试
+        # 剩余通道（不再为「注定失败」的通道各付一次超时），由调用方回退缓存。
+        # issue #67（D2 验收退回）：预算此前只约束「通道之间」，**正在阻塞的单个
+        # 通道**可以吃掉任意长的墙钟（3s 预算实测 12.01s）。现在每个通道调用都
+        # 套 ``run_with_deadline``（剩余预算），单票墙钟不超过预算 + 线程调度误差。
+        deadline = time.monotonic() + self.ticker_budget_seconds
+        budget_hit = False
         for state in candidates:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                budget_hit = True
+                attempts.append(_attempt(
+                    state.name, False,
+                    error=RuntimeError(
+                        f"单票耗时超过 {self.ticker_budget_seconds:g}s 预算，"
+                        f"跳过剩余通道"),
+                    budget_exhausted=True))
+                print(f"[WARN] {symbol} 单票耗时超过 {self.ticker_budget_seconds:g}s "
+                      f"预算，停止尝试剩余通道（{state.name} 未调用）", file=sys.stderr)
+                break
             try:
-                df = state.fetcher(symbol, start_date, adjust)
+                df = run_with_deadline(
+                    state.fetcher, remaining, symbol, start_date, adjust,
+                    budget=remaining)
                 if df is None or df.empty:
                     raise RuntimeError(f"{state.name} 返回空数据")
                 self._mark_success(state)
                 attempts.append(_attempt(state.name, True))
                 self._publish_attempts(attempts)
+                self._note_primary_result(state, ok=True)
                 return df, state.name
+            except TencentBudgetExceeded as err:
+                # 单通道自己吃满了剩余预算（网络挂死 / read timeout 比预算还长）。
+                # 不判通道故障（可能是前面通道已耗掉大半预算导致的「饿死」），
+                # 但要让主源连败计数看见它——腾讯挂死时要尽快把备胎排到前面。
+                budget_hit = True
+                last_err = err
+                attempts.append(_attempt(state.name, False, error=err))
+                self._publish_attempts(attempts)
+                self._note_primary_result(state, ok=False, error=err)
+                print(f"[WARN] {symbol} 通道 {state.name} 单次取数超过剩余预算 "
+                      f"{remaining:.2f}s，已放弃（剩余通道不再尝试）", file=sys.stderr)
+                continue
             except Exception as err:
                 last_err = err
                 cooldown, removed = self._mark_failure(state, err)
@@ -319,10 +393,43 @@ class _DataSourcePool:
                     state.name, False, error=err,
                     cooldown=cooldown, removed=removed,
                     cooldown_seconds=self._cooldown_seconds if cooldown else None))
+                self._note_primary_result(state, ok=False, error=err)
+        if not budget_hit and last_err is not None and time.monotonic() > deadline:
+            # 预算在**最后一个**通道上被用尽：没有「剩余通道」可跳过，但整票耗时
+            # 确实超预算，同样要记一次（调用方据此回退缓存并标 degraded）。
+            budget_hit = True
+            print(f"[WARN] {symbol} 单票耗时 {self.ticker_budget_seconds:g}s "
+                  f"预算已用尽（全部通道均已尝试）", file=sys.stderr)
+        if budget_hit:
+            self.budget_timeouts += 1
         self._publish_attempts(attempts)
         if last_err:
             print(f"[WARN] 渠道池全部失败 {symbol}: {last_err}", file=sys.stderr)
         return None, None
+
+    def _note_primary_result(self, state, ok, error=None):
+        """记录主源（腾讯）连败计数；达到阈值即「本轮剩余票优先备胎」。
+
+        issue #13 第 2/3 条。只在 ``state.name == primary_source_name`` 时生效，
+        备胎的成败不影响主源判定（备胎挂了不代表腾讯被限流）。
+        """
+        primary = self.primary_source_name
+        if not primary or state.name != primary:
+            return
+        with self._lock:
+            if ok:
+                self.primary_consecutive_failures = 0
+                return
+            self.primary_consecutive_failures += 1
+            if (self.primary_blocked_reason is None
+                    and self.primary_consecutive_failures >= self.primary_block_after):
+                self.primary_blocked_reason = (
+                    f"主源 {primary} 连续 {self.primary_consecutive_failures} 只失败，"
+                    f"本轮剩余票直接走备胎")
+        if self.primary_blocked_reason and error is not None and \
+                self.primary_consecutive_failures == self.primary_block_after:
+            print(f"[WARN] {self.primary_blocked_reason}"
+                  f"（最后一次：{_sanitize_error_text(error)}）", file=sys.stderr)
 
 
 def _normalize_daily_df(df):
@@ -346,16 +453,21 @@ def _normalize_daily_df(df):
     return normalized
 
 
-def _fetch_from_astock_tencent(symbol, start_date, adjust):
+def _fetch_from_astock_tencent(symbol, start_date, adjust, budget=None):
     """a-stock-data 腾讯 K 线（固定快照；§1.2 原始价 + §1.6 比例前复权）。
 
     返回 DatetimeIndex + OHLCV；meta 的 `_normalize_daily_df` 会把索引还原成
     `date` 列后走与其它通道完全相同的规范化/缓存路径。
+
+    ``budget``：渠道池剩余预算（秒）；腾讯侧据此把单次 HTTP 的 (connect, read)
+    收敛到预算内（issue #67 D2）。
     """
-    return _astock_source.fetch_daily(symbol, start_date=start_date, adjust=adjust)
+    return _astock_source.fetch_daily(
+        symbol, start_date=start_date, adjust=adjust, budget=budget)
 
 
-def _fetch_from_eastmoney(symbol, start_date, adjust):
+def _fetch_from_eastmoney(symbol, start_date, adjust, budget=None):
+    _ = budget  # akshare 不接受 per-call 超时；墙钟由渠道池 run_with_deadline 兜底
     if ak is None:
         raise RuntimeError("akshare未安装，无法在线拉取(eastmoney)")
     df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, adjust=adjust)
@@ -364,7 +476,8 @@ def _fetch_from_eastmoney(symbol, start_date, adjust):
     return _normalize_daily_df(df)
 
 
-def _fetch_from_sina_stock(symbol, start_date, adjust):
+def _fetch_from_sina_stock(symbol, start_date, adjust, budget=None):
+    _ = budget  # 同上：超时控制不在 akshare 内
     if ak is None:
         raise RuntimeError("akshare未安装，无法在线拉取(sina_stock)")
     sina_symbol = _to_exchange_symbol(symbol)
@@ -374,7 +487,8 @@ def _fetch_from_sina_stock(symbol, start_date, adjust):
     return _normalize_daily_df(df)
 
 
-def _fetch_from_sina_fund(symbol, start_date, adjust):
+def _fetch_from_sina_fund(symbol, start_date, adjust, budget=None):
+    _ = budget
     if ak is None:
         raise RuntimeError("akshare未安装，无法在线拉取(sina_fund)")
     _ = adjust
@@ -404,3 +518,6 @@ _STOCK_DATA_SOURCE_POOL = _DataSourcePool(
     max_total_failures=DATA_SOURCE_MAX_TOTAL_FAILURES,
     failure_window_seconds=DATA_SOURCE_FAILURE_WINDOW_SECONDS,
 )
+# issue #13：腾讯是主源。连续 3 只失败 → 本轮剩余票把备胎排到前面，不再每票
+# 先撞三次腾讯入口（R5 的 32 只失败里绝大多数是这种放大后的重试）。
+_STOCK_DATA_SOURCE_POOL.primary_source_name = "astock_tencent"

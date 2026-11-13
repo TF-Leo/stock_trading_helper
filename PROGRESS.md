@@ -1,5 +1,53 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-13 · issue #13（P0）腾讯限流：跨进程冷却 / 请求预算 / 快速切备胎
+
+- **分支**：`task/p0-tencent-throttle`（基线 `d440c94`）
+- **范围**：`source/stock_analysis/data_sources/tencent_throttle.py`（新增）、
+  `data_sources/astock.py`、`data_loader/bars.py`、`tools/context_ic.py`、
+  `source/tests/conftest.py`、`source/tests/test_tencent_throttle.py`（新增）、
+  `docs/ASTOCK_INTEGRATION.md` §5.1.1。
+  **未改** `source/decision/actions.py`（`git diff origin/main...HEAD -- source/decision/actions.py` 为空）。
+- **未改上游生成物**：`_astock_generated.py` 仍是快照可复验产物（`tools/astock_extract.py --check` 通过）；
+  冷却能力全部实现在适配层，通过 `_tencent_host_down_until` 这个既有注入点生效。
+- **证据**（本机 Linux，无 `pwsh`，门禁脚本以 `tools/probe.py` 等价执行）：
+  - `pytest tests/ -q` → **596 passed**（原 578 + 新增 18）。
+  - `tools/probe.py all` → 41 keys，除 `windows` 外全 PASS；`windows` 在基线
+    `d440c94` 上同样 FAIL（同一 reason `action 跨训练窗口不一致`），属既有数据依赖问题。
+  - 20 只冷启动演练：**100 次请求 / 32.4s / 0 失败 / 无冷却 / 最长连败 0**。
+  - 打桩 429 批量演练：**腾讯 HTTP 仅 3 次**（主源连败 3 只即停用）→ 20 只全部 baostock 补齐，
+    **0 失败 / 最长连败 0**。
+  - 跨进程：进程 A 3 请求触发冷却 → 进程 B **0 请求**（`TencentThrottled`）→ 冷却过期后恢复 4 请求成功。
+
+---
+
+## 2026-11-13 · issue #67（D2 验收退回）：单通道阻塞也受单票预算约束
+
+V19 在 PR #66（`4f98bfb`）上实测：3s 预算 + 单通道阻塞 12s → 墙钟 **12.01s**
+（预算 4 倍，`interrupted=false`）。根因：`bars.py` 的**单通道调用**没有套
+`run_with_deadline`，预算只约束「通道之间」；且单次 HTTP 仍是 `(5, 15)`，与
+小预算错配。
+
+- **修复**（分支 `task/p0-tencent-throttle`，HEAD `4f98bfb` 之上）：
+  1. `_DataSourcePool.fetch` 对**每个通道**调用 `run_with_deadline(…, 剩余预算)`；
+     超时记 `TencentBudgetExceeded` attempt、停止剩余通道、调用方回退缓存并 `degraded`。
+  2. 新增 `tencent_throttle.http_timeout_for_budget()`：预算充足保持 `(5, 15)`；
+     收紧时 connect/read 收敛到预算内（3s → `(1.0, 2.0)`）。
+     `astock.fetch_daily(..., budget=…)` 在取数窗口内应用、退出还原默认值；
+     渠道池把剩余预算透传给腾讯通道（akshare 通道不接受 per-call 超时，靠墙钟兜底）。
+  3. **未改** `_astock_generated.py`（仍是快照可复验产物）、**未改** `decision/actions.py`。
+- **证据**（命令原始输出见 PR #66 正文）：
+  - D2 生产路径（`meta.get_stock_daily` + 旧缓存）：3s 预算 / 12s 阻塞通道 →
+    **3.01s**，`degraded=true`，`source=cache`（修复前 12.01s）。
+  - 20s 预算 / 45s 挂死 → **20.01s**（修复前 45.0s）。
+  - `fetch_daily(budget=3)` 三次入口 HTTP 实际 timeout 均为 `(1.0, 2.0)`，退出还原 `(5, 15)`。
+  - `pytest tests/ -q` → **603 passed**（596 + 新增 7）。
+- **遗留风险**：Python 无法强杀线程，上限是**协作式**——调用线程按时返回，
+  被放弃的 daemon 线程自行结束；其单次 HTTP 超时已压到预算量级，最坏情况
+  仍靠 HTTP timeout 兜底。
+
+---
+
 - **最后更新**：2026-10-25 14:20（**F22–F34 全部完成 13/13**；门禁 48/48；外部验证 V2–V6 已执行）
 - **当前 HEAD**：`01ee33b`（V2–V5 验证记录已推送）｜工作树：V6 台账记录待提交
 - **当前基线**：**门禁 48/48 退出码 0**｜`pytest` **67 passed**｜probe **41 keys 全 PASS**｜`cli.py` 665 行

@@ -300,12 +300,43 @@ CLI JSON                                      source/cli.py:492-600
 | 数据源 | 上游口径 | 对本项目的含义 |
 |---|---|---|
 | 东财 `push2`/`datacenter`/`reportapi` 等 | 每秒 >5 次 / 单 IP 并发 ≥10 / 1 分钟 ≥200 / 5 分钟 ≥300 → 封；实测 2026-06-30 有 1 小时 45000+ 请求 → **IP 级封禁 20+ 小时**（§数据源优先级 & 东财防封） | 现有 akshare 东财通道没有统一节流；批量研究/预热时最危险。新接入东财端点必须走串行 + ≥1s 间隔 + 会话复用（上游 `em_get()`） |
-| 腾讯 K 线 | 单入口约 600 次后返回空 JSON；三入口轮换、失败冷却 120s（§1.2） | 不是封 IP，但批量回补会撞限流；必须有入口轮换与冷却，且 `source` 如实标注 |
+| 腾讯 K 线 | 单入口约 600 次后返回空 JSON；三入口轮换、失败冷却 120s（§1.2）；**连续 5000+ 次后整域返回空**（§1.2 实测案例） | 不是封 IP，但批量回补会撞限流。**issue #13 已实现**跨进程冷却 + 请求预算（见 §5.1.1） |
 | 腾讯实时报价 | 不封 IP；但僵尸报价/停牌会返回 200 + 定格数据，需 `is_stale`（§1.1） | 不能把「有返回」当「数据新鲜」 |
 | mootdx | TCP 7709；2026-09 起 K 线/盘口/逐笔返回空；海外 IP 通常全部超时（§1.7、FAQ） | **不要为行情引入 mootdx**；财务/F10 才可能用 |
 | baostock | TCP 登录；不支持北交所（§6.5、§6.6） | 引入即增加一个 TCP 依赖与登录失败路径 |
 | iwencai | 需 `IWENCAI_API_KEY`（Prerequisites） | 不进自动链路；只在人工研究时用 |
 | 交易所官方 / 中债 / 货币网等 | 零鉴权、极低风险，但避免高频（备用源速查） | P1/P2 可用，但同样要缓存 |
+
+### 5.1.1 腾讯限流：跨进程冷却与请求预算（issue #13，P0）
+
+R5 抓 300 只日线时真实触发整域限流（`docs/P1_EVIDENCE_V2.md` §2.2/§7）：第 47 只后
+三入口同时失败、全轮 22 次冷却、32 只失败、最后靠 baostock 补齐 57 只。根因是上游
+`_tencent_host_down_until` 只是**进程内字典**——新进程不继承，且「每票都重试三入口」
+把一次限流放大三倍。实现分三层，**均未改动上游生成物**（`_astock_generated.py`
+仍是 `tools/astock_extract.py --check` 可复验的快照）：
+
+| 层 | 位置 | 行为 |
+|---|---|---|
+| 状态镜像 | `data_sources/tencent_throttle.py` | 冷却状态落 `source/stock_analysis/data/state/tencent_cooldown.json`（gitignore），带过期时间；`tmp` + `os.replace` 原子写，`fcntl.flock` 串行化读-改-写（并发进程不会互相覆盖） |
+| 入口闸门 | `astock.fetch_daily` / `fetch_index_daily` | 取数前 `sync_process_state()` 把磁盘冷却并入进程内字典；三入口全冷却时抛 `TencentThrottled`，**一个请求都不发**；取数后 `flush_process_state()` 立即落盘 |
+| 渠道池预算 | `data_loader/bars.py::_DataSourcePool` | 单票总耗时 ≤ `DATA_SOURCE_TICKER_BUDGET_SECONDS`（默认 20s）：**每个通道调用**都套 `run_with_deadline`（剩余预算），单通道阻塞也会被放弃，不再只约束「通道之间」；超预算停止尝试剩余通道（attempt 带 `budget_exhausted`），调用方回退缓存并 `degraded`；主源连续 3 只失败后**本轮剩余票把备胎排到最前**，新一轮 `reset_primary_block()` 重新判定 |
+| 单次 HTTP 超时 | `tencent_throttle.http_timeout_for_budget` → `astock.fetch_daily(budget=…)` | 取数时把生成物的 `_ASTOCK_HTTP_TIMEOUT` 收敛到剩余预算内（预算 3s → `(1.0, 2.0)`；预算 ≥20s 保持默认 `(5, 15)`），退出还原默认值。避免「预算 3s、单请求 20s」错配 |
+| 批量预算 | `tools/context_ic.py fetch` | `--batch-size ≤ 20`、`--batch-pause ≥ 20s`（超限夹取并打印）；`--ticker-budget`（默认 20s）；`--primary-block-after`（默认 3）；`manifest.json` 记录 `price_sources` / `price_source_counts` / `price_budget` / `tencent_cooldown` |
+
+**备胎混源约束（第 4 条）**：`price_sources` 逐票记录 `tencent_qfq` / `baostock_qfq`。
+两源比例复权口径在**收益率**上等价（实测日收益最大绝对差 3.5e-6），但**价格水平不同**
+（复权基准不同）——因此任何跨票的**绝对价位**比较（同价位分组、价格带统计）必须先按
+来源分桶，不得混算。`stratify-buypoints --only-source/--exclude-source` 即为此提供。
+
+运维：手动解除冷却 = 删除 `tencent_cooldown.json`（或
+`tencent_throttle.clear_state()`）；`DATA_SOURCE_TICKER_BUDGET_SECONDS` 可临时放大预算。
+
+**预算的边界（issue #67 D2）**：Python 无法强杀线程，`run_with_deadline` 的上限是
+**协作式**的——超时后调用线程立刻返回（回退缓存、`degraded`），被放弃的取数线程
+转为 daemon 自行结束。它的单次 HTTP 超时在取数窗口内已被压到预算量级，因此
+遗留请求不会拖过「剩余预算 + 一个请求」；最坏情况（DNS / 半开连接不遵守
+read timeout）仍靠 HTTP timeout 兜底。实测：3s 预算 + 12s 阻塞通道 → 3.01s
+（修复前 12.01s）；20s 预算 + 45s 挂死 → 20.01s。
 
 ### 5.2 延迟与盘前窗口
 
