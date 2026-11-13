@@ -98,7 +98,16 @@ def main():
     if verify:
         out.append(f"| md5 与 R9 manifest 一致 | **{verify['md5_match']}** |")
         out.append(f"| md5 不一致 | **{verify['md5_mismatch']}** |")
+        drift = verify.get("mismatch_qfq_snapshot_drift", 0)
+        repro = verify.get("mismatch_reproduce_failed", 0)
+        other = verify.get("mismatch_other", 0)
+        if verify["md5_mismatch"]:
+            out.append(f"| ├ qfq 快照漂移（可复现，非取数错误） | {drift} |")
+            out.append(f"| ├ 复现失败（真错误） | {repro} |")
+            out.append(f"| └ 其他 | {other} |")
         out.append(f"| 行数合计 | {verify['rows_total']:,} |")
+        out.append(f"| 退市票 | {verify.get('delisted_checked', 0)} 只，"
+                   f"{verify.get('exit_reason_counts', {})} |")
     out.append("")
 
     # ---- 偏差 ----
