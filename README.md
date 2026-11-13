@@ -380,6 +380,11 @@ python cli.py 600519 --start 20200101 --json
 > （`waf.tencent.com/501page.html`），另外两个正常 —— 即 **1/3 入口不可用**，
 > 而不是"三入口一律 501"。这是**某一时点的观测**，不是永久结论：入口可用性
 > 会随 WAF 策略变化，适配器因此保留三入口轮换 + 冷却，不依赖固定顺序。
+> **2026-11-13 观测（issue #69）**：个股 K 线 `fqkline` 的三个入口**同时**
+> 返回 HTTP 501 + JS 挑战页（`location.href` / `btoa`），而指数 `newfqkline`
+> 与腾讯报价仍正常。**WAF 与 429/空响应限流是两种不同失败**：WAF 写 1800s
+> 长冷却、冷却期内个股腾讯通道一个请求都不发；限流仍是 120s。详见
+> `docs/ASTOCK_INTEGRATION.md` §5.1.2 与运维排查命令。
 > 复现方式见 `docs/P1_EVIDENCE_PLAN.md` §2.2.3。
 >
 > 指数与个股标签**允许不同**（指数走弱而个股强势是正常现象）。本字段目前只用于
@@ -406,6 +411,10 @@ python cli.py 600519 --start 20200101 --json
   - `ok=true`：本次成功；全通道首试成功时数组只有这一条，`warnings` 不新增。
   - `error_text` 经脱敏（长 URL → `<url>`、token/key → `<redacted>`）并截断到 **≤200 字**；
     `source` 只允许池内登记的标识符，避免把任意异常文本带进对外 JSON。
+  - **WAF（issue #69，additive）**：腾讯个股 K 线命中 HTTP 501 + JS 挑战页时，
+    该条目额外带 `"waf_blocked": true`，`cooldown_seconds` 是 WAF 长冷却剩余
+    （默认 1800s）；冷却期内后续票记 `ok=null, cooldown=true` 且同样带
+    `waf_blocked`（该通道本轮**不再发请求**）。普通限流/成功/失败条目不新增键。
   - 错误响应与成功响应键同构：无触网时为空数组 `[]`（G35）。
   - **基金（issue #24，additive）**：ETF / OTC 通道同样逐次记录，来源名为
     `fund_etf_sina`（`ak.fund_etf_hist_sina`）与 `eastmoney_otc`

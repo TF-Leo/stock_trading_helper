@@ -611,3 +611,276 @@ def test_count_requests_wraps_requests_request(monkeypatch):
     assert stats["count"] == 2
     assert generated.requests.request is wrapped
     assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# 6) issue #69：WAF（501 + JS 挑战页）与限流（429 / 空响应）分开
+# ---------------------------------------------------------------------------
+WAF_CHALLENGE_HTML = (
+    '<!DOCTYPE html><html><head><script>'
+    'location.href="https://waf.tencent.com/501page.html?"+btoa(document.referrer);'
+    '</script></head><body>501</body></html>'
+)
+
+
+def _waf_http(calls, status=501, body=WAF_CHALLENGE_HTML):
+    """所有腾讯入口都返回 501 挑战页，并记录实际发出的请求。"""
+
+    def fake_http(url, params=None, data=None, headers=None, method="GET",
+                  timeout=None, **kwargs):
+        calls.append(url)
+        return FakeResponse(body, status=status, url=url)
+
+    return fake_http
+
+
+@pytest.mark.parametrize("status,body,expected", [
+    (501, WAF_CHALLENGE_HTML, True),
+    (501, '<script>location.href="/x";</script>', True),
+    (501, '<script>btoa("x");</script>', True),
+    (501, "Service Unavailable", False),          # 普通 501 错误页不是 WAF
+    (429, WAF_CHALLENGE_HTML, False),             # 429 即使带挑战页也按限流处理
+    (200, WAF_CHALLENGE_HTML, False),
+    (None, WAF_CHALLENGE_HTML, False),
+])
+def test_is_waf_challenge_classification(status, body, expected):
+    assert throttle.is_waf_challenge(status, body) is expected
+
+
+def test_waf_501_enters_long_cooldown_with_single_probe(clean_throttle, monkeypatch):
+    """打桩 501 + 挑战页：一次探测即中止，写长冷却，不污染 120s 限流段。"""
+    monkeypatch.setenv(throttle.WAF_COOLDOWN_ENV, "1800")
+    calls = []
+    monkeypatch.setattr(generated, "_v39_http", _waf_http(calls))
+
+    with pytest.raises(astock.TencentWafBlocked) as excinfo:
+        astock.fetch_daily("600519", start_date="20200101", adjust="qfq")
+
+    # 只探测第一个入口，不把一次 WAF 放大成三次
+    assert len(calls) == 1, calls
+    assert "WAF" in str(excinfo.value)
+    payload = json.loads(clean_throttle.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == throttle.SCHEMA_VERSION == 2
+    assert set(payload["waf"]["hosts"]) == set(HOSTS)
+    assert all(until > time.time() for until in payload["waf"]["hosts"].values())
+    assert payload["hosts"] == {}, "WAF 不得写入 120s 限流段（会误伤指数）"
+    assert throttle.waf_hosts_cooling()
+    assert 1700 <= throttle.waf_remaining() <= 1800
+
+    # 冷却期内：后续调用一个请求都不发
+    before = len(calls)
+    with pytest.raises(astock.TencentWafBlocked):
+        astock.fetch_daily("600519", start_date="20200101", adjust="qfq")
+    assert len(calls) == before
+
+
+def test_waf_detected_when_http_helper_raises_wrapped_error(clean_throttle):
+    """真实 ``_v39_http`` 会先 ``raise_for_status`` 再包成 RuntimeError；同样要识别。"""
+    import requests
+
+    response = FakeResponse(WAF_CHALLENGE_HTML, status=501, url=HOSTS[0])
+
+    def boom(url, **kwargs):
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(f"请求 {url} 失败") from exc
+
+    wrapped = throttle.wrap_http_for_waf(boom)
+    with pytest.raises(throttle.WafBlocked):
+        wrapped(HOSTS[0] + "/appstock/app/fqkline/get")
+    assert throttle.waf_hosts_cooling()
+
+
+def test_429_and_empty_response_keep_short_cooldown(clean_throttle, monkeypatch):
+    """429 / 空响应仍走 120s 短冷却，不能误判成 WAF。"""
+
+    def rate_limited(url, **kwargs):
+        raise RuntimeError("429 Too Many Requests")
+
+    monkeypatch.setattr(generated, "_v39_http", rate_limited)
+    with pytest.raises(astock.AstockError) as excinfo:
+        astock.fetch_daily("600519", start_date="20200101", adjust="qfq")
+    assert not isinstance(excinfo.value, astock.TencentWafBlocked)
+    assert throttle.active_waf_hosts() == {}
+    active = throttle.active_hosts()
+    assert set(active) == set(HOSTS)
+    assert all(0 < until - time.time() <= throttle.DEFAULT_COOLDOWN_SECONDS
+               for until in active.values())
+
+    # 空响应（200 + 无 data）同样只是限流
+    throttle.clear_state()
+    generated._tencent_host_down_until.clear()
+    empty_calls = []
+
+    def empty(url, **kwargs):
+        empty_calls.append(url)
+        return FakeResponse("{}", status=200, url=url)
+
+    monkeypatch.setattr(generated, "_v39_http", empty)
+    with pytest.raises(astock.AstockError):
+        astock.fetch_daily("600519", start_date="20200101", adjust="qfq")
+    assert len(empty_calls) == len(HOSTS)
+    assert throttle.active_waf_hosts() == {}
+    assert set(throttle.active_hosts()) == set(HOSTS)
+
+
+def test_waf_expiry_allows_probe_then_success_restores(clean_throttle, monkeypatch):
+    """冷却到期后允许一次探测；成功即恢复正常（不再带 WAF 状态）。"""
+    clean_throttle.parent.mkdir(parents=True, exist_ok=True)
+    clean_throttle.write_text(json.dumps({
+        "schema_version": 2,
+        "hosts": {},
+        "waf": {"hosts": {host: time.time() - 5 for host in HOSTS},
+                "last_reason": "expired"},
+    }), encoding="utf-8")
+    assert not throttle.waf_hosts_cooling()
+
+    calls = []
+    monkeypatch.setattr(generated, "_v39_http", _fake_kline_http(calls))
+    frame = astock.fetch_daily("600519", start_date="20200101", adjust="")
+    assert len(frame) == 3 and calls, "到期后必须真的探测"
+    assert throttle.active_waf_hosts() == {}
+    assert not throttle.waf_hosts_cooling()
+
+
+def test_failed_probe_after_expiry_reenters_long_cooldown(clean_throttle, monkeypatch):
+    clean_throttle.parent.mkdir(parents=True, exist_ok=True)
+    clean_throttle.write_text(json.dumps({
+        "schema_version": 2,
+        "hosts": {},
+        "waf": {"hosts": {host: time.time() - 5 for host in HOSTS}},
+    }), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(generated, "_v39_http", _waf_http(calls))
+    with pytest.raises(astock.TencentWafBlocked):
+        astock.fetch_daily("600519", start_date="20200101", adjust="qfq")
+    assert len(calls) == 1
+    assert throttle.waf_hosts_cooling()
+    assert throttle.waf_remaining() > 1700
+
+
+_WAF_CHILD_SCRIPT = r"""
+import json, sys
+sys.path.insert(0, {src!r})
+from stock_analysis.data_sources import astock, _astock_generated as g
+
+calls = []
+BODY = {body!r}
+class _Resp:
+    status_code = 501
+    text = BODY
+    def __init__(self, url):
+        self.url = url
+    def json(self):
+        return {{}}
+    def raise_for_status(self):
+        return None
+
+def fake_http(url, params=None, data=None, headers=None, method='GET',
+              timeout=None, **kwargs):
+    calls.append(url)
+    return _Resp(url)
+
+g._v39_http = fake_http
+try:
+    astock.fetch_daily('600519', start_date='20200101', adjust='qfq')
+    outcome = 'ok'
+except Exception as exc:
+    outcome = type(exc).__name__
+print(json.dumps({{'calls': calls, 'outcome': outcome}}))
+"""
+
+
+def _run_waf_child(state_path, timeout=90):
+    script = _WAF_CHILD_SCRIPT.format(src=str(SRC), body=WAF_CHALLENGE_HTML)
+    env = dict(os.environ, PYTHONPATH=str(SRC),
+               TENCENT_COOLDOWN_PATH=str(state_path),
+               TENCENT_WAF_COOLDOWN_SECONDS="1800",
+               ASTOCK_CALENDAR_OFFLINE="1")
+    env.pop("ASTOCK_FORCE_FAIL", None)
+    result = subprocess.run([sys.executable, "-c", script],
+                            cwd=str(SRC), env=env, capture_output=True,
+                            text=True, timeout=timeout)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_cross_process_waf_cooldown_blocks_second_process(clean_throttle, tmp_path):
+    """进程 A 撞 WAF → 长冷却落盘；进程 B 启动后 0 请求、直接判 WAF。"""
+    state = tmp_path / "cross" / "tencent_cooldown.json"
+    first = _run_waf_child(state)
+    assert first["outcome"] == "TencentWafBlocked"
+    assert len(first["calls"]) == 1
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    assert set(payload["waf"]["hosts"]) == set(HOSTS)
+    assert all(until > time.time() for until in payload["waf"]["hosts"].values())
+    assert payload["hosts"] == {}
+
+    second = _run_waf_child(state)
+    assert second["calls"] == []
+    assert second["outcome"] == "TencentWafBlocked"
+
+
+def test_pool_marks_waf_and_skips_channel_without_requests(clean_throttle, monkeypatch):
+    """渠道池：WAF 条目带 waf_blocked；下一只票直接跳过、不发请求。"""
+    monkeypatch.setenv(throttle.WAF_COOLDOWN_ENV, "1800")
+    calls = []
+
+    def waf_fetcher(*args, **kwargs):
+        calls.append(1)
+        throttle.mark_waf(reason="test")
+        raise astock.TencentWafBlocked("腾讯 K 线 WAF 封锁（HTTP 501 挑战页）")
+
+    pool = _pool([("astock_tencent", waf_fetcher),
+                  ("sina_stock", lambda *a, **k: _toy(5))])
+    pool.primary_source_name = "astock_tencent"
+    df, used = pool.fetch("600519", "20200101", "qfq")
+    assert used == "sina_stock" and len(df) == 5
+    first = [a for a in pool.last_attempts if a["source"] == "astock_tencent"][0]
+    assert first["ok"] is False
+    assert first["error_class"] == "TencentWafBlocked"
+    assert first["waf_blocked"] is True
+    assert first["cooldown"] is True
+    assert 1700 <= first["cooldown_seconds"] <= 1800
+    lines = bars.format_attempt_warnings(pool.last_attempts)
+    assert any("WAF 长冷却" in line for line in lines), lines
+
+    # 第二只票：腾讯在 WAF 长冷却中 → ok=None、0 请求
+    before = len(calls)
+    df2, used2 = pool.fetch("000001", "20200101", "qfq")
+    assert used2 == "sina_stock"
+    assert len(calls) == before, "WAF 冷却期内不得再发请求"
+    skipped = [a for a in pool.last_attempts if a["source"] == "astock_tencent"][0]
+    assert skipped["ok"] is None and skipped["cooldown"] is True
+    assert skipped["waf_blocked"] is True
+    assert "WAF" in skipped["error_text"]
+
+
+def test_waf_cooldown_does_not_block_index_or_quote(clean_throttle, monkeypatch):
+    """指数 newfqkline 与腾讯报价不受个股 WAF 长冷却影响。"""
+    throttle.mark_waf(reason="test")
+    assert throttle.waf_hosts_cooling()
+
+    rows = []
+    cursor = pd.Timestamp("2020-01-02")
+    for i in range(30):
+        day = (cursor + pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        rows.append([day, "100", "101", "102", "99", "1000"])
+
+    def fake_index(url, params=None, data=None, headers=None, method="GET",
+                   timeout=None, **kwargs):
+        return FakeResponse(
+            json.dumps({"code": 0, "msg": "",
+                        "data": {"sh000300": {"day": rows}}}),
+            status=200, url=url)
+
+    monkeypatch.setattr(generated, "_v39_http", fake_index)
+    frame = astock.fetch_index_daily("sh000300", start_date="20200101")
+    assert len(frame) == 30
+
+    monkeypatch.setattr(
+        generated, "tencent_quote",
+        lambda codes: {str(codes[0]): {"code": str(codes[0]), "price": 100.0}})
+    quote = astock.fetch_quote("600519")
+    assert quote["price"] == 100.0

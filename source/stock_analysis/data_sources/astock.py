@@ -50,6 +50,7 @@ __all__ = [
     "calendar_last_error",
     "OFFLINE_ENV",
     "TencentThrottled",
+    "TencentWafBlocked",
 ]
 
 OFFLINE_ENV = "ASTOCK_CALENDAR_OFFLINE"
@@ -81,6 +82,15 @@ class TencentThrottled(AstockError):
 
     与普通 :class:`AstockError` 的区别对调用方很重要：这不是「这只票取不到」，
     而是「现在整个腾讯都别碰」。渠道池据此立刻切备胎，不必再付三次 HTTP 超时。
+    """
+
+
+class TencentWafBlocked(AstockError):
+    """腾讯个股 K 线被 **WAF 挑战页**拦截（HTTP 501），已进入长冷却。
+
+    与 :class:`TencentThrottled`（429/空响应限流，120s）分开：WAF 是边缘策略
+    拦截，默认冷却 1800s；冷却期内一个请求都不发。指数 ``newfqkline`` 与腾讯
+    报价不受影响（issue #69）。
     """
 
 
@@ -133,6 +143,25 @@ def _http_timeout(timeout):
         _g._ASTOCK_HTTP_TIMEOUT = _DEFAULT_HTTP_TIMEOUT
 
 
+@contextlib.contextmanager
+def _waf_guard():
+    """取数期间给生成物的 HTTP 调用装上 WAF 识别（issue #69）。
+
+    只在本上下文内替换 ``_v39_http``：501 + JS 挑战页 → :class:`tencent_throttle.WafBlocked`
+    （**不是** RuntimeError，不会触发上游的 120s 限流冷却 / 换入口），并写 WAF 长冷却。
+    429 / 空响应仍原样返回给上游，走既有 120s 短冷却。
+
+    恢复目标是**进入时的函数对象**（可能是测试打的桩），因此测试里的
+    ``monkeypatch.setattr(generated, "_v39_http", fake)`` 仍然有效。
+    """
+    original = _g._v39_http
+    _g._v39_http = _throttle.wrap_http_for_waf(original)
+    try:
+        yield
+    finally:
+        _g._v39_http = original
+
+
 def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.DataFrame:
     """拉取腾讯日线，按**比例口径**做前/后复权。
 
@@ -157,6 +186,11 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.D
     ``(connect, read)`` 会被 :func:`tencent_throttle.http_timeout_for_budget`
     收敛到预算内（issue #67 D2：避免「预算 3s、单请求 20s」错配）。这是
     **协作式**上限，墙钟仍由调用方的 ``run_with_deadline`` 兜底。
+
+    **WAF（issue #69）**：HTTP 501 + JS 挑战页（``location.href`` / ``btoa``）
+    与 429/空响应限流是两种失败。WAF 会抛 :class:`TencentWafBlocked` 并写入
+    1800s 长冷却（``TENCENT_WAF_COOLDOWN_SECONDS`` 可覆盖），冷却期内本函数
+    一个请求都不发；到期后自动放行一次探测。指数与腾讯报价不受影响。
     """
     if str(os.getenv(FORCE_FAIL_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
         raise AstockError(f"{FORCE_FAIL_ENV}=1：腾讯源被强制失败（降级演练）")
@@ -172,6 +206,11 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.D
     fetch_adjust = "" if needs_factor else adjust_value
 
     _throttle.sync_process_state()
+    if _throttle.waf_hosts_cooling():
+        # issue #69：WAF（501 挑战页）与限流是两类失败。长冷却期内一个请求都不发；
+        # 到期后本闸门自动放行一次探测，成功即恢复正常（失败会重新写长冷却）。
+        raise TencentWafBlocked(
+            f"腾讯 K 线 WAF 长冷却中（{_throttle.waf_summary()}），本次未发起请求")
     if _throttle.all_hosts_cooling():
         # issue #13 第 1 条：跨进程冷却文件显示三个入口都在冷却 → 一个请求都不发。
         # 抛专门的 TencentThrottled，让渠道池立刻切备胎（而不是再付三次超时）。
@@ -184,9 +223,13 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.D
                      else _http_timeout(request_timeout))
 
     try:
-        with timeout_scope:
+        with timeout_scope, _waf_guard():
             frame = _g.tencent_kline(digits, period="day", adjust=fetch_adjust,
                                      start=start)
+    except _throttle.WafBlocked as exc:
+        # 501 + 挑战页已经由 _waf_guard 写入长冷却；这里换成对调用方更明确的类型。
+        raise TencentWafBlocked(
+            f"腾讯K线 WAF 拦截({digits}): {exc}") from exc
     except ValueError as exc:
         # 参数错误（区间过长 / 北交所 / 代码不存在）与来源格式错误区分开
         raise AstockError(f"腾讯K线参数错误({digits}): {exc}") from exc
@@ -322,6 +365,10 @@ def fetch_index_daily(symbol="sh000300", start_date=None) -> pd.DataFrame:
     消费 ``close``，成交量仅作可选诊断，不能当个股成交量口径使用。
 
     失败（网络 / WAF / 空数据 / 格式变化 / 离线）抛 :class:`AstockError`。
+
+    **issue #69**：个股 WAF 长冷却（``tencent_cooldown.json`` 的 ``waf`` 段）
+    只约束 :func:`fetch_daily`；指数走 ``newfqkline``，这里**不读** WAF 段，
+    因此个股被 WAF 时指数仍可用。
     """
     if str(os.getenv(FORCE_FAIL_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
         raise AstockError(f"{FORCE_FAIL_ENV}=1：腾讯源被强制失败（降级演练）")
