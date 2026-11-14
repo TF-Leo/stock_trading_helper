@@ -73,6 +73,9 @@ FLOW_KEYS = (
     "pub_lag_days", "main_net_5d", "main_net_20d", "net_5d", "net_20d",
     "direction", "direction_basis", "stale", "expected_date",
     "expected_source", "reason",
+    # issue #108 additive：东财不可达 / 反爬阻断而降级到新浪口径时，写明原因。
+    # 成功走东财或旧缓存没有该字段时恒为 None（键始终存在，保证路径同构）。
+    "degraded_reason",
 )
 
 REASON_TEXT = {
@@ -227,6 +230,7 @@ def empty_flow_block(code=None, reason="cache_missing", expected_date=None,
         "expected_date": None if expected_date is None else str(expected_date),
         "expected_source": expected_source,
         "reason": reason,
+        "degraded_reason": None,
     }
 
 
@@ -318,6 +322,9 @@ def summarize_flow(code, as_of=None, flow_dir=None, now=None):
         "expected_date": expected.isoformat(),
         "expected_source": expected_source,
         "reason": None,
+        # issue #108 additive：降级原因随缓存落盘；旧缓存 / 东财口径为 None。
+        # 只有新浪口径的预计算才会写入该字段（见 tools/precompute_flow.py）。
+        "degraded_reason": (str(payload.get("degraded_reason") or "") or None),
     }
 
 
@@ -344,6 +351,8 @@ def flow_evidence(code, data_type="stock", as_of=None, flow_dir=None, now=None):
       （上游 §4.5 本就不覆盖 ETF，每次基金运行都告警只会变成噪声）。
     * 股票：缓存缺失 / 过期会追加一条可操作的 warning；该 warning 只描述
       上下文不可用，不影响 ``action`` / ``status`` / 仓位。
+    * issue #108：降级到新浪口径（``caliber=sina_total_net``）必须**出声** ——
+      ``degraded_reason`` 非空时追加一条带口径的 warning，不再静默换源。
     """
     if str(data_type) == "fund":
         return empty_flow_block(code=_normalize_code(code),
@@ -355,8 +364,15 @@ def flow_evidence(code, data_type="stock", as_of=None, flow_dir=None, now=None):
     if not block["available"]:
         reason = REASON_TEXT.get(block["reason"], block["reason"])
         notes.append(f"资金面上下文不可用（{shown}）：{reason}；只展示，不影响 action")
-    elif block.get("stale"):
-        notes.append(
-            f"资金面缓存过期（{shown}）：as_of={block['as_of']} < 期望 "
-            f"{block['expected_date']}；请重跑 tools/precompute_flow.py（只展示，不影响 action）")
+    else:
+        degraded_reason = block.get("degraded_reason")
+        if degraded_reason:
+            notes.append(
+                f"资金面口径已降级（{shown}）：当前 caliber="
+                f"{block.get('caliber') or 'unknown'}，原因 {degraded_reason}；"
+                "两种口径不可混比，只展示，不影响 action")
+        if block.get("stale"):
+            notes.append(
+                f"资金面缓存过期（{shown}）：as_of={block['as_of']} < 期望 "
+                f"{block['expected_date']}；请重跑 tools/precompute_flow.py（只展示，不影响 action）")
     return block, notes

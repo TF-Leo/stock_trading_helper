@@ -33,6 +33,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from stock_analysis.data_sources import astock
+from stock_analysis.data_sources import eastmoney_guard as em_guard
 
 __all__ = [
     "OFFLINE_ENV",
@@ -70,8 +71,11 @@ ST_LIST_RETRY = 1
 ST_LIST_STATE_DIR_ENV = "ST_LIST_STATE_DIR"
 ST_LIST_COOLDOWN_PATH_ENV = "ST_LIST_COOLDOWN_PATH"
 # 东财 nginx 444 / 零字节 FIN 是 IP 级反爬，几分钟内重试只会继续撞墙；
-# 收盘后预计算一旦命中就冷却 30 分钟（可用 ST_LIST_COOLDOWN_SECONDS 覆盖）。
-ST_LIST_COOLDOWN_SECONDS = float(os.getenv("ST_LIST_COOLDOWN_SECONDS", "1800"))
+# 收盘后预计算一旦命中就冷却 30 分钟。issue #108 起与资金流共用
+# ``eastmoney_guard`` 的冷却文件：``EASTMONEY_COOLDOWN_SECONDS`` 优先，
+# 旧 ``ST_LIST_COOLDOWN_SECONDS`` 仍兼容（默认 1800s）。
+ST_LIST_COOLDOWN_SECONDS = float(os.getenv(
+    "ST_LIST_COOLDOWN_SECONDS", str(em_guard.cooldown_seconds())))
 ST_LIST_CACHE_SCHEMA = 2
 
 _GEM_BOARDS = ("sz_gem", "sh_star")
@@ -173,11 +177,16 @@ def cache_path() -> str:
 
 
 def cooldown_path() -> str:
-    """444 / 零字节 FIN 后的冷却状态文件（默认与缓存同目录）。"""
+    """444 / 零字节 FIN 后的冷却状态文件（默认与缓存同目录）。
+
+    issue #108：与资金流共用 ``eastmoney_guard`` 的同一份冷却文件
+    （``eastmoney_cooldown.json``）。旧 ``ST_LIST_COOLDOWN_PATH`` 仍可显式
+    指定路径（运维兼容），新配置请用 ``EASTMONEY_COOLDOWN_PATH``。
+    """
     override = str(os.getenv(ST_LIST_COOLDOWN_PATH_ENV, "") or "").strip()
     if override:
         return override
-    return os.path.join(os.path.dirname(cache_path()), "st_list_cooldown.json")
+    return em_guard.state_path(state_dir=os.path.dirname(cache_path()))
 
 
 def codes_sha256(codes) -> str:
@@ -457,112 +466,45 @@ def _cache_date(payload: dict) -> str:
     return fetched or "未知日期"
 
 
-def _parse_iso(value) -> Optional[_dt.datetime]:
-    try:
-        return _dt.datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return None
-
-
 def cooldown_state(now: Optional[_dt.datetime] = None) -> Optional[dict]:
     """读取冷却状态；仍在生效才返回（附带 ``remaining_seconds``），否则 None。
 
-    文件不存在 / 损坏 / 已过期一律返回 None —— 冷却文件是**可选加速器**，
-    不能因为它坏了把整条盘前路径卡死。
+    issue #108：委托 ``eastmoney_guard.cooldown_state`` —— 资金流与 ST 名单
+    共用同一个文件、同一套过期判定。
     """
-    try:
-        with open(cooldown_path(), "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(payload, dict) or int(payload.get("schema", 0) or 0) != 1:
-        return None
-    until = _parse_iso(payload.get("blocked_until"))
-    if until is None:
-        return None
-    now = now or _dt.datetime.now()
-    try:
-        remaining = until.timestamp() - now.timestamp()
-    except (OSError, ValueError, OverflowError):
-        return None
-    if remaining <= 0:
-        return None
-    result = dict(payload)
-    result["remaining_seconds"] = remaining
-    return result
+    return em_guard.cooldown_state(now=now, path=cooldown_path())
 
 
 def mark_cooldown(reason: str, detail: Optional[str] = None,
                   seconds: Optional[float] = None,
                   now: Optional[_dt.datetime] = None) -> dict:
-    """写入跨进程冷却（``st_list_cooldown.json``，原子替换）。"""
-    now = now or _dt.datetime.now()
-    wait = float(ST_LIST_COOLDOWN_SECONDS if seconds is None else seconds)
-    until = now + _dt.timedelta(seconds=max(wait, 0.0))
-    payload = {
-        "schema": 1,
-        "reason": str(reason or "unknown"),
-        "detail": str(detail or ""),
-        "blocked_at": now.isoformat(),
-        "blocked_until": until.isoformat(),
-        "seconds": wait,
-    }
-    path = cooldown_path()
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=1, sort_keys=True)
-        handle.write("\n")
-    os.replace(tmp, path)
-    return payload
+    """写入跨进程冷却（``eastmoney_cooldown.json``，原子替换）。"""
+    wait = (ST_LIST_COOLDOWN_SECONDS if seconds is None else float(seconds))
+    return em_guard.mark_cooldown(reason, detail, seconds=wait, now=now,
+                                  path=cooldown_path())
 
 
 def clear_cooldown() -> None:
     """删除冷却状态（人工解除封锁后复跑预计算时用）。"""
-    try:
-        os.unlink(cooldown_path())
-    except FileNotFoundError:
-        pass
+    em_guard.clear_cooldown(path=cooldown_path())
 
 
-class StListBlocked(RuntimeError):
-    """东财反爬命中（HTTP 444 / 零字节 FIN）：本轮**不换域重试**，写冷却。"""
+class StListBlocked(em_guard.AntiScrapeBlocked):
+    """东财反爬命中（HTTP 444 / 零字节 FIN）：本轮**不换域重试**，写冷却。
+
+    issue #108：实际识别与熔断在 ``eastmoney_guard``；这里只保留 ST 专用
+    异常名，供既有调用方与测试按名捕获。
+    """
 
 
-#: 零字节 FIN / 连接被反爬层直接切断的常见文案（requests / ssl / 原生 socket）。
-_BLOCK_MARKERS = (
-    "remote end closed",
-    "remotedisconnected",
-    "connection aborted",
-    "connection reset",
-    "reset by peer",
-    "empty reply",
-    "incompleteread",
-    "ssleoferror",
-    "unexpected eof",
-    "eof occurred",
-)
+class StListFetchGuard(em_guard.EmFetchGuard):
+    """预计算专用闸门：ST 名单的冷却路径 / 异常名 / 冷却秒数。
 
-_BLOCK_EXC_TYPES = (
-    "ConnectionError",
-    "ConnectionResetError",
-    "ChunkedEncodingError",
-    "SSLEOFError",
-    "RemoteDisconnected",
-)
-
-
-class StListFetchGuard:
-    """预计算专用：包一层 ``_astock_generated.em_get``，计数并识别反爬。
-
-    为什么必须包在 ``em_get`` 这一层
-    --------------------------------
-    上游 ``_em_clist_all`` 会**吞掉**主域的 HTTP 444（只把异常类型记进
-    ``errors``）再换 ``push2delay`` 重试，且 ``st_stock_list`` 把错误重新包成
-    RuntimeError，状态码在上层已经丢失。这里在 HTTP 入口记录原始状态码 /
-    异常文案，并在命中 444 或零字节 FIN 时直接抛 :class:`StListBlocked`
-    （刻意不继承 ``requests.RequestException``），让上游既不会换域重试，
-    也不会把一次封禁放大成多次请求。
+    识别、冷却文件、跨进程锁、请求预算全部复用 ``eastmoney_guard``，与资金流
+    共用同一套实现和同一个 ``eastmoney_cooldown.json``。上游
+    ``_em_clist_all`` 会吞掉主域错误再换域重试；这里在 ``em_get`` 入口命中
+    444 / FIN 时直接抛 :class:`StListBlocked`（不是
+    ``requests.RequestException``），让上游不会把一次封禁放大成多次请求。
 
     用法::
 
@@ -572,90 +514,11 @@ class StListFetchGuard:
         guard.requests, guard.block_reason
     """
 
-    def __init__(self) -> None:
-        self.requests = 0
-        self.status_codes: List[int] = []
-        self.block_reason: Optional[str] = None
-        self.block_detail: Optional[str] = None
-        self._module = None
-        self._original = None
-
-    # -- 内部记录 ---------------------------------------------------------
-    def _record(self, reason: str, detail: str) -> None:
-        if self.block_reason is None:
-            self.block_reason = reason
-            self.block_detail = detail
-
-    @staticmethod
-    def _block_message(reason: str, detail: str) -> str:
-        return (f"东财反爬阻断（{reason}）：{detail[:200]}；"
-                "本轮不换域重试，已记录冷却状态")
-
-    def _note_response(self, response) -> None:
-        status = getattr(response, "status_code", None)
-        try:
-            status_int = int(status) if status is not None else None
-        except (TypeError, ValueError):
-            status_int = None
-        if status_int is not None:
-            self.status_codes.append(status_int)
-        if status_int == 444:
-            self._record("http_444", f"HTTP 444（nginx 反爬）")
-            return
-        try:
-            content = getattr(response, "content", None)
-            size = len(content) if content is not None else None
-        except Exception:
-            size = None
-        if size == 0:
-            self._record("zero_byte_fin", f"HTTP {status_int or '?'} 返回 0 字节")
-
-    def _note_exception(self, exc: BaseException) -> bool:
-        text = f"{type(exc).__name__}: {exc}"
-        if re.search(r"\b444\b", text):
-            self._record("http_444", text)
-            return True
-        lowered = text.lower()
-        type_name = type(exc).__name__
-        if type_name in _BLOCK_EXC_TYPES or any(
-                marker in lowered for marker in _BLOCK_MARKERS):
-            self._record("zero_byte_fin", text)
-            return True
-        return False
-
-    # -- 上下文管理 -------------------------------------------------------
-    def __enter__(self):
-        from stock_analysis.data_sources import _astock_generated as _g
-
-        self._module = _g
-        self._original = getattr(_g, "em_get", None)
-        if self._original is None:
-            return self
-
-        def wrapped(url, params=None, headers=None, timeout=15, **kwargs):
-            self.requests += 1
-            try:
-                response = self._original(
-                    url, params=params, headers=headers, timeout=timeout,
-                    **kwargs)
-            except Exception as exc:
-                if self._note_exception(exc):
-                    raise StListBlocked(self._block_message(
-                        self.block_reason, self.block_detail)) from exc
-                raise
-            self._note_response(response)
-            if self.block_reason:
-                raise StListBlocked(self._block_message(
-                    self.block_reason, self.block_detail))
-            return response
-
-        _g.em_get = wrapped
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self._module is not None and self._original is not None:
-            self._module.em_get = self._original
-        return False
+    def __init__(self, budget=None, now_fn=None, respect_cooling=True) -> None:
+        super().__init__(budget=budget, path=cooldown_path(),
+                         cooldown_seconds_override=ST_LIST_COOLDOWN_SECONDS,
+                         block_exc=StListBlocked, now_fn=now_fn,
+                         respect_cooling=respect_cooling)
 
 
 def fetch_st_list() -> StListSnapshot:

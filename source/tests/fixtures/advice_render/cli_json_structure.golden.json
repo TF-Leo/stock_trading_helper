@@ -101,6 +101,7 @@
     "available",
     "caliber",
     "code",
+    "degraded_reason",
     "direction",
     "direction_basis",
     "expected_date",
