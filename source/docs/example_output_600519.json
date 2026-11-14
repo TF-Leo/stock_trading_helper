@@ -17,6 +17,7 @@
     "board": "sh_main",
     "price_limit_pct": 0.1,
     "is_st": false,
+    "is_st_source": "quote_name",
     "is_suspended": false,
     "limit_up": 1542.53,
     "limit_down": 1262.07,

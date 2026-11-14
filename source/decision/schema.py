@@ -78,6 +78,9 @@ class Instrument:
     limit_down: Optional[float] = None
     quote_stale: Optional[bool] = None
     status_source: str = "unavailable"
+    # issue #106 additive：ST 判定来源（exchange_list / quote_name /
+    # local_name / unavailable）。
+    is_st_source: str = "unavailable"
 
 
 @dataclass
@@ -339,6 +342,8 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
                        # issue #98 additive：一字板字段与成功路径键同构（G35）。
                        # 取数/交易状态未解析时不可得 → 显式 null。
                        'one_word_limit': None,
+                       # issue #106 additive：ST 判定来源；错误路径不可得。
+                       'is_st_source': 'unavailable',
                        'status_source': 'unavailable'},
         'data': {
             # bars/start/end/last_close 在"数据太短"时是**已知的真实值**，

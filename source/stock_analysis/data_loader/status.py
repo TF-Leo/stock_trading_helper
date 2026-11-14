@@ -37,6 +37,9 @@ from stock_analysis.data_sources import astock
 __all__ = [
     "OFFLINE_ENV",
     "DELIST_LAG_DAYS",
+    "ST_LIST_RETRY",
+    "StListEmptyError",
+    "StListDuplicateError",
     "StListSnapshot",
     "TradingStatus",
     "get_st_list",
@@ -48,6 +51,8 @@ __all__ = [
 OFFLINE_ENV = "ASTOCK_STATUS_OFFLINE"
 # 行情连续滞后多少个交易日仍取不到报价 → 疑似退市/长期停牌（可复核阈值）。
 DELIST_LAG_DAYS = int(os.getenv("ASTOCK_DELIST_LAG_DAYS", "20"))
+# issue #106：空表 / 重复代码是「名单本身可疑」，允许重试一次（仍异常则回退缓存）。
+ST_LIST_RETRY = 1
 
 _GEM_BOARDS = ("sz_gem", "sh_star")
 _TRADING_DAY_LOOKBACK = 30
@@ -144,13 +149,49 @@ class StListSnapshot:
     session_date: Optional[str] = None
     degraded: bool = False
     warning: Optional[str] = None
+    # issue #106：三态区分 —— ``ok`` / ``empty``（可疑空表）/ ``duplicate``
+    # （可疑重复代码）/ ``failed``（请求失败）/ ``offline``（显式离线未请求）。
+    # ``available=False`` 时 state 必须明确说明「为什么不可用」，调用方不得
+    # 把空表当成「今天没有 ST」。
+    state: str = "ok"
+    # 回退本地缓存时为 True；同时保留缓存日期（``fetched_at`` / ``session_date``）。
+    stale: bool = False
+    retried: bool = False
+    cleaned_duplicates: int = 0
 
     @property
     def codes(self):
         return frozenset(self.stocks)
 
 
-def _snapshot_from_payload(payload, degraded=False, warning=None) -> StListSnapshot:
+class StListEmptyError(RuntimeError):
+    """ST 名单返回空表：可疑状态，不能等同于「今日无 ST」。"""
+
+
+class StListDuplicateError(RuntimeError):
+    """ST 名单出现无法清洗的重复代码（同一代码内容冲突）。"""
+
+
+def _st_failure_kind(exc: BaseException) -> str:
+    """把取数异常归类为 ``empty`` / ``duplicate`` / ``failed``。
+
+    上游 ``st_stock_list()`` 没有专用异常类型，只能按错误文案归类；归类只影响
+    warning 措辞与「是否重试一次」，不会把失败静默成空名单。
+    """
+    if isinstance(exc, StListEmptyError):
+        return "empty"
+    if isinstance(exc, StListDuplicateError):
+        return "duplicate"
+    text = str(exc or "")
+    if "代码重复" in text or "重复" in text:
+        return "duplicate"
+    if "为空" in text or "0 条" in text or "empty" in text.lower():
+        return "empty"
+    return "failed"
+
+
+def _snapshot_from_payload(payload, degraded=False, warning=None,
+                           state="ok", stale=False) -> StListSnapshot:
     stocks = {}
     raw = payload.get("stocks")
     if isinstance(raw, dict):
@@ -168,6 +209,8 @@ def _snapshot_from_payload(payload, degraded=False, warning=None) -> StListSnaps
         session_date=payload.get("session_date"),
         degraded=degraded,
         warning=warning,
+        state=state,
+        stale=stale,
     )
 
 
@@ -208,42 +251,95 @@ def _write_disk_cache(snapshot: StListSnapshot, now: _dt.datetime) -> None:
         print(f"[WARN] 写 ST 名单缓存失败：{exc}", file=sys.stderr)
 
 
-def _snapshot_from_frame(frame) -> StListSnapshot:
+def _snapshot_from_frame(frame, allow_clean: bool = False) -> StListSnapshot:
+    """把上游 DataFrame 变成快照；空表 / 重复代码必须显式报错。
+
+    ``allow_clean=True`` 用于「已重试一次」的第二次结果：内容**完全一致**的
+    重复代码可以清洗掉（计数并告警）；内容冲突的重复代码仍然报错，因为无法
+    判断哪一行才算权威名单。
+    """
     if not isinstance(frame, pd.DataFrame) or frame.empty:
-        raise RuntimeError("ST 名单为空，不能当成完整快照")
+        raise StListEmptyError("ST 名单为空，不能当成完整快照")
     stocks = {}
+    cleaned = 0
     for row in frame.to_dict("records"):
-        code = str(row.get("code") or "").zfill(6)
-        if not re.fullmatch(r"\d{6}", code) or code in stocks:
-            raise RuntimeError(f"ST 名单代码异常或重复: {row.get('code')!r}")
+        raw_code = row.get("code")
+        code = str(raw_code or "").zfill(6)
+        if not re.fullmatch(r"\d{6}", code):
+            raise RuntimeError(f"ST 名单代码异常: {raw_code!r}")
         name = str(row.get("name") or "").strip()
         if not name:
             raise RuntimeError(f"ST 名单 {code} 缺少名称，无法复核")
-        stocks[code] = {
+        info = {
             "name": name,
             "st_type": str(row.get("st_type") or ("*ST" if name.startswith("*") else "ST")),
             "market": str(row.get("market") or ""),
             "price": _num(row.get("price")),
             "pct_change": _num(row.get("pct_change")),
         }
+        if code in stocks:
+            if allow_clean and stocks[code] == info:
+                cleaned += 1
+                continue
+            raise StListDuplicateError(
+                f"ST 名单代码 {raw_code!r} 重复（{stocks[code]!r} vs {info!r}），"
+                "无法判断哪一行才是权威名单")
+        stocks[code] = info
     coverage = str(getattr(frame, "attrs", {}).get("coverage") or "")
     source = ""
     if "source" in frame.columns:
         source = str(frame["source"].iloc[0] or "")
+    warning = (f"ST 名单含 {cleaned} 条内容一致的重复代码，已清洗"
+               if cleaned else None)
     return StListSnapshot(available=True, stocks=stocks, coverage=coverage,
-                          source=source or "eastmoney")
+                          source=source or "eastmoney", warning=warning,
+                          state="ok", cleaned_duplicates=cleaned)
 
 
-def _fetch_st_list() -> StListSnapshot:
+def _fetch_st_list(allow_clean: bool = False) -> StListSnapshot:
     from stock_analysis.data_sources import _astock_generated as _g
 
     frame = _g.st_stock_list()
-    return _snapshot_from_frame(frame)
+    return _snapshot_from_frame(frame, allow_clean=allow_clean)
+
+
+def _st_list_warning(kind: str, reason: str, cached: Optional[dict],
+                     retried: bool) -> str:
+    """空表 / 重复 / 失败的统一告警文案。
+
+    空表与失败**绝不**写成「今日无 ST」；回退缓存必须写明缓存日期与
+    ``stale=true``。
+    """
+    label = {
+        "empty": "ST 名单为空（可疑）",
+        "duplicate": "ST 名单代码重复（可疑）",
+        "failed": "ST 名单接口失败",
+    }.get(kind, "ST 名单接口异常")
+    retry_note = "，已重试 1 次仍异常" if retried else ""
+    if cached:
+        date = (str(cached.get("fetched_at") or "")
+                or str(cached.get("session_date") or "") or "未知日期")
+        coverage = str(cached.get("coverage") or "") or "未知"
+        return (f"{label}{retry_note}（{reason}），回退到 {date} 的本地缓存"
+                f"（覆盖 {coverage}，stale=true，可能过时；不能据此确认名单最新）")
+    if kind == "empty":
+        return (f"{label}{retry_note}（{reason}）：接口返回 0 条，不能当成"
+                "「今日没有 ST」，is_st 只能依据实时报价/本地名称判断")
+    if kind == "duplicate":
+        return (f"{label}{retry_note}（{reason}）：名单不能当成完整快照，"
+                "is_st 只能依据实时报价/本地名称判断")
+    return (f"{label}（{reason}）{retry_note}，且无本地缓存："
+            "is_st 只能依据实时报价名称判断")
 
 
 def get_st_list(now: Optional[_dt.datetime] = None,
                 force: bool = False) -> StListSnapshot:
-    """东财 ST 名单（1 个交易日短缓存；失败回退旧缓存，绝不中断主流程）。"""
+    """东财 ST 名单（1 个交易日短缓存；失败回退旧缓存，绝不中断主流程）。
+
+    issue #106 三态：``state='ok'``（名单正常）/ ``'empty'``（空表，可疑）/
+    ``'failed'``（请求失败，含 ``'duplicate'`` 重复代码异常）。空表与失败都会
+    写明确 warning，且**不会**被当成「今日无 ST」。
+    """
     now = now or _dt.datetime.now()
     key = (_snapshot_session_date(now).isoformat(), _offline())
     if not force and key in _ST_MEMO:
@@ -258,25 +354,50 @@ def get_st_list(now: Optional[_dt.datetime] = None,
         snapshot = _snapshot_from_payload(cached)
     elif _offline():
         # 显式离线：能用旧缓存就用，不触网；没有则返回不可用（由调用方降级）。
-        snapshot = (_snapshot_from_payload(cached, degraded=True) if cached
-                    else StListSnapshot(available=False, source="offline"))
+        snapshot = (_snapshot_from_payload(
+                        cached, degraded=True, state="offline", stale=True,
+                        warning=(f"显式离线（{OFFLINE_ENV}=1），使用 "
+                                 f"{cached.get('fetched_at') or '未知日期'} 的"
+                                 "本地 ST 名单缓存（stale=true，可能过时）"))
+                    if cached
+                    else StListSnapshot(available=False, source="offline",
+                                        state="offline",
+                                        warning="显式离线：未请求 ST 名单"))
     else:
-        try:
-            snapshot = _fetch_st_list()
-            _write_disk_cache(snapshot, now)
-        except Exception as exc:
-            reason = f"{type(exc).__name__}: {exc}"
+        snapshot = None
+        last_exc: Optional[BaseException] = None
+        kind = "failed"
+        retried = False
+        for attempt in range(1 + ST_LIST_RETRY):
+            try:
+                snapshot = _fetch_st_list(allow_clean=(attempt > 0))
+                if attempt > 0:
+                    retried = True
+                    snapshot.retried = True
+                break
+            except Exception as exc:  # 网络 / 空表 / 重复代码
+                last_exc = exc
+                kind = _st_failure_kind(exc)
+                # 只有「名单本身可疑」（空表 / 重复代码）才重试一次；
+                # 网络失败不额外重试，避免放大限流压力。
+                if attempt < ST_LIST_RETRY and kind in ("empty", "duplicate"):
+                    retried = True
+                    continue
+                break
+        if snapshot is None:
+            reason = f"{type(last_exc).__name__}: {last_exc}"
+            warning = _st_list_warning(kind, reason, cached, retried)
             if cached:
                 snapshot = _snapshot_from_payload(
-                    cached, degraded=True,
-                    warning=(f"ST 名单接口失败（{reason}），回退到 "
-                             f"{cached.get('fetched_at')} 的缓存"
-                             f"（覆盖 {cached.get('coverage') or '未知'}，可能过时）"))
+                    cached, degraded=True, warning=warning, state=kind,
+                    stale=True)
+                snapshot.retried = retried
             else:
                 snapshot = StListSnapshot(
-                    available=False, source="unavailable",
-                    warning=(f"ST 名单接口失败（{reason}），且无本地缓存："
-                             "is_st 只能依据实时报价名称判断"))
+                    available=False, source="unavailable", state=kind,
+                    warning=warning, retried=retried)
+        else:
+            _write_disk_cache(snapshot, now)
 
     _ST_MEMO[key] = snapshot
     return snapshot
@@ -293,6 +414,9 @@ def reset_cache() -> None:
 @dataclass
 class TradingStatus:
     is_st: Optional[bool] = None
+    # issue #106 additive：ST 判定来源（exchange_list / quote_name /
+    # local_name / unavailable）。渲染层据此措辞，不得把 unavailable 写成「非 ST」。
+    is_st_source: str = "unavailable"
     is_suspended: Optional[bool] = None
     limit_up: Optional[float] = None
     limit_down: Optional[float] = None
@@ -389,30 +513,71 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
     status_source_parts.extend(sources)
 
     # ---- ST ---------------------------------------------------------------
-    # 解析优先级（issue #17 验收退回）：
+    # 解析优先级（issue #17 验收退回；issue #106 增加来源标注与冲突保守）：
     #   ① ST 名单可用 → 权威 True/False；名称带 ST 而名单未含 → True + 冲突 warning
     #   ② 腾讯报价可用 → 按报价名称前缀判断（ST → True，否则 False）
     #   ③ 报价不可用、传入 name 可用 → 名称含 ST → True + 「仅依据名称」warning；
     #      否则 → None + 「is_st 未知」warning（绝不把未知伪装成 False）
     #   ④ 全部不可用 → None + warning
     is_st: Optional[bool] = None
+    is_st_source = "unavailable"
     quote_name = str(quote.get("name") or "").strip() if quote_ok else ""
     provided_name = str(name or "").strip()
     # get_stock_name 取数失败时会把代码本身当名称返回；代码不是可用名称。
     name_usable = bool(provided_name) and provided_name != str(code).strip()
-    effective_name = quote_name or (provided_name if name_usable else "")
     echo_name = quote_name or provided_name
+
+    quote_says_st = bool(quote_name) and _looks_st(quote_name)
+    local_says_st = name_usable and _looks_st(provided_name)
+    name_st_sources = []
+    if quote_says_st:
+        name_st_sources.append("quote_name")
+    if local_says_st:
+        name_st_sources.append("local_name")
 
     if snapshot.available:
         is_st = code in snapshot.codes
-        if not is_st and _looks_st(effective_name):
-            warnings.append(
-                "ST 名单与名称不一致（名单未含该代码，名称带 ST 前缀）：按 ST 处理")
+        is_st_source = "exchange_list"
+        if not is_st and name_st_sources:
+            # 名单说「不是 ST」、名称说「是 ST」→ 取保守的一方并告警。
             is_st = True
+            is_st_source = name_st_sources[0]
+            which = "实时报价" if is_st_source == "quote_name" else "本地"
+            warnings.append(
+                f"ST 名单与名称不一致（名单未含该代码，{which}名称带 ST 前缀）："
+                "按 ST 保守处理")
+        elif is_st and quote_name and not quote_says_st:
+            warnings.append(
+                "ST 名单与实时报价名称不一致（名单含该代码，报价名称未带 ST "
+                "前缀）：以名单为准，仍按 ST 处理")
+    elif quote_ok and quote_name:
+        is_st = quote_says_st
+        is_st_source = "quote_name"
+        if not is_st and local_says_st:
+            # 报价名称说「不是 ST」、本地名称说「是 ST」→ 同样取保守的一方。
+            is_st = True
+            is_st_source = "local_name"
+            warnings.append(
+                "实时报价名称与本地名称不一致（报价名称不含 ST，本地名称带 ST "
+                "前缀）：按 ST 保守处理")
+    elif quote_ok and name_usable:
+        # 报价可用但名称为空：不能用空名称冒充「非 ST」，退回本地名称。
+        is_st_source = "local_name"
+        if local_says_st:
+            is_st = True
+            warnings.append(
+                f"仅依据名称判断 ST（ST 名单与实时报价名称均不可用）："
+                f"{provided_name}，无法交叉复核")
+        else:
+            warnings.append(
+                f"is_st 未知（名称 {provided_name} 不含 ST 标记，但 ST 名单与"
+                "实时报价名称均不可用，不能据此确认非 ST）")
     elif quote_ok:
-        is_st = _looks_st(effective_name)
+        warnings.append(
+            "is_st 未知：ST 名单、实时报价名称与本地名称均不可用，无法判断是否 ST")
     elif name_usable:
-        if _looks_st(provided_name):
+        is_st_source = "local_name"
+        if local_says_st:
             is_st = True
             warnings.append(
                 f"仅依据名称判断 ST（ST 名单与实时报价均不可用）：{provided_name}，"
@@ -494,6 +659,7 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
     status_source = "+".join(dict.fromkeys(status_source_parts)) or "unavailable"
     return TradingStatus(
         is_st=is_st,
+        is_st_source=is_st_source,
         is_suspended=is_suspended,
         limit_up=limit_up,
         limit_down=limit_down,

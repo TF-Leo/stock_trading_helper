@@ -525,6 +525,10 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'board': board,
             'price_limit_pct': price_limit_pct,
             'is_st': is_st,
+            # issue #106 additive：ST 判定来源（exchange_list / quote_name /
+            # local_name / unavailable）。渲染层据 unavailable 显示「ST 状态未知」。
+            'is_st_source': ('unavailable' if trading is None
+                             else trading.is_st_source),
             # P0-3 additive：真实交易状态（未知显式 null，不伪装成 False）
             'is_suspended': None if trading is None else trading.is_suspended,
             'limit_up': None if trading is None else trading.limit_up,

@@ -92,7 +92,7 @@
 | §1.2 腾讯 K 线（三入口） | `data_sources/astock.py::fetch_daily`、渠道池备胎 | ✅ 已接 |
 | §12.4 官方交易日历 | `data.status` 的 `expected_source='calendar_cache'`（实测） | ✅ 已接 |
 | §1.1 腾讯报价（涨跌停/`is_stale`/名称） | `data_loader/status.py` → `instrument.*` | ✅ 已接，**建议未消费** |
-| §6.8 ST 名单 | 同上 | ⚠️ 已接但**当天是坏的**（实测 warning：「ST 名单为空或代码重复…`is_st` 只能依据实时报价名称判断」），建议里看不出降级 |
+| §6.8 ST 名单 | 同上；issue #106 三态/重试/缓存/`instrument.is_st_source` | ✅ 已接，**三态与来源可见**（空表/失败不再当成「无 ST」） |
 | §6.5 baostock 估值历史 | `data_loader/valuation.py` + `tools/precompute_valuation.py`（18:40） | ✅ 已接，**建议未消费**；`baostock` **未写进 `source/requirements.txt`**（可选预计算依赖） |
 | §4.5 个股资金流 120 日 + 新浪备胎 | `data_loader/flow.py` + `tools/precompute_flow.py`（18:30） | ✅ 已接，**建议未消费** |
 | §12.1/12.2 指数 regime（沪深 300） | `market_regime.index`（`source='tencent_index:sh000300'`） | ✅ 已接，**建议未消费** |

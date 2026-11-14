@@ -1,5 +1,35 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-15 · issue #106 ST 名单三态 / 重试 / 缓存回退 / 来源标注
+
+- **分支**：`task/st-list-robust`（父 = `origin/main` `ab7d435`）；未改 `source/decision/*`
+  的决策表（仅给 `Instrument` dataclass 补一个 additive 字段），未引入依赖。
+- **三态**：`StListSnapshot.state` 新增 `ok` / `empty`（可疑空表）/ `duplicate`
+  （可疑重复代码）/ `failed`（请求失败）/ `offline`。空表与失败各有明确
+  warning；空表文案写明「接口返回 0 条，不能当成今日没有 ST」。
+- **重试与备胎**：空表 / 重复代码先**重试一次**（网络失败不重试，避免放大限流）；
+  仍异常则回退本地缓存，`stale=true` 且 warning 写明缓存日期与覆盖率。内容
+  一致的重复代码在第二次尝试清洗（计数 + warning），内容冲突则继续报错。
+- **来源标注**：`instrument.is_st_source`（additive）取值
+  `exchange_list` / `quote_name` / `local_name` / `unavailable`；错误响应与成功
+  响应键同构。渲染层 `is_st_source=unavailable` 输出「ST 状态未知」，不写「非 ST」。
+- **冲突取保守**：名单说非 ST 而任一名称说 ST（含「报价名称说非 ST、本地名称说
+  ST」这一旧实现会漏掉的组合）→ `is_st=true` + warning；名单说 ST 而报价名称
+  非 ST → 以名单为准并 warning。
+- **证据（本机 Linux，`~/.venv`）**：
+  - `pytest tests/ -q` → **991 passed, 1 failed**；唯一失败
+    `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    是父 commit 基线就存在的解释器版本不符（akshare/requests/numpy/pandas/pytest），
+    与本改动无关。
+  - 新增 16 项 `test_trading_status.py`（三态 / 重试 / 缓存日期+stale / 重复清洗 /
+    四种来源 / 三向冲突 / 空报价名）与 4 项渲染措辞断言。
+  - `tests/test_advice_render.py` 的 `cli_json_structure.golden.json` 同步
+    additive 键 `instrument.is_st_source`。
+- **未验证**：本机无 `pwsh`，`tools/check_gates.ps1` 未执行；真实东财端点未触网
+  实测（测试全离线，按约束不引入外部波动）。
+- **跳过项**：官方风险警示名单备胎 —— 仓库内没有现成官方源（§6.8 已是东财风险
+  警示板），按 brief「若仓库已有则复用」记为不新增。
+
 ## 2026-11-14 · issue #99 台账结算三项残留（basis 文案 / 无缓存钉 stock / fixture 措辞）
 
 - **分支**：`task/ledger-residuals`（父 = `origin/main` `0722fec`）；**未改

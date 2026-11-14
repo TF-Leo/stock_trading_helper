@@ -108,6 +108,7 @@ python cli.py 600519 --start 20200101 --json
     "board": "sh_main",
     "price_limit_pct": 0.10,
     "is_st": false,
+    "is_st_source": "exchange_list",
     "is_suspended": false,
     "limit_up": 1542.53,
     "limit_down": 1262.07,
@@ -310,6 +311,7 @@ python cli.py 600519 --start 20200101 --json
 - **board**: 板块（"sh_main"/"sh_star"/"sz_main"/"sz_gem"/"bj"/"fund"/"unknown"）
 - **price_limit_pct**: 涨跌停幅度（0.10 表示 10%）。有实时报价时以腾讯 `limit_up/last_close` 推算为准；否则按板块静态规则（主板 10%、创业板/科创板 20%、北交所 30%）。**2026-07-06 起沪深主板 ST/*ST 已由 5% 并轨为 10%**（交易所《交易规则（2026 年修订）》），故不再对主板 ST 做 5% 修正；创业板/科创板 ST 仍 20%，北交所 ST 30%
 - **is_st**: 是否 ST/*ST（**真实值**：东财 §6.8 当日名单优先，其次腾讯报价名称前缀；两者都不可用时，若本地名称带 ST 前缀则判 `true` 并在 `diagnostics.warnings` 注明「仅依据名称」，否则为 `null`，不再默认 `false`）
+- **is_st_source**: `is_st` 的判定来源（issue #106 additive）：`exchange_list`（交易所/东财 ST 名单）、`quote_name`（腾讯实时报价名称）、`local_name`（本地名称）、`unavailable`（三者都不可用，`is_st` 为 `null`）。名单与名称冲突时按「是 ST」保守处理并告警；**`unavailable` 只表示未知，渲染层写「ST 状态未知」，绝不显示成「非 ST」**
 - **is_suspended**: 是否停牌。判据是「交易日 10:00 后 / 已收盘 / 非交易日」腾讯报价定格（`is_stale=true` 且当日成交量为 0）；**盘前（<10:00）返回 `null`**，不把集合竞价前的正常定格误判为停牌
 - **limit_up / limit_down**: 腾讯实时快照给出的当日涨停价 / 跌停价（元）；报价不可用时为 `null`
 - **quote_stale**: 腾讯报价是否定格（`is_stale`）。**它本身不等于停牌**，只是"报价非当日真实成交"的信号
@@ -337,8 +339,11 @@ python cli.py 600519 --start 20200101 --json
 > 只拦截"今天这笔成交不了"的场景。
 >
 > ST 名单由东财 §6.8 提供，经上游 `em_get()` 串行限流（最小间隔 1s + 抖动）；
-> 本地短缓存 1 个交易日（`source/stock_analysis/data/status/`，已 gitignore），
-> 接口失败（含 429）回退旧缓存并 warning，不阻断主流程。本项目不引入 baostock。
+> 本地短缓存 1 个交易日（`source/stock_analysis/data/status/`，已 gitignore）。
+> issue #106 起区分三态：名单正常 / **名单为空（可疑）** / 请求失败。空表或
+> 重复代码会先重试一次；仍异常则回退本地缓存（warning 写明缓存日期与
+> `stale=true`），无缓存时 `is_st_source=unavailable`。**空表绝不等同于
+> 「今日没有 ST」**；接口失败回退旧缓存并 warning，不阻断主流程。本项目不引入 baostock。
 
 ### data
 - **bars**: 实际参与回测的 K 线根数（受 `--start` 截取影响）
@@ -927,7 +932,7 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
   "schema_version": "1.0",
   "generated_at": "2026-10-18T10:34:33.471955",
   "request": { "code": "600519", "type": "stock", "type_hint": "auto", "start": null, "opt": "grid", "jobs": 1, "fast": true },
-  "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false, "is_suspended": false, "limit_up": 1542.53, "limit_down": 1262.07, "quote_stale": false, "one_word_limit": null, "status_source": "tencent_quote" },
+  "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false, "is_st_source": "quote_name", "is_suspended": false, "limit_up": 1542.53, "limit_down": 1262.07, "quote_stale": false, "one_word_limit": null, "status_source": "tencent_quote" },
   "data": { "bars": 1643, "start": "2020-01-02 00:00:00", "end": "2026-10-16 00:00:00", "last_close": 1329.0, "source": "cache", "from_cache": true, "stale": false, "cache_last_date": "2026-10-16", "lag_days": 0, "expected_date": "2026-10-16", "requested_source": "sina", "window_note": null },
   "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility", "index": { "label": "Shock", "confidence": 0.5, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility", "source": "tencent_index:sh000300", "bars": 1662 } },
   "recommendation": {
