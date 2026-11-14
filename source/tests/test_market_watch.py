@@ -4,14 +4,15 @@
 覆盖：
 * 解析：命中 / 未命中 / **北交所 ``MARKET="B"`` → ``BJ`` 而非 ``SZ``** /
   未知市场值原样带出 / 字段不合法抛错（绝不静默跳过）；
-* 空结果与「接口坏了」分开：``[]`` 合法，非 2xx / 非 JSON / 非列表抛
-  :class:`MarketWatchError`；
+* 空结果与「接口坏了」分开：``[]`` 是**唯一合法**的空池；``null``（HTTP 200
+  但 body 为空）/ 非 2xx / 非 JSON / 非列表抛 :class:`MarketWatchError`；
 * 缓存：当日有效 → **请求次数 1**；第二次 0 次；接口失败回退旧缓存并
-  ``stale=True``；失败且无缓存 → ``available=False``；
+  ``stale=True``；失败且无可用缓存 → ``available=False``；**缓存损坏 ≠ 请求
+  失败** —— 坏缓存被忽略并重新请求一次，warning 分开写「缓存损坏」；
 * CLI：``evidence.market_watch`` additive、键同构（G35 错误路径）、
   ``diagnostics.warnings`` 在不可用/过期时给原因、A/B 不改 ``recommendation``；
-* 渲染：命中行位置（闸门之后、建议行之前）、未命中/不可用/过期整行消失、
-  不改写 ``action`` / ``confidence``；
+* 渲染：命中行位置（闸门之后、建议行之前）、未命中/不可用整行消失、
+  **``stale=True`` 且有命中时照常出行**（P2-2）、不改写 ``action`` / ``confidence``；
 * 端到端：人为注入命中 → CLI JSON → 渲染输出，证明链路不是死代码。
 
 所有网络入口在本文件里都被打桩；用例默认 ``ASTOCK_MARKET_WATCH_OFFLINE=1``
@@ -68,6 +69,10 @@ def _pool_rows():
     ]
 
 
+#: ``_Counter(payload=...)`` 的哨兵：区分「没传」与「显式传 None（body=null）」。
+_UNSET = object()
+
+
 class _FakeResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload
@@ -80,11 +85,15 @@ class _FakeResponse:
 
 
 class _Counter:
-    """统计 ``em_get`` 调用次数（T6 的核心断言：一次请求服务全池）。"""
+    """统计 ``em_get`` 调用次数（T6 的核心断言：一次请求服务全池）。
 
-    def __init__(self, payload=None, error=None, status_code=200):
+    ``payload`` 用哨兵默认值：显式传 ``None`` 表示「接口返回 body=null」，
+    不能和「没传、用默认池」混为一谈。
+    """
+
+    def __init__(self, payload=_UNSET, error=None, status_code=200):
         self.calls = []
-        self.payload = payload if payload is not None else _pool_rows()
+        self.payload = _pool_rows() if payload is _UNSET else payload
         self.error = error
         self.status_code = status_code
 
@@ -160,14 +169,56 @@ def test_parse_invalid_row_raises(row, needle):
 # ---------------------------------------------------------------------------
 # 2) 空结果 ≠ 接口坏了
 # ---------------------------------------------------------------------------
-def test_empty_list_is_a_legal_empty_pool(monkeypatch):
+def test_empty_list_is_a_legal_empty_pool(monkeypatch, tmp_path):
     counter = _Counter(payload=[])
     monkeypatch.setattr(mw, "_http_get", counter)
     mw.reset_cache()
-    snapshot = mw.load_pool(now=NOW, state_dir=None, allow_network=True)
+    snapshot = mw.load_pool(now=NOW, state_dir=_state(tmp_path), allow_network=True)
     assert snapshot.available is True
     assert snapshot.entries == {}
     assert snapshot.error is None
+
+
+def test_null_body_is_not_an_empty_pool(monkeypatch, tmp_path):
+    """HTTP 200 + body ``null`` 是失败，**不是**「全市场 0 条」（P2-1）。
+
+    README 契约：「非列表一律抛错」。``[]`` 与 ``null`` 必须可区分 ——
+    把 ``null`` 读成空池，正是「接口坏了」被静默当成「今天没人被监控」。
+    """
+    counter = _Counter(payload=None)
+    monkeypatch.setattr(mw, "_http_get", counter)
+    mw.reset_cache()
+    with pytest.raises(mw.MarketWatchError) as exc:
+        mw.fetch_pool()
+    assert "null" in str(exc.value)
+
+    # 端到端：null 不得产出 available=true 的空池
+    state = _state(tmp_path)
+    snapshot = mw.load_pool(now=NOW, state_dir=state, allow_network=True)
+    assert snapshot.available is False
+    assert snapshot.error and "null" in snapshot.error
+    assert not Path(mw.cache_path(state)).exists(), "失败结果不得写缓存"
+
+
+def test_empty_list_and_null_differ_end_to_end(monkeypatch, tmp_path):
+    """``[]`` → available=true / 无 warning；``null`` → available=false / 有 warning。"""
+    # 两半各用独立状态目录：``[]`` 那次会写当日缓存，共用目录会让第二次读缓存，
+    # 测不到 ``null`` 的取数路径。
+    monkeypatch.setattr(mw, "_http_get", _Counter(payload=[]))
+    mw.reset_cache()
+    empty_block, empty_notes = mw.market_watch_evidence(
+        HIT_CODE, now=NOW, state_dir=_state(tmp_path / "empty"), allow_network=True)
+    assert empty_block["available"] is True
+    assert empty_block["hit"] is None
+    assert empty_notes == []
+
+    monkeypatch.setattr(mw, "_http_get", _Counter(payload=None))
+    mw.reset_cache()
+    null_block, null_notes = mw.market_watch_evidence(
+        HIT_CODE, now=NOW, state_dir=_state(tmp_path / "null"), allow_network=True)
+    assert null_block["available"] is False
+    assert null_block["hit"] is None
+    assert any("监控池不可用" in note for note in null_notes)
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -175,6 +226,7 @@ def test_empty_list_is_a_legal_empty_pool(monkeypatch):
     {"status_code": 500},
     {"payload": ValueError("not json")},
     {"payload": {"unexpected": "object"}},
+    {"payload": None},
 ])
 def test_broken_endpoint_raises_not_empty(monkeypatch, kwargs):
     counter = _Counter(**kwargs)
@@ -284,6 +336,112 @@ def test_corrupt_cache_is_treated_as_missing(monkeypatch, tmp_path):
 
     snapshot = mw.load_pool(now=NOW, state_dir=state, allow_network=True)
     assert snapshot.available is False
+
+
+@pytest.mark.parametrize("payload", [
+    "{not json",                                              # JSON 坏
+    "[]",                                                     # 顶层不是对象
+    json.dumps({"schema": 99, "entries": []}),                # schema 不符
+    json.dumps({"schema": 1, "entries": "nope"}),             # entries 非列表
+    json.dumps({"schema": 1, "count": 1,
+                "entries": [{"code": "600000"}]}),            # 条目缺日期
+    json.dumps({"schema": 1, "count": 5, "entries": []}),     # count 不一致
+])
+def test_corrupt_cache_is_ignored_and_refetched(monkeypatch, tmp_path, payload):
+    """坏缓存**不等于**请求失败：忽略坏缓存并重新请求一次（P3-1）。"""
+    state = _state(tmp_path)
+    path = Path(mw.cache_path(state))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+
+    counter = _Counter()  # 接口本身正常
+    monkeypatch.setattr(mw, "_http_get", counter)
+    mw.reset_cache()
+
+    snapshot = mw.load_pool(now=NOW, state_dir=state, allow_network=True)
+    assert len(counter.calls) == 1, "坏缓存必须触发一次重新请求"
+    assert snapshot.available is True
+    assert snapshot.stale is False, "坏缓存不得被当作旧缓存回退"
+    assert snapshot.cache_problem and snapshot.cache_problem.startswith("corrupt:")
+    # 新数据已经覆盖坏缓存
+    assert json.loads(path.read_text(encoding="utf-8"))["count"] == 3
+
+
+def test_corrupt_cache_warning_says_cache_not_fetch_failure(monkeypatch, tmp_path):
+    """缓存坏了 + 接口也失败：两条原因必须分开写，不能只报「请求失败」。"""
+    state = _state(tmp_path)
+    path = Path(mw.cache_path(state))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    counter = _Counter(error=ConnectionError("rst"))
+    monkeypatch.setattr(mw, "_http_get", counter)
+    mw.reset_cache()
+
+    snapshot = mw.load_pool(now=NOW, state_dir=state, allow_network=True)
+    assert snapshot.available is False
+    assert len(counter.calls) == 1, "坏缓存必须触发一次重新请求（不是直接放弃）"
+
+    block, notes = mw.market_watch_evidence(HIT_CODE, now=NOW, state_dir=state,
+                                            allow_network=True)
+    assert block["available"] is False
+    corrupt_notes = [n for n in notes if "缓存损坏" in n]
+    assert corrupt_notes, notes
+    assert "已忽略坏缓存并重新请求" in corrupt_notes[0]
+    # 不可用 warning 里同时保留真正的请求失败原因
+    unavailable = [n for n in notes if "监控池不可用" in n]
+    assert unavailable and "ConnectionError" in unavailable[0]
+
+
+def test_missing_cache_has_no_cache_problem(monkeypatch, tmp_path):
+    """冷启动（无缓存文件）不是「缓存损坏」，不得报缓存告警。"""
+    counter = _Counter()
+    monkeypatch.setattr(mw, "_http_get", counter)
+    mw.reset_cache()
+
+    snapshot = mw.load_pool(now=NOW, state_dir=_state(tmp_path), allow_network=True)
+    assert snapshot.cache_problem is None
+    block, notes = mw.market_watch_evidence(HIT_CODE, now=NOW,
+                                            state_dir=_state(tmp_path),
+                                            allow_network=True)
+    assert not any("缓存损坏" in n for n in notes)
+
+
+def test_cache_with_zero_count_is_still_available(monkeypatch, tmp_path):
+    """合法空池（当日 ``[]``）写入的缓存 ``count=0``：回读必须仍是可用空池。
+
+    ``_snapshot_from_cache`` 现在不再用 ``count == 0`` 判断可用性，这里锁住
+    「合法空缓存不被误判为不可用」这一侧（P3-1 的改动没有反向破坏）。
+    """
+    state = _state(tmp_path)
+    mw.write_cache([], "2026-11-16T09:00:00", state_dir=state,
+                   session_date="2026-11-16")
+    counter = _Counter()
+    monkeypatch.setattr(mw, "_http_get", counter)
+    mw.reset_cache()
+
+    snapshot = mw.load_pool(now=NOW, state_dir=state, allow_network=True)
+    assert counter.calls == [], "当日空池缓存有效时不得再发请求"
+    assert snapshot.available is True
+    assert snapshot.entries == {}
+    assert snapshot.stale is False
+    assert snapshot.cache_problem is None
+
+
+def test_read_cache_checked_distinguishes_states(tmp_path):
+    """``read_cache_checked`` 三态：可用 / 缺失 / 损坏。"""
+    state = _state(tmp_path)
+    payload, problem = mw.read_cache_checked(state)
+    assert payload is None and problem == mw.CACHE_MISSING
+
+    mw.write_cache(list(mw.parse_pool(_pool_rows()).values()),
+                   "2026-11-16T09:00:00", state_dir=state, session_date="2026-11-16")
+    payload, problem = mw.read_cache_checked(state)
+    assert problem is None and payload["session_date"] == "2026-11-16"
+
+    Path(mw.cache_path(state)).write_text("{not json", encoding="utf-8")
+    payload, problem = mw.read_cache_checked(state)
+    assert payload is None and problem.startswith("corrupt:")
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +578,23 @@ def test_render_hit_line_disappears_when_unavailable():
 def test_render_hit_line_disappears_when_stale_without_hit():
     assert MARKET_WATCH_MARK not in render_advice(
         _payload(hit=False, available=True, stale=True))
+
+
+def test_render_hit_line_present_when_stale_with_hit():
+    """``stale=true`` 但有命中：照常出行，日期取该条目的生效窗口（P2-2）。
+
+    实现口径（docstring 已按实现改正）：``stale`` 只说明名单来自旧缓存，
+    不改变「是否命中」这一事实；命中是风险提示，宁可多报。
+    """
+    output = render_advice(_payload(hit=True, available=True, stale=True))
+    assert f"{MARKET_WATCH_MARK}（2026-11-16~2026-11-27）" in output
+
+
+def test_render_stale_hit_line_equals_fresh_hit_line():
+    """stale 与否只影响 JSON 的 ``stale`` 键，渲染行逐字节一致。"""
+    fresh = render_advice(_payload(hit=True, stale=False))
+    stale = render_advice(_payload(hit=True, stale=True))
+    assert fresh == stale
 
 
 def test_render_does_not_rewrite_action_or_confidence():

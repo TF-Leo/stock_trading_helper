@@ -43,11 +43,15 @@ LINK_URL           东财 App 详情页（可为空）
 --------------------------------------------------------------------------------
 * 盘前主路径最多 **1 次** 请求（``DEFAULT_TIMEOUT`` = 3s）；同一北京自然日内
   第二次及以后直接读缓存，**0 次** 请求。
-* 请求/解析失败 → 回退上一份缓存并标 ``stale=True``；**没有缓存**才
+* 请求/解析失败 → 回退上一份缓存并标 ``stale=True``；**没有可用缓存**才
   ``available=False``。
 * 空结果与接口坏了必须分开：接口返回 ``[]`` 是**合法**的「全市场 0 条」；
-  非 2xx / 非 JSON / 非列表 / 行字段不合法一律抛 :class:`MarketWatchError`，
-  **绝不返回空 dict 冒充「无监控」**。
+  ``null`` / 非列表 / 非 2xx / 非 JSON / 行字段不合法一律抛
+  :class:`MarketWatchError`，**绝不返回空 dict 冒充「无监控」**。
+* 缓存损坏（JSON 不可解析 / schema 不符 / ``entries`` 非列表 / 单条字段不合法 /
+  ``count`` 与条数不符）**不等于请求失败**：坏缓存一律忽略并**重新请求一次**，
+  失败原因在 ``PoolSnapshot.error`` 里写清「缓存损坏」与「请求失败」两件事，
+  不再把坏缓存误报成「接口请求失败」。
 
 本模块只服务「展示 / 风险提示」，不参与 ``action`` / ``confidence`` / 仓位 /
 触发器计算。CLI 侧见 :func:`market_watch_evidence`。
@@ -77,6 +81,7 @@ __all__ = [
     "market_watch_evidence",
     "parse_pool",
     "read_cache",
+    "read_cache_checked",
     "reset_cache",
     "with_market_watch_block",
     "write_cache",
@@ -187,8 +192,13 @@ def fetch_pool(timeout: float = DEFAULT_TIMEOUT) -> List[dict]:
     """拉取全市场监控池的**原始条目**（一次请求，不分页）。
 
     * 非 2xx → :class:`MarketWatchError`
-    * 响应不是 JSON / 不是列表 → :class:`MarketWatchError`
-    * 返回 ``[]`` 是**合法**结果（全市场 0 条），由调用方与「接口坏了」区分。
+    * 响应不是 JSON / 是 ``null`` / 不是列表 → :class:`MarketWatchError`
+    * 返回 ``[]`` 是**唯一合法**的空结果（全市场 0 条），由调用方与「接口坏了」区分。
+
+    ``null`` 不算空池：HTTP 200 + body ``null`` 是上游故障 / 降级页的常见形态，
+    把它读成「今天没有标的被监控」正是本模块要避免的静默失败（与 README
+    「非列表一律抛错」一致）。上游示例里的 ``r.json() or []`` 是**上游的**宽松写法，
+    这里不跟随。
     """
     try:
         response = _http_get(MONITOR_URL,
@@ -208,8 +218,9 @@ def fetch_pool(timeout: float = DEFAULT_TIMEOUT) -> List[dict]:
             f"监控池接口返回非 JSON（{type(exc).__name__}: {exc}）") from exc
 
     if payload is None:
-        # 上游写法 `r.json() or []`；显式 null 视为空列表（合法空结果）。
-        return []
+        # 只有 ``[]`` 才是真空池；``null`` 视为失败（P2-1）。
+        raise MarketWatchError(
+            "监控池接口返回 null（HTTP 200 但 body 为空，不是合法的空池）")
     if not isinstance(payload, list):
         raise MarketWatchError(
             f"监控池接口返回的不是列表（{type(payload).__name__}）")
@@ -274,20 +285,68 @@ def parse_pool(rows) -> Dict[str, dict]:
 # ---------------------------------------------------------------------------
 # 缓存
 # ---------------------------------------------------------------------------
-def read_cache(state_dir: Optional[str] = None) -> Optional[dict]:
-    """读缓存；不存在 / 不可解析 / schema 不符一律 ``None``（由调用方降级）。"""
+#: ``read_cache_checked`` 的第二返回值：缓存文件根本不存在（不是损坏）。
+CACHE_MISSING = "missing"
+
+
+def _valid_cached_entry(item) -> bool:
+    """缓存条目是否具备回放所需的最小字段（代码 6 位 + 起止日期）。"""
+    if not isinstance(item, dict):
+        return False
+    if not _CODE_RE.match(str(item.get("code") or "")):
+        return False
+    return all(_DATE_RE.match(str(item.get(key) or "")) for key in ("start", "end"))
+
+
+def read_cache_checked(state_dir: Optional[str] = None):
+    """读缓存**并校验**，返回 ``(payload, problem)``。
+
+    ``problem`` 三态，调用方据此区分「没有缓存」「缓存坏了」「缓存可用」：
+
+    * ``None`` —— 缓存可用（``payload`` 为 dict）；
+    * :data:`CACHE_MISSING` —— 文件不存在（正常冷启动，不需要告警）；
+    * ``"corrupt: <原因>"`` —— 文件存在但不可用（JSON 坏 / schema 不符 /
+      ``entries`` 非列表 / 单条字段不合法 / ``count`` 与条数不符）。
+
+    校验必须比 ``read_cache`` 严格：只检查「顶层是 dict + entries 是 list」会
+    放过「entries 里全是垃圾」的缓存，装载时条目被静默丢光，``available`` 变
+    ``False`` 而 ``error`` 为空 —— 调用方于是把**缓存损坏**报成「接口请求失败」
+    且不再重试（P3-1 的原始缺陷）。
+    """
     path = cache_path(state_dir)
+    if not os.path.exists(path):
+        return None, CACHE_MISSING
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"corrupt: JSON 不可解析（{type(exc).__name__}: {exc}）"
     if not isinstance(payload, dict):
-        return None
-    if int(payload.get("schema") or 0) != CACHE_SCHEMA:
-        return None
-    if not isinstance(payload.get("entries"), list):
-        return None
+        return None, f"corrupt: 顶层不是对象（{type(payload).__name__}）"
+    try:
+        schema = int(payload.get("schema") or 0)
+    except Exception:
+        return None, f"corrupt: schema 不是整数（{payload.get('schema')!r}）"
+    if schema != CACHE_SCHEMA:
+        return None, f"corrupt: schema={schema}，期望 {CACHE_SCHEMA}"
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return None, f"corrupt: entries 不是列表（{type(entries).__name__}）"
+    for index, item in enumerate(entries):
+        if not _valid_cached_entry(item):
+            return None, f"corrupt: 第 {index} 条缓存字段不合法"
+    count = payload.get("count")
+    if count is not None and int(count) != len(entries):
+        return None, f"corrupt: count={count} 与条数 {len(entries)} 不一致"
+    return payload, None
+
+
+def read_cache(state_dir: Optional[str] = None) -> Optional[dict]:
+    """读缓存；不存在 / 不可解析 / schema 不符一律 ``None``（由调用方降级）。
+
+    需要区分「没有缓存」与「缓存损坏」时用 :func:`read_cache_checked`。
+    """
+    payload, _problem = read_cache_checked(state_dir)
     return payload
 
 
@@ -327,13 +386,29 @@ def _parse_iso(text: Optional[str]) -> Optional[_dt.datetime]:
         return None
 
 
+def _join_reasons(*parts: Optional[str]) -> Optional[str]:
+    """把多条原因拼成一条（去空、去重、保持顺序）；全空时返回 ``None``。"""
+    seen = []
+    for part in parts:
+        text = str(part or "").strip()
+        if text and text not in seen:
+            seen.append(text)
+    return "；".join(seen) or None
+
+
 def _snapshot_from_cache(cached: dict, stale: bool, error: Optional[str]) -> "PoolSnapshot":
+    """缓存 → 快照。
+
+    ``available`` 只看**校验通过的条目**：``read_cache_checked`` 已经拒绝了
+    非法条目，因此这里不再用 ``count == 0`` 兜底 —— 否则「entries 全垃圾 +
+    count=0」会被当成合法的空池（P3-1 的静默失败路径）。
+    """
     entries = {}
     for item in cached.get("entries") or []:
         if isinstance(item, dict) and _CODE_RE.match(str(item.get("code") or "")):
             entries[str(item["code"])] = dict(item)
     return PoolSnapshot(
-        available=bool(entries) or cached.get("count") == 0,
+        available=True,
         stale=stale,
         as_of=cached.get("session_date"),
         entries=entries,
@@ -357,6 +432,10 @@ class PoolSnapshot:
     fetched_at: Optional[str] = None
     source: str = SOURCE
     error: Optional[str] = None
+    #: 本地缓存**损坏**时的原因（``"corrupt: ..."``）；缓存可用 / 不存在时为 ``None``。
+    #: 与 :attr:`error` 分开存，是为了让 warning 能明确区分「缓存坏了」与
+    #: 「接口请求失败」两件事，而不是把前者误报成后者（P3-1）。
+    cache_problem: Optional[str] = None
 
     def hit(self, code: Optional[str], on_date: Optional[str] = None) -> Optional[dict]:
         """``code`` 是否在监控池内；给了 ``on_date`` 还要求落在生效窗口内。
@@ -399,7 +478,13 @@ def load_pool(now: Optional[_dt.datetime] = None,
     if not force and key in _POOL_MEMO:
         return _POOL_MEMO[key]
 
-    cached = read_cache(state_dir)
+    cached, cache_problem = read_cache_checked(state_dir)
+    # 坏缓存 = 没有缓存：不能拿它当「旧缓存」回退，否则会把损坏当过期名单展示，
+    # 并且把「缓存坏了」误报成「接口请求失败」（P3-1）。
+    corrupt_note = None
+    if cache_problem not in (None, CACHE_MISSING):
+        corrupt_note = f"{REASON_TEXT['cache_invalid']}（{cache_problem}），已忽略并重新请求"
+        cached = None
     fresh = bool(cached and cached.get("session_date") == today)
 
     if fresh and not force:
@@ -412,7 +497,8 @@ def load_pool(now: Optional[_dt.datetime] = None,
                 error=f"{REASON_TEXT['offline']}；回退 {cached.get('session_date')} 的缓存")
         else:
             snapshot = PoolSnapshot(available=False, stale=False, as_of=None,
-                                    error=REASON_TEXT["offline"])
+                                    error=_join_reasons(corrupt_note,
+                                                        REASON_TEXT["offline"]))
     else:
         try:
             rows = fetch_pool(timeout=timeout)
@@ -426,20 +512,26 @@ def load_pool(now: Optional[_dt.datetime] = None,
             if cached:
                 snapshot = _snapshot_from_cache(
                     cached, stale=True,
-                    error=f"{exc}；回退 {cached.get('session_date')} 的缓存（可能过时）")
+                    error=_join_reasons(
+                        corrupt_note,
+                        f"{exc}；回退 {cached.get('session_date')} 的缓存（可能过时）"))
             else:
                 snapshot = PoolSnapshot(available=False, stale=False, as_of=None,
-                                        error=str(exc))
+                                        error=_join_reasons(corrupt_note, str(exc)))
         except Exception as exc:  # 兜底：绝不把异常读成「无监控」
             reason = f"{type(exc).__name__}: {exc}"
             if cached:
                 snapshot = _snapshot_from_cache(
                     cached, stale=True,
-                    error=f"{reason}；回退 {cached.get('session_date')} 的缓存（可能过时）")
+                    error=_join_reasons(
+                        corrupt_note,
+                        f"{reason}；回退 {cached.get('session_date')} 的缓存（可能过时）"))
             else:
                 snapshot = PoolSnapshot(available=False, stale=False, as_of=None,
-                                        error=reason)
+                                        error=_join_reasons(corrupt_note, reason))
 
+    if cache_problem not in (None, CACHE_MISSING):
+        snapshot.cache_problem = cache_problem
     _POOL_MEMO[key] = snapshot
     return snapshot
 
@@ -497,7 +589,7 @@ def with_market_watch_block(builder):
     return wrapped
 
 
-def market_watch_evidence(code, data_type: Optional[str] = None,
+def market_watch_evidence(code,
                           now: Optional[_dt.datetime] = None,
                           state_dir: Optional[str] = None,
                           timeout: float = DEFAULT_TIMEOUT,
@@ -506,9 +598,15 @@ def market_watch_evidence(code, data_type: Optional[str] = None,
                           as_of: Optional[str] = None):
     """CLI 接线：返回 ``(evidence.market_watch, warnings)``。
 
+    监控池是**全市场**名单，与标的类型（股票 / 基金）无关，因此本函数**没有**
+    ``data_type`` 参数 —— 曾经有过一个从不读取的 ``data_type`` 形参，会让调用方
+    以为口径按类型分化（P3-2 已删除）。
+
     * 命中 → ``hit={listed,start,end,reason}``；未命中 / 不可用 → ``hit=null``。
     * ``available=False``（无缓存且取数失败）或 ``stale=True``（回退旧缓存）
       各给一条可操作 warning，说明原因；两者都**不改**任何决策字段。
+    * 本地缓存损坏时**另给一条** warning，写明「缓存损坏」而不是「接口请求失败」，
+      并说明已忽略坏缓存、重新请求过（P3-1）。
     * ``as_of``（``--as-of`` 历史回放）时**不给命中**：监控池只有当前快照，
       没有历史版本，把今天的名单套到过去某天等于引入前视。此时只报
       ``available/stale/as_of``，并说明「回放不提供历史监控状态」。
@@ -534,6 +632,11 @@ def market_watch_evidence(code, data_type: Optional[str] = None,
             f"监控池命中（{shown}，{entry.get('start')}~{entry.get('end')}）"
             f"但为当前快照，--as-of {as_of} 回放不提供历史监控状态；"
             "只展示，不影响 action")
+
+    if snapshot.cache_problem:
+        notes.append(
+            f"监控池缓存损坏（{shown}）：{snapshot.cache_problem}；"
+            "已忽略坏缓存并重新请求，不影响 action")
 
     if not snapshot.available:
         reason = snapshot.error or REASON_TEXT["fetch_failed"]

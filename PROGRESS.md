@@ -1,5 +1,54 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-14 · PR #97 复验非阻塞项收口（2×P2 + 3×P3）
+
+- **分支**：`TF-Leo/fix-pr97`（父 = PR #97 head `c3756af`）；**未改
+  `source/decision/*`**，未引入依赖，`--json` 只做 additive（键集合不变）。
+- **P2-1 `null` ≠ 空池**：`fetch_pool()` 原先 `payload is None → return []`，
+  与 README「非列表一律抛错」矛盾，且 HTTP 200 + body `null`（上游降级页的
+  常见形态）会被读成「今天没人被监控」。现 `null` 抛 `MarketWatchError`，
+  **只有 `[]` 是真空池**；`test_empty_list_and_null_differ_end_to_end` 逐项
+  断言两条路径的 `available` / warnings 不同。
+- **P2-2 docstring 对齐实现**：`stale=true` 且有命中时**实现会出行**（日期取
+  条目生效窗口），旧 docstring 写「stale 不出行」。以实现为准（命中是风险
+  提示，宁可多报），改 `advice_render` 模块 docstring + `_market_watch_line`
+  docstring + README 两处，并补两条断言：`stale+hit` 出行、
+  `render(stale)==render(fresh)` 逐字节一致。**渲染行为零改动**。
+- **P3-1 缓存损坏 ≠ 请求失败**：新增 `read_cache_checked()` 三态
+  （可用 / `CACHE_MISSING` / `corrupt: <原因>`），校验严格到单条字段与
+  `count` 一致性；`load_pool` 遇坏缓存**忽略并重新请求一次**（旧实现只
+  「视为缺失」且不重取，warning 报成「接口请求失败」）。`PoolSnapshot`
+  新增 `cache_problem` 字段（dataclass 内部字段，**不进 CLI JSON**），
+  `market_watch_evidence` 单独输出一条「监控池缓存损坏…已忽略坏缓存并重新
+  请求」。同时修掉 `_snapshot_from_cache` 的 `count == 0` 兜底 —— 那会把
+  「entries 全垃圾 + count=0」读成合法空池。
+- **P3-2 死参数**：`market_watch_evidence(code, data_type=None, ...)` 的
+  `data_type` 从未被读取（监控池是全市场名单，与标类型无关）。选择**删除**
+  而非硬用：`cli.py` 调用点改为 `_market_watch_evidence(code, as_of=as_of)`，
+  docstring 写明「没有 `data_type` 参数」的理由。
+- **P3-3 `cli.py` 超限**：基线 761 行（G10 的 ≤700 在基线即红），PR #97 后
+  772。**做了最小拆分而非跳过**：纯函数块（`_jsonable` / `parse_pct` /
+  `build_parser` / `_parse_cli_date` / `_date_arg`）迁至新文件
+  `source/cli_args.py`，`cli.py` 保留同名 re-export，故
+  `tests/test_cli_date_args.py`、`tests/test_p3_bayes.py`、
+  `tools/probe.py`（含 `python cli.py --help` 真跑）零改动。
+  **`cli.py` 772 → 678 行，G10 由红转绿。** 模块**不放在 `decision/`**：
+  本任务约束「不改 `decision/*`」。
+- **证据（本机 Linux，无 pwsh；门禁脚本以 probe 为裁定器，probe 直接跑）**：
+  - `pytest tests/ -q` → **833 passed, 1 failed**；唯一失败
+    `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    是**基线就存在**的解释器版本不符（akshare 1.17.44 vs 1.18.29 等）。
+    基线为 818 passed / 同一条失败 → 净增 15 项（`test_market_watch.py`
+    38 → 53）。
+  - `python tools/probe.py all` → **39 PASS / 2 FAIL**：
+    `requirements`（同上，基线红）；`error_shape`（
+    `/instrument/one_word_limit` 缺失，**由父 commit #93 引入**，修复需改
+    `decision/*`，超出本次约束，**未处理**）。两者在改动前后逐字相同。
+  - 非回退项：`BJ` 映射、一次请求服务全池（`len(calls)==1`）、同日二次
+    0 请求、9 类失败构造、渲染行位置（闸门之后 / 价格行之前）全部沿用
+    原断言并继续通过。
+- **跳过项**：无。
+
 ## 2026-11-14 · issue #1 / R11 T6：全市场重点监控池（硬风险告警）
 
 - **分支**：`TF-Leo/market-watch`（父 `origin/main` = `c357b28`）；未改

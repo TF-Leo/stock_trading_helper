@@ -620,10 +620,14 @@ Referer: https://vipmoney.eastmoney.com/
    盘前主路径超时上限 **3s**。
 2. **当日有效**：缓存 `source/stock_analysis/data/state/market_watch.json`（`data/` 已 gitignore），
    记录 `fetched_at` 与原始条目。
-3. **失败 ≠ 无监控**：请求/解析失败 → 回退上一份缓存并标 `stale=true`；**无缓存**才
+3. **失败 ≠ 无监控**：请求/解析失败 → 回退上一份缓存并标 `stale=true`；**无可用缓存**才
    `available=false`。两种情况都在 `diagnostics.warnings` 给原因。
-4. **空结果与接口坏了分开**：接口返回 `[]` 是**合法**的「全市场 0 条」；
-   非 2xx / 非 JSON / 非列表 / 行字段不合法一律抛 `MarketWatchError`，绝不返回空 dict。
+4. **空结果与接口坏了分开**：接口返回 `[]` 是**唯一合法**的「全市场 0 条」；
+   `null`（HTTP 200 但 body 为空）/ 非列表 / 非 2xx / 非 JSON / 行字段不合法
+   一律抛 `MarketWatchError`，绝不返回空 dict。
+   **本地缓存损坏 ≠ 接口请求失败**：JSON 坏 / schema 不符 / `entries` 非列表 /
+   单条字段不合法 / `count` 与条数不符都视为「没有缓存」，忽略坏缓存并**重新请求
+   一次**，warnings 里单独写明「缓存损坏」而不是「接口请求失败」。
 5. **`--as-of` 回放不给命中**：监控池只有当前快照、没有历史版本，把今天的名单套到
    过去某天等于引入前视。回放时 `hit` 恒为 `null`，若当前确实命中会在 warnings 里
    显式说明「已抑制」，避免被误读成「那天没被监控」。
@@ -639,6 +643,8 @@ Referer: https://vipmoney.eastmoney.com/
 
 位置固定在**可执行性闸门之后、价格/建议行之前**；未命中 / `available=false` /
 无命中时过期，整行消失（不把「没取到」写成「没被监控」）。
+**`stale=true` 不抑制该行**：命中是风险提示，宁可多报；「名单截至哪天」看
+`as_of` 与 warnings，行内日期仍是该条目的生效窗口。
 离线开关：`ASTOCK_MARKET_WATCH_OFFLINE=1`（测试默认开启）；
 状态目录覆盖：`MARKET_WATCH_STATE_DIR`。
 
@@ -894,7 +900,8 @@ source/.venv/bin/python cli.py 600519 --json --fast \
 估值分位（T4）、资金流方向（T5），以及**交易所重点监控命中（T6）**——
 `evidence.market_watch.hit.listed is True` 时输出
 `🚫 交易所重点监控（{start}~{end}）`，位置在可执行性闸门之后、价格/建议行之前。
-未命中 / `available=false` / 无命中时过期，整行消失；该行**只陈述事实**，
+未命中 / `available=false` / 无命中时过期，整行消失；`stale=true` 时**照常输出**
+（命中宁可多报，名单时点看 `as_of` 与 warnings）；该行**只陈述事实**，
 不改写 `action` / `confidence`。
 
 ### `--compact` 契约：封闭词表替换 + 整段删除
