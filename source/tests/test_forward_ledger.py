@@ -632,15 +632,15 @@ def test_stock_corrupt_cache_does_not_fall_through_to_fund(
     """
     data_dir = tmp_path / "corrupt_data"
     days, opens = _bars_with_hand_math()
-    _write_bars(data_dir, "002415", days, opens)
-    _write_bars(data_dir, "002415", days, [p * 0.85 for p in opens],
-                name="fund_002415.csv")
-    (data_dir / "stock_002415_qfq.csv").write_bytes(b"\x00\xff\xfe binary junk\n")
+    _write_bars(data_dir, "600519", days, opens)
+    _write_bars(data_dir, "600519", days, [p * 0.85 for p in opens],
+                name="fund_600519.csv")
+    (data_dir / "stock_600519_qfq.csv").write_bytes(b"\x00\xff\xfe binary junk\n")
     monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
 
-    fl.record_day(["002415"], ledger_dir=ledger_tmp,
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
                   runner=_runner(_cli_payload(as_of="2026-11-02")))
-    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
     assert record["instrument_type"] == "stock"
     assert record["price_source"] == "local_qfq_cache"
 
@@ -648,7 +648,7 @@ def test_stock_corrupt_cache_does_not_fall_through_to_fund(
     assert stats["settled"] == 0, "损坏的 stock 缓存不得变成 settled"
     assert stats["failed"] == 1
     assert stats["failed_reasons"] == {"no_price_data": 1}
-    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
     assert record["settled"] is None
     assert record["settle_reason"] == "no_price_data"
     assert record["settle_status"] == "failed"
@@ -659,13 +659,13 @@ def test_stock_missing_cache_does_not_fall_through_to_fund(
     """个股缓存缺失（只剩 ``fund_*.csv``）→ ``failed``，同样不换源。"""
     data_dir = tmp_path / "missing_stock"
     days, opens = _bars_with_hand_math()
-    _write_bars(data_dir, "002415", days, [p * 0.85 for p in opens],
-                name="fund_002415.csv")
+    _write_bars(data_dir, "600519", days, [p * 0.85 for p in opens],
+                name="fund_600519.csv")
     monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
 
-    fl.record_day(["002415"], ledger_dir=ledger_tmp,
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
                   runner=_runner(_cli_payload(as_of="2026-11-02")))
-    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
     # 只有 fund_*.csv，但内容是交易所 OHLC（不是净值）→ 仍按 stock/qfq 记录，
     # 且**不**把它当成基金净值来源。
     assert record["price_source"] == "local_qfq_cache"
@@ -684,22 +684,22 @@ def test_instrument_type_not_taken_from_cli_request_type(ledger_tmp, tmp_path,
     """
     data_dir = tmp_path / "type_data"
     days, opens = _bars_with_hand_math()
-    _write_bars(data_dir, "002415", days, opens)
+    _write_bars(data_dir, "600519", days, opens)
     monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
 
     payload = _cli_payload(as_of="2026-11-02", type_hint="fund")
     payload["request"]["type"] = "fund"
-    fl.record_day(["002415"], ledger_dir=ledger_tmp, runner=_runner(payload))
+    fl.record_day(["600519"], ledger_dir=ledger_tmp, runner=_runner(payload))
 
-    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
     assert record["instrument_type"] == "stock"
     assert record["price_source"] == "local_qfq_cache"
     assert record["price_caliber"] == "qfq_open_to_open"
-    assert "stock_002415_qfq.csv" in record["instrument_basis"]
+    assert "stock_600519_qfq.csv" in record["instrument_basis"]
 
     stats = fl.settle_all(ledger_dir=ledger_tmp)
     assert stats["settled"] == 1
-    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
     assert record["settled"]["price_source"] == "local_qfq_cache"
     assert record["price_caliber"] == "qfq_open_to_open"
 
@@ -725,7 +725,7 @@ def test_settle_no_bars_after_as_of_is_pending(ledger_tmp):
     days = _bdays(date(2026, 11, 2), 3)
     frame = pd.DataFrame({"open": [10.0, 10.0, 10.0]},
                          index=pd.to_datetime([d.isoformat() for d in days]))
-    fl.record_day(["002415"], ledger_dir=ledger_tmp,
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
                   runner=_runner(_cli_payload(as_of="2026-11-02")))
     stats = fl.settle_all(ledger_dir=ledger_tmp,
                           price_loader=lambda _code: frame)
@@ -733,7 +733,7 @@ def test_settle_no_bars_after_as_of_is_pending(ledger_tmp):
     assert stats["failed"] == 0
     assert stats["settled"] == 0
     assert stats["reasons"] == {"no_bars_after_as_of": 1}
-    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
     assert record["settled"] is None
     assert record["settle_reason"] == "no_bars_after_as_of"
     assert record["settle_status"] == "pending"
@@ -796,10 +796,10 @@ def test_settle_stock_price_source_stays_local_qfq(ledger_tmp):
     days, opens = _bars_with_hand_math()
     frame = pd.DataFrame({"open": opens}, index=pd.to_datetime(
         [d.isoformat() for d in days]))
-    fl.record_day(["002415"], ledger_dir=ledger_tmp,
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
                   runner=_runner(_cli_payload(as_of="2026-11-02")))
     fl.settle_all(ledger_dir=ledger_tmp, price_loader=lambda _code: frame)
-    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
     assert record["instrument_type"] == "stock"
     assert record["settled"]["price_source"] == "local_qfq_cache"
 
@@ -857,7 +857,7 @@ def test_report_never_evaluated_records_are_pending_not_settled(ledger_tmp):
 
 def test_record_day_then_report_does_not_claim_settled(ledger_tmp):
     """真实记录路径同样不得在未 evaluate 时声称已结算。"""
-    fl.record_day(["002415"], ledger_dir=ledger_tmp,
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
                   runner=_runner(_cli_payload(as_of="2026-11-02")))
     report = fl.build_report(ledger_dir=ledger_tmp)
     assert report["matured"] == 0
@@ -1039,7 +1039,7 @@ def test_tool_evaluate_output_does_not_pair_zero_failed_with_reasons(
     frame = pd.DataFrame({"open": [10.0, 10.0, 10.0]},
                          index=pd.to_datetime([d.isoformat() for d in days]))
     monkeypatch.setattr(fl, "load_price_bars", lambda _code: frame)
-    tool.record(["002415"], ledger_dir=ledger_dir,
+    tool.record(["600519"], ledger_dir=ledger_dir,
                 runner=_runner(_cli_payload(as_of="2026-11-02")))
     capsys.readouterr()
     tool.evaluate(ledger_dir=ledger_dir)
