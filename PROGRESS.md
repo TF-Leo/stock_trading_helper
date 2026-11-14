@@ -1,5 +1,112 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-14 · PR #97 复验非阻塞项收口（2×P2 + 3×P3）
+
+- **分支**：`TF-Leo/fix-pr97`（父 = PR #97 head `c3756af`）；**未改
+  `source/decision/*`**，未引入依赖，`--json` 只做 additive（键集合不变）。
+- **P2-1 `null` ≠ 空池**：`fetch_pool()` 原先 `payload is None → return []`，
+  与 README「非列表一律抛错」矛盾，且 HTTP 200 + body `null`（上游降级页的
+  常见形态）会被读成「今天没人被监控」。现 `null` 抛 `MarketWatchError`，
+  **只有 `[]` 是真空池**；`test_empty_list_and_null_differ_end_to_end` 逐项
+  断言两条路径的 `available` / warnings 不同。
+- **P2-2 docstring 对齐实现**：`stale=true` 且有命中时**实现会出行**（日期取
+  条目生效窗口），旧 docstring 写「stale 不出行」。以实现为准（命中是风险
+  提示，宁可多报），改 `advice_render` 模块 docstring + `_market_watch_line`
+  docstring + README 两处，并补两条断言：`stale+hit` 出行、
+  `render(stale)==render(fresh)` 逐字节一致。**渲染行为零改动**。
+- **P3-1 缓存损坏 ≠ 请求失败**：新增 `read_cache_checked()` 三态
+  （可用 / `CACHE_MISSING` / `corrupt: <原因>`），校验严格到单条字段与
+  `count` 一致性；`load_pool` 遇坏缓存**忽略并重新请求一次**（旧实现只
+  「视为缺失」且不重取，warning 报成「接口请求失败」）。`PoolSnapshot`
+  新增 `cache_problem` 字段（dataclass 内部字段，**不进 CLI JSON**），
+  `market_watch_evidence` 单独输出一条「监控池缓存损坏…已忽略坏缓存并重新
+  请求」。同时修掉 `_snapshot_from_cache` 的 `count == 0` 兜底 —— 那会把
+  「entries 全垃圾 + count=0」读成合法空池。
+- **P3-2 死参数**：`market_watch_evidence(code, data_type=None, ...)` 的
+  `data_type` 从未被读取（监控池是全市场名单，与标类型无关）。选择**删除**
+  而非硬用：`cli.py` 调用点改为 `_market_watch_evidence(code, as_of=as_of)`，
+  docstring 写明「没有 `data_type` 参数」的理由。
+- **P3-3 `cli.py` 超限**：基线 761 行（G10 的 ≤700 在基线即红），PR #97 后
+  772。**做了最小拆分而非跳过**：纯函数块（`_jsonable` / `parse_pct` /
+  `build_parser` / `_parse_cli_date` / `_date_arg`）迁至新文件
+  `source/cli_args.py`，`cli.py` 保留同名 re-export，故
+  `tests/test_cli_date_args.py`、`tests/test_p3_bayes.py`、
+  `tools/probe.py`（含 `python cli.py --help` 真跑）零改动。
+  **`cli.py` 772 → 678 行，G10 由红转绿。** 模块**不放在 `decision/`**：
+  本任务约束「不改 `decision/*`」。
+- **证据（本机 Linux，无 pwsh；门禁脚本以 probe 为裁定器，probe 直接跑）**：
+  - `pytest tests/ -q` → **833 passed, 1 failed**；唯一失败
+    `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    是**基线就存在**的解释器版本不符（akshare 1.17.44 vs 1.18.29 等）。
+    基线为 818 passed / 同一条失败 → 净增 15 项（`test_market_watch.py`
+    38 → 53）。
+  - `python tools/probe.py all` → **39 PASS / 2 FAIL**：
+    `requirements`（同上，基线红）；`error_shape`（
+    `/instrument/one_word_limit` 缺失，**由父 commit #93 引入**，修复需改
+    `decision/*`，超出本次约束，**未处理**）。两者在改动前后逐字相同。
+  - 非回退项：`BJ` 映射、一次请求服务全池（`len(calls)==1`）、同日二次
+    0 请求、9 类失败构造、渲染行位置（闸门之后 / 价格行之前）全部沿用
+    原断言并继续通过。
+- **跳过项**：无。
+
+## 2026-11-14 · issue #1 / R11 T6：全市场重点监控池（硬风险告警）
+
+- **分支**：`TF-Leo/market-watch`（父 `origin/main` = `c357b28`）；未改
+  `source/decision/*`，未引入新依赖。
+- **端点取证（不是凭记忆）**：`curl` 钉死 commit `f215349` 的 SKILL.md §8.4
+  （4525–4583 行）核对 URL/字段，再本机实测
+  `GET https://mobappconfig.securities.eastmoney.com/emcfg/stock_monitor.json`
+  → **HTTP 200、0.20s、19 条**；字段恰为
+  `MARKET/STKNAME/STKCODE/VALIDATESTARTDATE/VALIDATEENDDATE/LINK_URL`。
+  实测样本里 **3 条 `MARKET="B"`**（920575/920090/920023，均 `*ST`），
+  与上游「三值坑」记录一致。
+- **实现**：
+  - 新增 `source/stock_analysis/data_sources/market_watch.py`：一次请求 →
+    原始条目 → `{code: {code,name,market,start,end,reason,link}}`；
+    `_MARKET_MAP = {"1":"SH","0":"SZ","B":"BJ"}`，未知值原样带出 `?<值>`；
+    3s 超时；非 2xx / 非 JSON / 非列表 / 行字段不合法一律抛
+    `MarketWatchError`（**不返回空 dict**）；`[]` 视为合法空结果。
+  - 缓存 `source/stock_analysis/data/state/market_watch.json`（`data/` 已
+    gitignore），含 `fetched_at` / `session_date` / 原始 `entries`；当日有效，
+    同进程 memo + 磁盘双层。失败回退旧缓存标 `stale=true`；无缓存
+    `available=false`。
+  - `cli.py`：`evidence.market_watch = {available,stale,as_of,hit}`（additive）。
+    G35 错误路径用 `with_market_watch_block()` 包一层补同构块 —— **不改
+    `decision/*`**（第一版曾改 `decision/context.py`，按约束已撤回）。
+  - `advice_render.py`：命中时输出 `🚫 交易所重点监控（{start}~{end}）`，
+    位置在可执行性闸门之后、价格行之前；未命中/不可用/无命中时过期整行消失。
+  - `--as-of` 回放**抑制命中**（只有当前快照，套到过去等于前视），并在
+    warnings 显式说明「已抑制」，不写成「那天没被监控」。
+- **测试**：新增 `source/tests/test_market_watch.py`（38 项）：解析（命中/未命中/
+  **北交所 B→BJ 非 SZ**/未知市场/4 类非法行）、空结果 vs 接口坏了（4 类）、
+  缓存（1 次请求服务 10 票、当日二次 0 请求、失败回退 stale、坏缓存）、
+  窗口过滤、as-of 抑制、渲染位置/消失/不改 action、G35 同构、端到端注入命中。
+- **证据（本机 Linux，无 pwsh）**：
+  - `pytest source/tests -q` → **818 passed, 1 failed**；唯一失败
+    `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    是**基线就存在**的解释器版本不符（akshare 1.17.44 vs 1.18.29 等），与本次无关。
+  - 真实取数：`load_pool()` → `available=True stale=False as_of=2026-11-14
+    n=19 sec=0.196`，markets `{SH,SZ,BJ}`；**第二次 0 请求、0.0004s**。
+  - 真实 CLI（公开基准 600519）：`market_watch.available=true, hit=null`，
+    `evidence` 18 键，`--fast` 墙钟 23.1s、退出码 10（no_edge，与基线一致）。
+  - 真实命中（公开标的 605255，2026-11-13~11-26 在监控窗口内）：CLI 输出
+    `hit={listed:true,start:2026-11-13,end:2026-11-26,reason:monitor}`；
+    渲染输出 `【今日不建议执行】收盘涨停…` → `🚫 交易所重点监控
+    （2026-11-13~2026-11-26）` → `605255 天普股份 现价 73.82`，位置符合契约。
+  - `source/docs/example_output_600519.json` 只补 `market_watch` 键（沿用
+    #93 的最小改动做法，不重跑整份样例以免行情数据无谓漂移）。
+- **隐私**：测试与本文只用公开/虚构代码（600000/920999/605255/600519）；
+  未出现真实持仓代码、名称、金额、股数、权重。
+- **风险（如实记录）**：
+  1. `reason` 是**本模块派生**（上游只给名单不给原因），仅按名称 ST 前缀分
+     `risk_warning` / `monitor` 两值；它不影响命中判定。
+  2. 监控池只有**当前快照**，无历史版本 → `--as-of` 回放不提供历史监控状态。
+  3. 接口当日不可达时，若缓存日期已旧，`stale=true` 仍会展示旧名单并报命中；
+     文案已标注过期，但**不阻止**渲染该行（命中是风险提示，宁可多报）。
+  4. 池子通常十几只，命中率低 → 已用端到端注入命中的用例证明链路不是死代码。
+  5. `cli.py` 行数基线 761（G10 的 ≤700 在基线即为红）；本次 +17 行至 778，
+     未修复该既有超限。
+
 ## 2026-11-14 · issue #11（P1）冷启动数据完整性：腾讯日线缺根导致策略漂移
 
 - **分支**：`TF-Leo/cold-start-gap`（基线 `1c86274`）；未改 `source/decision/*`，

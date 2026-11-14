@@ -10,6 +10,7 @@ T2        可执行性闸门 + 数据新鲜度（``instrument.*`` / ``diagnostic
 T3        个股 regime 与指数 regime 的口径冲突（``market_regime.index``）
 T4        估值分位一句（``evidence.valuation``）
 T5        资金流方向 + 口径标签（``evidence.flow``）
+T6        交易所重点监控池命中（``evidence.market_watch``）—— 硬风险告警
 ========  ==========================================================
 
 设计边界（硬约束）
@@ -47,6 +48,15 @@ T5        资金流方向 + 口径标签（``evidence.flow``）
   同时有值时视为「混源」，只输出方向、不输出净额。
 * ``evidence.valuation`` 的 ``percentile_samples`` 小于 3 年窗口（756）时，
   文案标注「样本 N 日」。
+* ``evidence.market_watch``（T6）：只有 ``available is True`` **且**
+  ``hit.listed is True`` 才输出 ``🚫 交易所重点监控（{start}~{end}）``。
+  ``available=False``（没取到名单）时**不输出**任何风险结论 —— 由
+  ``diagnostics.warnings`` 说明原因，绝不把「没取到」写成「没被监控」。
+  ``stale=True``（回退旧缓存）**照常输出**命中行，日期取该条目的生效窗口
+  （``start~end``，与新鲜数据同一口径）；「名单截至哪天」由
+  ``evidence.market_watch.as_of`` 与 warnings 说明 —— 命中是风险提示，
+  宁可多报也不因缓存旧了一天就静默隐藏。命中行位置固定在可执行性闸门之后、
+  价格/建议行之前。
 * ``compact=True`` 只处理 ``diagnostics.warnings``，结果由 **封闭词表替换 +
   整段删除** 两部分组成：
 
@@ -77,6 +87,7 @@ __all__ = [
     "render_advice",
     "CALIBER_LABELS",
     "COMPACT_GLOSSARY",
+    "MARKET_WATCH_MARK",
     "PERCENTILE_WINDOW_DAYS",
     "DEFAULT_DISCLAIMER",
 ]
@@ -786,6 +797,36 @@ def _flow_line(payload: Dict[str, Any]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# T6：交易所重点监控池（硬风险告警）
+# ---------------------------------------------------------------------------
+#: 命中行必须带的前缀（测试与 Hermes 侧按此识别）。
+MARKET_WATCH_MARK = "🚫 交易所重点监控"
+
+
+def _market_watch_line(payload: Dict[str, Any]) -> Optional[str]:
+    """命中时输出一行 ``🚫 交易所重点监控（{start}~{end}）``；否则整行消失。
+
+    口径（T6 契约）：
+    * 只有 ``available is True`` **且** ``hit.listed is True`` 才输出 ——
+      ``available=False``（没取到名单）不产生风险结论，由
+      ``diagnostics.warnings`` 说明；
+    * ``stale=True``（回退旧缓存）**不抑制**本行：命中是风险提示，宁可多报；
+      「名单截至哪天」由 ``evidence.market_watch.as_of`` 与 warnings 说明；
+    * ``start`` / ``end`` 逐值照抄 JSON，缺失时用 ``?`` 占位（不编造日期）；
+    * 只描述事实，不改写 ``action`` / ``confidence``。
+    """
+    block = _dict(_dict(payload.get("evidence")).get("market_watch"))
+    if block.get("available") is not True:
+        return None
+    hit = _dict(block.get("hit"))
+    if hit.get("listed") is not True:
+        return None
+    start = _date_text(hit.get("start")) or "?"
+    end = _date_text(hit.get("end")) or "?"
+    return f"{MARKET_WATCH_MARK}（{start}~{end}）"
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 def render_advice(payload: dict, compact: bool = False) -> str:
@@ -819,6 +860,11 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     gate = _gate_reason(document)
     if gate:
         lines.append(f"【今日不建议执行】{gate}")
+
+    # T6：硬风险告警 —— 放在可执行性闸门之后、价格/建议行之前；未命中整行消失。
+    market_watch = _market_watch_line(document)
+    if market_watch:
+        lines.append(market_watch)
 
     lines.append(_price_line(document))
 

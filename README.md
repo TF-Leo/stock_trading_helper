@@ -584,6 +584,70 @@ python cli.py 600519 --start 20200101 --json
 > 且**不追加 warning**（上游 §6.5 只覆盖沪深个股）。股票缓存缺失/过期会给出
 > 一条可操作提示，但不改变任何决策字段。
 
+### evidence.market_watch（T6，issue #1 / R11 缺口表 #6）
+
+交易所**重点监控池**，`schema_version` 仍为 `1.0`（additive）。
+上游 a-stock-data v3.10.4 §8.4 `em_stock_monitor()`：东财 App「重点监控」名单
+（被交易所风险警示 / 重点监控的标的 + 生效时间窗）。**零鉴权静态 JSON、全量返回、
+不分页**，因此**一次请求服务全池** —— 不是逐票请求。
+
+```
+GET https://mobappconfig.securities.eastmoney.com/emcfg/stock_monitor.json
+Referer: https://vipmoney.eastmoney.com/
+```
+
+上游字段（逐字，不改名）：`STKCODE` / `STKNAME` / `MARKET` /
+`VALIDATESTARTDATE` / `VALIDATEENDDATE` / `LINK_URL`。
+**`MARKET` 是三值且含字母**：`"1"`=沪、`"0"`=深、**`"B"`=北交所**。
+写成 `"SH" if MARKET=="1" else "SZ"` 会把北交所整片错标成深市；未知取值不猜，
+原样带出 `?<原值>`。
+
+| 键 | 含义 |
+|---|---|
+| `available` | 当日请求成功，或成功回退到历史缓存；`false` 表示无缓存且取数失败 |
+| `stale` | `true` = 本次用的是**旧缓存**（当日请求失败后回退），`as_of` 是那份缓存的日期 |
+| `as_of` | 这份名单对应的**北京日期**（不是文件时间，也不是运行时刻） |
+| `hit` | 命中：`{listed: true, start, end, reason}`；未命中 / 不可用 / 过期无命中时为 `null` |
+
+`reason` 是**本模块派生**的封闭两值（上游只给名单，不给原因）：`risk_warning`
+（名称带 `ST` / `*ST` 前缀）或 `monitor`（其余）。它只影响文案归类，不影响
+「是否命中」这一事实（命中只看代码）。`hit` 只暴露这四个键 —— 名称与东财链接
+**不进入 CLI JSON**。
+
+**行为约束**：
+
+1. **一次请求**：同一北京自然日 + 同一状态目录，最多 1 次 HTTP；第二次起读缓存（0 请求）。
+   盘前主路径超时上限 **3s**。
+2. **当日有效**：缓存 `source/stock_analysis/data/state/market_watch.json`（`data/` 已 gitignore），
+   记录 `fetched_at` 与原始条目。
+3. **失败 ≠ 无监控**：请求/解析失败 → 回退上一份缓存并标 `stale=true`；**无可用缓存**才
+   `available=false`。两种情况都在 `diagnostics.warnings` 给原因。
+4. **空结果与接口坏了分开**：接口返回 `[]` 是**唯一合法**的「全市场 0 条」；
+   `null`（HTTP 200 但 body 为空）/ 非列表 / 非 2xx / 非 JSON / 行字段不合法
+   一律抛 `MarketWatchError`，绝不返回空 dict。
+   **本地缓存损坏 ≠ 接口请求失败**：JSON 坏 / schema 不符 / `entries` 非列表 /
+   单条字段不合法 / `count` 与条数不符都视为「没有缓存」，忽略坏缓存并**重新请求
+   一次**，warnings 里单独写明「缓存损坏」而不是「接口请求失败」。
+5. **`--as-of` 回放不给命中**：监控池只有当前快照、没有历史版本，把今天的名单套到
+   过去某天等于引入前视。回放时 `hit` 恒为 `null`，若当前确实命中会在 warnings 里
+   显式说明「已抑制」，避免被误读成「那天没被监控」。
+6. **只展示、不改决策**：`evidence.market_watch` 不参与 `action`、`confidence`、
+   `status`、`position_fraction`、`entry_zone`、`target_position` 的任何计算；
+   A/B 对照中 `recommendation` 逐键一致。
+
+建议渲染层（`stock_analysis/advice_render.py`）在命中时输出一行
+
+```
+🚫 交易所重点监控（2026-11-13~2026-11-26）
+```
+
+位置固定在**可执行性闸门之后、价格/建议行之前**；未命中 / `available=false` /
+无命中时过期，整行消失（不把「没取到」写成「没被监控」）。
+**`stale=true` 不抑制该行**：命中是风险提示，宁可多报；「名单截至哪天」看
+`as_of` 与 warnings，行内日期仍是该条目的生效窗口。
+离线开关：`ASTOCK_MARKET_WATCH_OFFLINE=1`（测试默认开启）；
+状态目录覆盖：`MARKET_WATCH_STATE_DIR`。
+
 ### 前向台账（P1，issue #56）：每日记录 + 20 交易日结算
 
 回放历史得不出资金流方向与置信度校准的结论（R3 §8.2：资金流只有 79 个决策日、
@@ -684,6 +748,8 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 - `evidence.flow` 十八键齐全（`available=false, reason="data_source_error"`，数值键全 `null`）
 - `evidence.valuation` 二十四键齐全（`available=false, reason="data_source_error"`，数值键全 `null`；
   `pub_lag_days=0`，`percentile_samples={pe: null, pb: null, ps: null}`）
+- `evidence.market_watch` 四键齐全（`available=false, stale=false, as_of=null, hit=null`；
+  取数阶段失败时**不读缓存、不触网**）
 - `recommendation.horizon_days = [null, null]`、`stop_loss/take_profit/stop_method = null`、`position_fraction = 0.0`
 - `data.bars/start/end/last_close` 在"数据太短"时是**已知真实值**（如 `bars=23`），与 `invalidation` 文本一致；拉取彻底失败时才为 `0 / "" / null`
 - `candidates = []`（没有候选才是正确语义，不是缺字段）
@@ -866,6 +932,14 @@ source/.venv/bin/python cli.py 600519 --json --fast \
 渲染层是纯函数（不改入参、不读写文件、不触网），字段口径见
 `source/stock_analysis/advice_render.py` 的模块 docstring。`--compact` 只压缩
 `diagnostics.warnings`，其余行与默认输出逐字节一致。
+
+渲染的上下文行：仓位/持有期/复审日（T1）、可执行性闸门（T2）、regime 冲突（T3）、
+估值分位（T4）、资金流方向（T5），以及**交易所重点监控命中（T6）**——
+`evidence.market_watch.hit.listed is True` 时输出
+`🚫 交易所重点监控（{start}~{end}）`，位置在可执行性闸门之后、价格/建议行之前。
+未命中 / `available=false` / 无命中时过期，整行消失；`stale=true` 时**照常输出**
+（命中宁可多报，名单时点看 `as_of` 与 warnings）；该行**只陈述事实**，
+不改写 `action` / `confidence`。
 
 ### `--compact` 契约：封闭词表替换 + 整段删除
 
