@@ -335,7 +335,11 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
                        # P0-3 additive：错误路径与成功路径键同构（G35）。
                        # 失败发生在取数阶段，交易状态不可得 → 显式 null。
                        'is_suspended': None, 'limit_up': None, 'limit_down': None,
-                       'quote_stale': None, 'status_source': 'unavailable'},
+                       'quote_stale': None,
+                       # issue #98 additive：一字板字段与成功路径键同构（G35）。
+                       # 取数/交易状态未解析时不可得 → 显式 null。
+                       'one_word_limit': None,
+                       'status_source': 'unavailable'},
         'data': {
             # bars/start/end/last_close 在"数据太短"时是**已知的真实值**，
             # 必须如实填（此前恒 0/''/0，与 invalidation 文本互相打脸）

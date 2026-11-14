@@ -534,16 +534,20 @@ def test_cli_one_word_limit_up_blocks_buy(monkeypatch):
     assert any("一字涨停" in w for w in out["diagnostics"]["warnings"])
 
 
-def test_error_response_instrument_keys_isomorphic():
+def test_error_response_instrument_keys_isomorphic(monkeypatch):
+    """issue #98：错误路径 instrument 键集合必须与**真实成功路径**完全一致。
+
+    旧断言手写了 10 个键，issue #92 给成功路径新增 ``one_word_limit`` 后这里没同步
+    → probe 的 error_shape 判 FAIL。改为直接比对成功路径的实际键集合，避免再漏。
+    """
     import cli
 
+    ok = _run_cli(monkeypatch, trading=None)
     doc = cli.create_error_response('insufficient_data', '数据不足', '600519', 'stock',
                                     bars=23, start='2026-09-08', end='2026-10-16',
                                     last_close=1329.0, elapsed=0.01)
-    assert set(doc["instrument"]) == {
-        "code", "name", "board", "price_limit_pct", "is_st",
-        "is_suspended", "limit_up", "limit_down", "quote_stale", "status_source",
-    }
+    assert set(doc["instrument"]) == set(ok["instrument"])
+    assert doc["instrument"]["one_word_limit"] is None
     assert doc["instrument"]["is_suspended"] is None
     assert doc["instrument"]["status_source"] == "unavailable"
 
