@@ -25,8 +25,12 @@
     四种来源 / 三向冲突 / 空报价名）与 4 项渲染措辞断言。
   - `tests/test_advice_render.py` 的 `cli_json_structure.golden.json` 同步
     additive 键 `instrument.is_st_source`。
-- **未验证**：本机无 `pwsh`，`tools/check_gates.ps1` 未执行；真实东财端点未触网
-  实测（测试全离线，按约束不引入外部波动）。
+- **真实端点实测（2026-11-15，本机，`force=True`）**：`push2.eastmoney.com`
+  与 `push2delay.eastmoney.com` 均 `ConnectionError`（curl 亦 SSL EOF，而 github
+  HTTP 200），真实观测到 `state=failed`、`available=false`、warning 为
+  「ST 名单接口失败…且无本地缓存…」，**未**被当成「今日无 ST」，网络失败也
+  **未**重试。`ok / empty / duplicate` 三态由离线桩逐项覆盖。
+- **未验证**：本机无 `pwsh`，`tools/check_gates.ps1` 未执行。
 - **跳过项**：官方风险警示名单备胎 —— 仓库内没有现成官方源（§6.8 已是东财风险
   警示板），按 brief「若仓库已有则复用」记为不新增。
 
