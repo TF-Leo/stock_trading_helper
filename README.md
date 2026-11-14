@@ -112,6 +112,7 @@ python cli.py 600519 --start 20200101 --json
     "limit_up": 1542.53,
     "limit_down": 1262.07,
     "quote_stale": false,
+    "one_word_limit": null,
     "status_source": "eastmoney_st_list+tencent_quote"
   },
   "data": {
@@ -312,6 +313,7 @@ python cli.py 600519 --start 20200101 --json
 - **is_suspended**: 是否停牌。判据是「交易日 10:00 后 / 已收盘 / 非交易日」腾讯报价定格（`is_stale=true` 且当日成交量为 0）；**盘前（<10:00）返回 `null`**，不把集合竞价前的正常定格误判为停牌
 - **limit_up / limit_down**: 腾讯实时快照给出的当日涨停价 / 跌停价（元）；报价不可用时为 `null`
 - **quote_stale**: 腾讯报价是否定格（`is_stale`）。**它本身不等于停牌**，只是"报价非当日真实成交"的信号
+- **one_word_limit**: 一字板方向（`"up"` / `"down"` / `null`）。腾讯实时快照满足 `最高=最低=涨停价`（或跌停价）时给出；`null` 表示当日不是一字板或报价不可用。渲染层优先读取本字段，`diagnostics.warnings` 里的「一字涨停/一字跌停」文案仅作兜底。**仅成功路径存在**：错误响应由 `decision/*` 构造，本次改动未触碰该目录，故错误响应缺此键，消费方须按「缺失」处理
 - **status_source**: 本次状态的数据来源，`+` 分隔的组合值：
   - `tencent_quote`：实时报价（涨跌停价 / 名称 / is_stale）
   - `eastmoney_st_list`：东财 §6.8 当日 ST 名单（新鲜）
@@ -323,6 +325,10 @@ python cli.py 600519 --start 20200101 --json
 
 > P0-3（issue #6）新增字段全部是 **additive**，`schema_version` 保持 `1.0`：
 > 旧字段含义不变，错误响应与成功响应键集合同构（G35）。无法获取时显式 `null`。
+>
+> 例外（issue #92）：`instrument.one_word_limit` 只在成功路径存在；错误响应由
+> `decision/*` 构造且本次未触碰该目录，故缺此键。消费者须按「键缺失 = 无该
+> 事实」处理。
 >
 > **可执行性硬提示**：`is_suspended=true`、疑似退市（报价不可用且行情连续滞后
 > ≥20 个交易日，或报价定格且名称含退市标记）、一字涨停遇买入、一字跌停遇卖出时，
@@ -741,7 +747,7 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
   "schema_version": "1.0",
   "generated_at": "2026-10-18T10:34:33.471955",
   "request": { "code": "600519", "type": "stock", "type_hint": "auto", "start": null, "opt": "grid", "jobs": 1, "fast": true },
-  "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false, "is_suspended": false, "limit_up": 1542.53, "limit_down": 1262.07, "quote_stale": false, "status_source": "tencent_quote" },
+  "instrument": { "code": "600519", "name": "贵州茅台", "board": "sh_main", "price_limit_pct": 0.1, "is_st": false, "is_suspended": false, "limit_up": 1542.53, "limit_down": 1262.07, "quote_stale": false, "one_word_limit": null, "status_source": "tencent_quote" },
   "data": { "bars": 1643, "start": "2020-01-02 00:00:00", "end": "2026-10-16 00:00:00", "last_close": 1329.0, "source": "cache", "from_cache": true, "stale": false, "cache_last_date": "2026-10-16", "lag_days": 0, "expected_date": "2026-10-16", "requested_source": "sina", "window_note": null },
   "market_regime": { "label": "Bull", "confidence": 0.7, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility", "index": { "label": "Shock", "confidence": 0.5, "as_of": "2026-10-16 00:00:00", "definition": "ma20_ma60_return_volatility", "source": "tencent_index:sh000300", "bars": 1662 } },
   "recommendation": {
@@ -810,6 +816,55 @@ cd source && python cli.py 600519 --json --fast > docs/example_output_600519.jso
 > 上表数值取自 2026-10-18 10:34 对 600519 的真实运行（`--fast`，1643 根），
 > 为便于阅读删减了 `candidates` 其余 9 条；**完整未删减样例**见
 > `source/docs/example_output_600519.json`（同样由命令现跑生成）。
+
+## 建议渲染（`tools/render_advice.py`）
+
+把 `cli.py --json` 的完整响应渲染成可直接投递的每日建议：
+
+```bash
+source/.venv/bin/python cli.py 600519 --json --fast \
+  | source/.venv/bin/python tools/render_advice.py --compact
+```
+
+渲染层是纯函数（不改入参、不读写文件、不触网），字段口径见
+`source/stock_analysis/advice_render.py` 的模块 docstring。`--compact` 只压缩
+`diagnostics.warnings`，其余行与默认输出逐字节一致。
+
+### `--compact` 契约：封闭词表替换 + 整段删除
+
+issue #92 要求 compact 输出是原文的「删除子序列」。实现需要把少量内部术语换成
+用户可读表述，协调者裁定后的口径如下（**封闭集合 + 可验证**）：
+
+1. **删除**只允许三类：URL、堆栈/回溯段、**配对完整**的内部引用括号。括号
+   不配对时不删；删除后括号失衡则整条退回原文。不截句、不重排、不删斜杠枚举
+   中的单项。
+2. **替换**只允许模块级封闭常量
+   `stock_analysis.advice_render.COMPACT_GLOSSARY` 里的条目（当前 6 项）：
+
+   | 原文 token | 替换为 | 说明 |
+   | --- | --- | --- |
+   | `p_positive` | 买侧期望胜率 | 买侧期望 |
+   | `trigger.current` | 触发参考价 | 触发价字段 |
+   | `is_st` | ST 标记 | ST 状态字段 |
+   | `ProxyError` | 代理异常 | 网络代理错误 |
+   | `no_edge` | 无统计优势 | 统计判定，不是「没有机会」 |
+   | `95% CI` | 置信区间 | no_edge 告警里的统计术语 |
+
+   词表之外的任何内部字段名/术语都不替换，仍只允许整段删除。增删词表项必须
+   同步修改 `tests/test_advice_render.py::test_compact_glossary_is_closed_set`
+   与本表。
+3. **词边界**：token 前后不得粘连字母/数字/下划线/中文或 `.`，例如 `is_st`
+   不会命中 `is_status`、`仅is_st推断`、`x.is_st`。
+4. **空格**：替换时若标签与相邻字符都是中文，吸收其间的原空格；输出不得出现
+   中文夹空格（`is_st 只能` → `ST 标记只能`）或连续两个空格。
+5. **不变量**：不含词表 token 的告警，输出必为原文的删除子序列；含 token 的，
+   除被替换 token（及为避免中文夹空格而吸收的一个 ASCII 空格）外逐字保持原序。
+6. **安全红线**：含「停牌/退市/ST/一字 + 无法区分/无法判断/无法成交」的告警，
+   压缩前后语义必须一致；`test_compact_preserves_safety_qualifiers` 用参数化
+   用例锁住。
+
+> 与 issue #92 字面表述的差异（替换 vs 纯删除）已显式记录在此：只接受上面这个
+> 封闭、可验证的词表，不接受任何自由改写；`--json` 仅允许 additive 变更。
 
 ## 幂等性保证
 

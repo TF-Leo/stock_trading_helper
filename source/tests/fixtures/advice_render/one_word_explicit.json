@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-11-13T09:12:00",
+  "request": {"code": "300998", "type": "stock", "fast": true},
+  "instrument": {
+    "code": "300998",
+    "name": "示例制造",
+    "board": "sz_gem",
+    "price_limit_pct": 0.2,
+    "is_st": false,
+    "is_suspended": false,
+    "limit_up": 14.4,
+    "limit_down": 9.6,
+    "quote_stale": false,
+    "one_word_limit": "up",
+    "status_source": "tencent_quote"
+  },
+  "data": {
+    "bars": 500,
+    "start": "2024-09-02",
+    "end": "2026-11-13",
+    "last_close": 12.0,
+    "source": "cache",
+    "from_cache": true,
+    "stale": false,
+    "lag_days": 0,
+    "expected_date": "2026-11-13"
+  },
+  "recommendation": {
+    "status": "ok",
+    "action": "buy",
+    "action_reason": ["今日（2026-11-13）触发买点"],
+    "target_position": 1.0,
+    "review_date": "2026-12-11",
+    "confidence": 0.5,
+    "position_fraction": 0.1,
+    "horizon_days": [20, 20],
+    "entry_zone": [11.8, 12.2],
+    "stop_loss": 11.0,
+    "take_profit": 13.5,
+    "distance_to_trigger": {"buy_pct": 0.0, "sell_pct": null},
+    "no_edge": false
+  },
+  "evidence": {"triggers": []},
+  "diagnostics": {"warnings": [], "elapsed_seconds": 9.0},
+  "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
+}

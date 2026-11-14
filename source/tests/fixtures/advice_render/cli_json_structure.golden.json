@@ -20,6 +20,7 @@
     "limit_down",
     "limit_up",
     "name",
+    "one_word_limit",
     "price_limit_pct",
     "quote_stale",
     "status_source"

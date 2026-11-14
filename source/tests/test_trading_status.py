@@ -480,6 +480,18 @@ def test_cli_instrument_additive_fields(monkeypatch):
     assert inst["quote_stale"] is False
     assert inst["status_source"] == "eastmoney_st_list+tencent_quote"
     assert inst["price_limit_pct"] == pytest.approx(0.05)
+    assert inst["one_word_limit"] is None
+
+
+def test_cli_instrument_exposes_one_word_limit(monkeypatch):
+    """issue #92：一字板显式字段进入 instrument，渲染层不再只靠 warning 文案。"""
+    from stock_analysis.data_loader.status import TradingStatus
+
+    trading = TradingStatus(is_st=False, is_suspended=False,
+                            one_word_limit="up", quote_stale=False,
+                            status_source="tencent_quote", warnings=[])
+    out = _run_cli(monkeypatch, trading)
+    assert out["instrument"]["one_word_limit"] == "up"
 
 
 def test_cli_suspended_becomes_untradeable(monkeypatch):

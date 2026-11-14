@@ -21,6 +21,7 @@
     "limit_up": 1542.53,
     "limit_down": 1262.07,
     "quote_stale": false,
+    "one_word_limit": null,
     "status_source": "tencent_quote"
   },
   "data": {

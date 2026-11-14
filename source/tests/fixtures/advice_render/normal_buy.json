@@ -58,6 +58,18 @@
     "no_edge": false
   },
   "evidence": {
+    "triggers": [
+      {
+        "indicator": "均线趋势(3-5-8)",
+        "current": 12.0,
+        "last_close": 12.0,
+        "buy_trigger": "买点参考价 12.00（最近一次买点所在 bar 收盘价）",
+        "sell_trigger": "卖点参考价 10.50（最近一次卖点所在 bar 收盘价）",
+        "state": "buy_triggered",
+        "buy_price": 12.0,
+        "sell_price": 10.5
+      }
+    ],
     "flow": {
       "available": true,
       "code": "600000",
