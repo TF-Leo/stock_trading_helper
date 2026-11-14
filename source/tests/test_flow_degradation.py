@@ -149,7 +149,7 @@ def test_444_block_stops_eastmoney_requests_and_records_reason(tmp_path, monkeyp
         return []
 
     stats = tool.precompute(
-        ["600519", "002415"], out_dir=str(tmp_path), interval=1.0, retries=0,
+        ["600519", "600000"], out_dir=str(tmp_path), interval=1.0, retries=0,
         fetch_fn=eastmoney_fetch,
         sina_fetch_fn=lambda code: _sina_rows(),
         sleep_fn=lambda seconds: None, now_fn=datetime.now)
@@ -161,7 +161,7 @@ def test_444_block_stops_eastmoney_requests_and_records_reason(tmp_path, monkeyp
     assert "已降级到 sina_total_net" in capsys.readouterr().err
     assert em.cooldown_state()["reason"] == "http_444"
 
-    for code in ("600519", "002415"):
+    for code in ("600519", "600000"):
         payload = json.loads((tmp_path / f"{code}.json").read_text(encoding="utf-8"))
         assert payload["caliber"] == tool.CALIBER_SINA
         assert "反爬阻断" in payload["degraded_reason"]
@@ -210,7 +210,7 @@ def test_budget_exceeded_stops_run_before_extra_requests(tmp_path, capsys):
         return _eastmoney_rows()
 
     stats = tool.precompute(
-        ["600519", "002415", "300750"], out_dir=str(tmp_path),
+        ["600519", "600000", "300750"], out_dir=str(tmp_path),
         interval=1.0, retries=0, budget=1,
         fetch_fn=ok, sina_fetch_fn=lambda code: pytest.fail("不应降级"),
         sleep_fn=lambda seconds: None, now_fn=datetime.now)
@@ -222,8 +222,8 @@ def test_budget_exceeded_stops_run_before_extra_requests(tmp_path, capsys):
     assert "BUDGET" in capsys.readouterr().err
     assert stats["request_limits"]["counts"] == {"push2his.eastmoney.com": 1}
     assert stats["request_limits"]["limit_per_domain"] == 1
-    assert stats["failed"][0]["code"] == "002415"
+    assert stats["failed"][0]["code"] == "600000"
     assert stats["skipped"] == ["300750"]
     assert (tmp_path / "600519.json").exists()
-    assert not (tmp_path / "002415.json").exists()
+    assert not (tmp_path / "600000.json").exists()
     assert not (tmp_path / "300750.json").exists()
