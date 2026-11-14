@@ -978,9 +978,14 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
             f"（阈值 {DELIST_LAG_DAYS}），疑似退市/长期停牌，判定不可交易")
 
     # ---- T8：量比 / 换手 / 市值（复用同一次腾讯报价，零额外请求） ---------
-    # 字段位置按**钉死 commit f215349** 的 §1.1 核对，不凭记忆下标
-    # （``vendor/a-stock-data/SKILL.md``「腾讯财经字段索引速查」1161-1193 行，
-    # 取值见 1116-1136 行）：
+    # 字段位置按仓库内 vendored 快照核对，不凭记忆下标：快照为
+    # ``vendor/a-stock-data/SKILL.md``（v3.10.4，blob
+    # 907deb00f05365e0445d6d95294c3c98d5a4a8fe，sha256
+    # 09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2）的
+    # 「腾讯财经字段索引速查」1161-1193 行，取值见 1116-1136 行；
+    # ``python tools/astock_extract.py --check`` 会逐字校验该快照与生成物
+    # （期望 ``OK … (44 symbols, sha256 af7cec001b9241bf…)``），读者可在
+    # 本仓库内复验，无需访问上游 commit。
     #   vals[38] 换手率 —— **已经是百分数**（4.55 表示 4.55%，不要再乘 100）
     #   vals[49] 量比   —— 无量纲倍数
     #   vals[44] 流通市值 / vals[45] 总市值 —— 单位均为**亿元**（1e8 元），

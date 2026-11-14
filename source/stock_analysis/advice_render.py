@@ -14,7 +14,7 @@ T6        交易所重点监控池命中（``evidence.market_watch``）—— �
 T7        事件风险（``evidence.events``）：解禁 / 股东增减持 / 业绩预告 /
           股权质押 —— 只报 20 日内且达到阈值的重大事件
 T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
-          ``volume_ratio``）—— 只报**上一交易日口径**，定格/缺失整句消失
+          ``volume_ratio``）—— 只报**最近成交日累计**，定格/缺失整句消失
 ========  ==========================================================
 
 设计边界（硬约束）
@@ -385,10 +385,10 @@ def _freshness(payload: Dict[str, Any]):
 
 
 # ---------------------------------------------------------------------------
-# T8：量比 / 换手（腾讯报价，上一交易日口径）
+# T8：量比 / 换手（腾讯报价，最近成交日累计）
 # ---------------------------------------------------------------------------
 def _turnover_line(payload: Dict[str, Any]) -> Optional[str]:
-    """``换手 {t}%｜量比 {v}（上一交易日口径）``；不适用时整行消失。
+    """``换手 {t}%｜量比 {v}（最近成交日累计）``；不适用时整行消失。
 
     语义坑：盘前（本项目每天 09:15 运行）当日尚无成交，腾讯报价的换手 /
     量比恒为 0，且报价定格（``quote_stale=True``）。因此本行有两个硬闸门：
@@ -397,8 +397,10 @@ def _turnover_line(payload: Dict[str, Any]) -> Optional[str]:
       不能冒充今日活跃度）；
     * 换手 / 量比任一缺失或 ≤ 0 → 整行消失（绝不输出 ``0`` 或空值）。
 
-    通过闸门时，数值来自最近一个**有成交**的交易日，所以句尾必须显式标注
-    「上一交易日口径」——否则用户会把盘前看到的量比当成今天的。
+    通过闸门时当日已有成交，数值是**当日累计**；周末/节假日复现最近一个
+    完整交易日时则是上一交易日。两种相位都成立的说法只有「最近成交日累计」，
+    因此句尾必须写它 —— 写「上一交易日口径」会在盘中/盘后把当日累计冒充昨日，
+    读时钟或按交易日相态分叉既增加耦合又容易在节假日边界出错。
 
     单位：``turnover_rate_pct`` 已是百分数（0.26 → ``0.26%``，不再乘 100）；
     ``volume_ratio`` 是无量纲倍数，原样输出。场外基金不适用，整行消失。
@@ -413,7 +415,7 @@ def _turnover_line(payload: Dict[str, Any]) -> Optional[str]:
     if turnover is None or ratio is None or turnover <= 0 or ratio <= 0:
         return None
     return (f"换手 {_fmt_num(turnover)}%｜量比 {_fmt_num(ratio)}"
-            "（上一交易日口径）")
+            "（最近成交日累计）")
 
 
 def _paren_pairs(text: str):
@@ -1409,7 +1411,7 @@ def render_advice(payload: dict, compact: bool = False) -> str:
 
     lines.append(_price_line(document))
 
-    # T8：上一交易日口径的换手 / 量比（复用 CLI 已有的报价字段）；缺失/定格/
+    # T8：最近成交日累计的换手 / 量比（复用 CLI 已有的报价字段）；缺失/定格/
     # 基金 → 整行消失，不输出 0。
     turnover = _turnover_line(document)
     if turnover:

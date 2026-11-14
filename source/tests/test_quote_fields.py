@@ -4,8 +4,14 @@
 公开基准代码：``600519`` / ``600000``。基金路径用一个被 mock 成 ``fund`` 的
 公开代码，不引入任何真实持仓代码。
 
-字段取证：下标来自钉死 commit ``f215349`` 的 §1.1
-（``vendor/a-stock-data/SKILL.md``「腾讯财经字段索引速查」1161-1193 行）：
+字段取证：下标来自仓库内 vendored 快照 ``vendor/a-stock-data/SKILL.md``
+（version 3.10.4；blob ``907deb00f05365e0445d6d95294c3c98d5a4a8fe``，
+sha256 ``09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2``）
+的「腾讯财经字段索引速查」1161-1193 行。``python tools/astock_extract.py
+--check`` 会对该文件与生成物做逐字校验，期望输出
+``OK … (44 symbols, sha256 af7cec001b9241bf…)`` —— 因此读者无需外部
+commit 即可在本仓库复验；上游 commit 仅作为 ``vendor/a-stock-data/VERSION``
+的溯源信息保留。
 
 ========  ==========================  ====================
 下标      含义                        单位
@@ -154,7 +160,7 @@ def test_status_without_quote_has_no_quote_fields():
 
 
 # ---------------------------------------------------------------------------
-# 3. 渲染层：一句话，上一交易日口径；不满足条件整句消失
+# 3. 渲染层：一句话，最近成交日累计；不满足条件整句消失
 # ---------------------------------------------------------------------------
 def _payload(**instrument) -> dict:
     inst = {
@@ -186,7 +192,7 @@ def _advice_lines(payload) -> list[str]:
 def test_render_turnover_line_marks_previous_session():
     lines = _advice_lines(_payload())
     line = next(line for line in lines if line.startswith("换手 "))
-    assert line == "换手 0.26%｜量比 0.91（上一交易日口径）"
+    assert line == "换手 0.26%｜量比 0.91（最近成交日累计）"
     # 百分号口径不得被二次放大（0.26 不是 26%）。
     assert "换手 26%" not in line
     # 量比是无量纲倍数，不得写成百分比。
@@ -219,7 +225,7 @@ def test_render_turnover_line_disappears_when_quote_is_stale():
     output = render_advice(_payload(quote_stale=True))
     assert "换手 " not in output
     assert "量比 " not in output
-    assert "上一交易日口径" not in output
+    assert "最近成交日累计" not in output
 
 
 def test_render_turnover_line_disappears_for_fund():
@@ -229,18 +235,18 @@ def test_render_turnover_line_disappears_for_fund():
     output = render_advice(payload)
     assert "换手 " not in output
     assert "量比 " not in output
-    assert "上一交易日口径" not in output
+    assert "最近成交日累计" not in output
 
 
 def test_render_turnover_line_unit_boundaries():
     """换手是百分数、量比是无量纲；极小值保留有效位，大值不截断成整数。"""
     lines = _advice_lines(_payload(turnover_rate_pct=0.005, volume_ratio=12.5))
     line = next(line for line in lines if line.startswith("换手 "))
-    assert line == "换手 0.005%｜量比 12.5（上一交易日口径）"
+    assert line == "换手 0.005%｜量比 12.5（最近成交日累计）"
 
     lines = _advice_lines(_payload(turnover_rate_pct=100.0, volume_ratio=1000.5))
     line = next(line for line in lines if line.startswith("换手 "))
-    assert line == "换手 100%｜量比 1000.5（上一交易日口径）"
+    assert line == "换手 100%｜量比 1000.5（最近成交日累计）"
 
 
 # ---------------------------------------------------------------------------
@@ -329,4 +335,4 @@ def test_cli_quote_request_count_does_not_increase(monkeypatch):
     assert inst["turnover_rate_pct"] == pytest.approx(0.26)
     assert inst["volume_ratio"] == pytest.approx(0.91)
     assert inst["market_cap_yi"] == pytest.approx(17629.53)
-    assert "换手 0.26%｜量比 0.91（上一交易日口径）" in render_advice(out)
+    assert "换手 0.26%｜量比 0.91（最近成交日累计）" in render_advice(out)
