@@ -1,5 +1,46 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-14 · issue #99 台账结算三项残留（basis 文案 / 无缓存钉 stock / fixture 措辞）
+
+- **分支**：`task/ledger-residuals`（父 = `origin/main` `0722fec`）；**未改
+  `source/decision/*`**，未引入依赖，schema 只做 additive。
+- **1) basis 文案与「拒绝换源」统一**：新增两个固定措辞常量
+  `BASIS_CONFIRMED_SUFFIX = "口径已确认：记录时确定，结算时不再更改"` /
+  `BASIS_UNCERTAIN_SUFFIX = "口径未确认：首次结算成功前允许一次重判"`。
+  `classify_instrument_detailed()` 的四种判定、`resolve_price_plan()` 的
+  「记录价源」与「老记录」两条分支全部用这两句，不再出现「按 brief 默认」
+  「并告警」这类与实现脱节的旧说法。
+- **2) 记录时无缓存不再永久钉 stock**：`build_record()` 新增 additive 字段
+  `basis_uncertain`。判 `true` 的三种情形：两份缓存都不存在 / 只有未复权
+  交易所 OHLC（qfq 口径无法确定）/ `fund_*.csv` 读不出。`rejudge_record()`
+  在**首次结算成功前**（`settled` 仍为 null）重判一次，**只允许
+  uncertain → 确认**；已确认记录（`basis_uncertain=false`）、已结算记录、
+  以及引入该字段之前的老记录（缺键）一律不重判。重判写盘并把 code 列进
+  `settle_all()` 返回的 `rejudged`，`tools/forward_log.py evaluate` 打印
+  「口径重判」一行；`build_report()` 新增 `basis_uncertain` 计数并单独输出。
+- **3) fixture 匿名化措辞**：`tests/fixtures/fund/fund_999901.csv` 的说明改为
+  「匿名化场内 ETF 日线切片，140 个交易日（2026-04-17~2026-11-12），文件无
+  代码列、文件名是虚构代码，数值保留原样（公开行情）以便独立复核形态；不含
+  持仓/成本/股数/权重」。新增 `test_fund_fixture_shape_matches_its_documented_
+  provenance` 逐项核对说明与文件（行数、首末日、列集合、`open != close`、
+  `amount ≈ volume × close`），说明与文件脱节即红。
+- **证据（本机 Linux，`~/.venv`）**：
+  - `pytest tests/ -q` → **875 passed, 1 failed**；唯一失败
+    `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    是**基线就存在**的解释器版本不符（akshare 1.17.44 vs 1.18.29 等）。
+    父 commit `0722fec` 基线 **861 passed / 同一条失败** → 净增 14 项。
+  - `python tools/probe.py all` → **40 PASS / 1 FAIL**（仅 `requirements`），
+    与父 commit 逐项相同。
+  - 迁移对比：真实台账（2026-11-12/13，2 天 12 条）新旧实现结算结果
+    **0 漂移**（settled/not_matured/pending/failed 逐项相同、`rejudged=[]`）；
+    另用旧实现造一份含 2 条**已结算**记录（个股 qfq + 场外净值）的台账，
+    新实现重算后 `settled` / `settle_reason` / `settle_status` / 三个口径字段
+    **逐键相等，0 漂移**。
+  - `tests/test_forward_ledger.py` 47 → **59**；`test_readme_consistency.py`
+    新增 2 条（README「运行」行键集合 = `build_record` 实际键；重判语义必须
+    写进 README）。
+- **跳过项**：无。
+
 ## 2026-11-14 · PR #97 复验非阻塞项收口（2×P2 + 3×P3）
 
 - **分支**：`TF-Leo/fix-pr97`（父 = PR #97 head `c3756af`）；**未改

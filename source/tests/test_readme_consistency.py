@@ -138,3 +138,34 @@ def test_evidence_plan_waf_rows_carry_date():
     a3 = [ln for ln in plan.splitlines() if ln.startswith("| A3 |")]
     assert a3 and "2026-11-12" in a3[0], a3
     assert "2026-11-12 观测" in plan.split("#### 2.2.3", 1)[1][:200]
+
+
+# ---------------------------------------------------------------------------
+# 5) 前向台账记录键集合（issue #99：新增 basis_uncertain 必须同步文档）
+# ---------------------------------------------------------------------------
+LEDGER_RUN_KEYS = {"cli_exit", "elapsed_s", "recorded_at", "missing",
+                   "instrument_type", "price_source", "price_caliber",
+                   "instrument_basis", "basis_uncertain"}
+
+
+def test_readme_ledger_run_row_matches_build_record_keys(readme_text):
+    """README 的「运行」行必须逐键等于 ``build_record`` 的口径/运行字段。
+
+    历史问题：README 与实现各写一份键列表，加了 additive 字段只改一边。
+    这里直接从实现取键集合，与 README 表格逐键比对。
+    """
+    from stock_analysis import forward_ledger as fl
+
+    rec = fl.build_record("600519", None, 30, 1.0, "2026-11-12")
+    assert LEDGER_RUN_KEYS <= set(rec), LEDGER_RUN_KEYS - set(rec)
+    row = next(ln for ln in readme_text.splitlines()
+               if ln.startswith("| 运行 |"))
+    documented = set(re.findall(r"`([a-z_]+)`", row))
+    assert documented == LEDGER_RUN_KEYS, documented ^ LEDGER_RUN_KEYS
+
+
+def test_readme_documents_basis_uncertain_semantics(readme_text):
+    """「口径记录时确定、结算时不再更改」与一次重判必须写进 README。"""
+    assert "口径记录时确定、结算时不再更改" in readme_text
+    assert "basis_uncertain=true" in readme_text
+    assert "只允许" in readme_text and "uncertain → 确认" in readme_text

@@ -52,10 +52,22 @@ R4 的 C 路径（校准，Brier 改善 ≥0.02）要求 **≥200 条已到期�
 结算**按记录里已记录的价源**取价，取价口径不变（``open_{d+1+20} / open_{d+1} − 1``）：
 
 * 记录阶段写入 ``instrument_type`` / ``price_source`` / ``price_caliber`` /
-  ``instrument_basis``（additive 字段）。类型**不取 CLI 的 ``request.type``** ——
-  那是取数通道，``auto`` 失败会回落到另一侧（实测把个股标成 fund、把 ETF 标成
-  fund），按它结算会永久用错口径。判定依据是**数据文件类型**（``fund_*.csv`` 是
-  净值还是交易所 OHLC）＋代码段静态信息，见 :func:`classify_instrument`。
+  ``instrument_basis`` / ``basis_uncertain``（additive 字段）。类型**不取 CLI
+  的 ``request.type``** —— 那是取数通道，``auto`` 失败会回落到另一侧（实测把
+  个股标成 fund、把 ETF 标成 fund），按它结算会永久用错口径。判定依据是
+  **数据文件类型**（``fund_*.csv`` 是净值还是交易所 OHLC）＋代码段静态信息，
+  见 :func:`classify_instrument`。口径**记录时确定，结算时不再更改**：
+  ``instrument_basis`` 写明当时的判定依据，结算只按记录里的 ``price_source``
+  取价（:func:`resolve_price_plan`）。
+* **口径未确认时允许一次重判**（issue #99）：记录当日**没有任何可用缓存**
+  （两份都没有、``fund_*.csv`` 读不出、或只有未复权交易所 OHLC 而无法确定
+  qfq 口径）时，记录按代码段静态兜底并把 ``basis_uncertain`` 写成 ``true``，
+  ``instrument_basis`` 注明「记录时无可用缓存，口径未确认」。这类记录在
+  **首次结算成功之前**（``settled`` 仍为 ``null``）每次 ``settle_all`` 都会
+  重新判定一次：一旦缓存出现且能确定口径，就把四个字段改成确认值、把
+  ``basis_uncertain`` 置 ``false``（``settle_all`` 返回的 ``rejudged`` 列出
+  这些 code）。**只允许 uncertain → 确认，不得反向改已确认记录**，已结算
+  记录（``settled`` 非 null）永不重判。
 * 个股与**场内 ETF** 都走 ``stock_*_qfq.csv``（前复权，与修复前口径一致）；
   只有**场外基金**走 ``fund_*.csv`` 的单位净值（净值对净值）。
 * **绝不跨源回退**：记录里写的是哪个来源，结算就只读那个文件；该文件缺失 /
@@ -111,6 +123,12 @@ PRICE_SOURCES = (PRICE_SOURCE_STOCK, PRICE_SOURCE_FUND)
 #: （OTC 场外基金没有开盘价，``open`` 由净值补齐）。
 PRICE_CALIBER_QFQ = "qfq_open_to_open"
 PRICE_CALIBER_NAV = "nav_to_nav"
+
+#: ``instrument_basis`` 的两段固定措辞（issue #99）。判定依据与「拒绝换源」
+#: 是同一件事的两面：口径**记录时确定，结算时不再更改**，所以依据文本必须
+#: 说清「当时定下的是什么、以后不会变」。两种状态各用一句，避免同义异文。
+BASIS_CONFIRMED_SUFFIX = "口径已确认：记录时确定，结算时不再更改"
+BASIS_UNCERTAIN_SUFFIX = "口径未确认：首次结算成功前允许一次重判"
 
 #: ``settle_status`` 取值。``pending`` / ``not_matured`` 都**不算失败**：
 #: 前者是「as_of 之后还没有行情」（缓存没更新）或「从未跑过 evaluate」，
@@ -271,6 +289,58 @@ def _fund_file_kind(path):
         return None
 
 
+def classify_instrument_detailed(code, data_dir=None):
+    """判定标的类型、价源、口径与**口径是否已确认**（issue #99）。
+
+    返回 ``(instrument_type, price_source, price_caliber, basis, uncertain)``，
+    前四项与 :func:`classify_instrument` 相同；``uncertain`` 为 ``True`` 表示
+    **记录时没有任何可用缓存、口径无法确定**，只能按代码段静态兜底，结算前
+    允许一次重判（见 :func:`resolve_price_plan` / :func:`settle_all`）。
+
+    判为 ``uncertain`` 的三种情形（其余都是确认）：
+
+    * 两份缓存都不存在 —— 完全无依据；
+    * 只有 ``fund_*.csv`` 且是交易所 OHLC（未复权）—— qfq 口径无法确定；
+    * ``fund_*.csv`` 存在但读不出 —— 内容未知。
+
+    ``stock_*_qfq.csv`` 存在、或 ``fund_*.csv`` 确认为单位净值，都属于
+    **已确认**：口径记录时定死，结算时不再更改。
+    """
+    code = _normalize_code(code)
+    root = str(data_dir or DATA_DIR)
+    stock_path = os.path.join(root, f"stock_{code}_qfq.csv")
+    fund_path = os.path.join(root, f"fund_{code}.csv")
+    static_type = "etf" if _is_etf_code(code) else "stock"
+
+    if os.path.exists(stock_path):
+        return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
+                f"stock_{code}_qfq.csv 存在（前复权）；{BASIS_CONFIRMED_SUFFIX}",
+                False)
+
+    if os.path.exists(fund_path):
+        kind = _fund_file_kind(fund_path)
+        if kind == "fund":
+            return ("fund", PRICE_SOURCE_FUND, PRICE_CALIBER_NAV,
+                    f"仅 fund_{code}.csv 且 open==close（单位净值）；"
+                    f"{BASIS_CONFIRMED_SUFFIX}", False)
+        if kind == "etf":
+            # 只有未复权的交易所行情：口径无法确定 → 按 brief 走原 stock/qfq
+            # 路径并写明实情。结算时该文件不存在 → no_price_data + 拒绝换源告警，
+            # 绝不拿未复权价冒充 qfq 或净值。缓存以后换成 qfq/净值时可重判。
+            return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
+                    f"仅 fund_{code}.csv 且为交易所 OHLC（未复权，非净值）；"
+                    f"无 stock_*_qfq.csv，按原 stock/qfq 路径；{BASIS_UNCERTAIN_SUFFIX}"
+                    f"（记录时无可用 qfq/净值缓存，仅有未复权交易所行情）", True)
+        return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
+                f"fund_{code}.csv 存在但无法解析，退回代码段静态判定；"
+                f"{BASIS_UNCERTAIN_SUFFIX}（缓存内容无法解析）", True)
+
+    return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
+            f"记录时无可用缓存（stock_{code}_qfq.csv / fund_{code}.csv 均不存在），"
+            f"按代码段静态判定（{'场内基金' if static_type == 'etf' else '个股'}）；"
+            f"{BASIS_UNCERTAIN_SUFFIX}（记录时无可用缓存）", True)
+
+
 def classify_instrument(code, data_dir=None):
     """判定标的类型与实际价源（PR #96 复验 P1-2 / P1-3）。
 
@@ -296,34 +366,14 @@ def classify_instrument(code, data_dir=None):
        **不会**拿未复权价冒充 qfq 或净值。
     4. 两份都没有 → 按代码段静态判定（``etf`` / ``stock``），
        ``price_source`` 取该类型的常规来源，结算时缺文件即 ``no_price_data``。
+
+    情形 3 / 4 的「口径未确认」标记（``basis_uncertain``）由
+    :func:`classify_instrument_detailed` 给出；本函数只保留四元组契约，
+    供既有调用方与测试使用。
     """
-    code = _normalize_code(code)
-    root = str(data_dir or DATA_DIR)
-    stock_path = os.path.join(root, f"stock_{code}_qfq.csv")
-    fund_path = os.path.join(root, f"fund_{code}.csv")
-    static_type = "etf" if _is_etf_code(code) else "stock"
-
-    if os.path.exists(stock_path):
-        return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
-                f"stock_{code}_qfq.csv 存在（前复权）")
-
-    if os.path.exists(fund_path):
-        kind = _fund_file_kind(fund_path)
-        if kind == "fund":
-            return ("fund", PRICE_SOURCE_FUND, PRICE_CALIBER_NAV,
-                    f"仅 fund_{code}.csv 且 open==close（单位净值）")
-        if kind == "etf":
-            # 只有未复权的交易所行情：口径无法确定 → 按 brief 走原 stock/qfq
-            # 路径并写明实情。结算时该文件不存在 → no_price_data + 拒绝换源告警，
-            # 绝不拿未复权价冒充 qfq 或净值。
-            return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
-                    f"仅 fund_{code}.csv 且为交易所 OHLC（未复权，非净值）；"
-                    f"无 stock_*_qfq.csv，按原 stock/qfq 路径并告警")
-        return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
-                f"fund_{code}.csv 存在但无法解析，退回代码段静态判定")
-
-    return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
-            f"无本地缓存，按代码段静态判定（{'场内基金' if static_type == 'etf' else '个股'}）")
+    inst_type, source, caliber, basis, _uncertain = \
+        classify_instrument_detailed(code, data_dir=data_dir)
+    return (inst_type, source, caliber, basis)
 
 
 def _sub_block(source, keys, missing, prefix):
@@ -381,6 +431,10 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
         "price_source": None,
         "price_caliber": None,
         "instrument_basis": None,
+        # issue #99 additive：记录时**没有任何可用缓存**导致口径未确认时为 True，
+        # 首次结算成功前允许一次重判（只能 uncertain → 确认）。已确认记录恒为
+        # False，永不重判 —— 口径记录时确定、结算时不再更改。
+        "basis_uncertain": False,
         "missing": {},
         "settled": None,
         "settle_reason": None,
@@ -393,11 +447,15 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
     # 类型/价源在**记录时**就定下来（不依赖结算时的文件状态，否则缓存一变
     # 口径就跟着变）。payload 只用于确认「这只标的确实跑过 CLI」，不参与
     # 类型判定 —— ``request.type`` 是取数通道，auto 会回落。
-    inst_type, price_source, price_caliber, basis = classify_instrument(code)
+    # issue #99：记录时没有任何可用缓存时口径无法确认，写 ``basis_uncertain``，
+    # 首次结算成功前允许一次重判（只能 uncertain → 确认）。
+    (inst_type, price_source, price_caliber, basis,
+     uncertain) = classify_instrument_detailed(code)
     rec["instrument_type"] = inst_type
     rec["price_source"] = price_source
     rec["price_caliber"] = price_caliber
     rec["instrument_basis"] = basis
+    rec["basis_uncertain"] = bool(uncertain)
 
     if not isinstance(payload, dict):
         reason = ("cli_failed" if cli_exit not in (0, None) else "cli_no_json")
@@ -583,6 +641,9 @@ def resolve_price_plan(record, code=None):
       阶段同一套规则（:func:`classify_instrument`）：只有 ``fund_*.csv`` 存在、
       内容确认为**单位净值**（``open == close`` 且无交易所列）、且**没有**
       ``stock_*_qfq.csv`` 时才判 ``fund`` / ``fund_nav``。判定依据写进 ``basis``。
+    * ``basis_uncertain=true`` 的记录（issue #99：记录时无可用缓存）→ 重新判定
+      一次，**只允许 uncertain → 确认**：新判定确认了口径就采用新值；仍无法
+      确认就沿用记录值（不把确认记录改成 uncertain，见 :func:`rejudge_record`）。
 
     老记录里即便有 ``instrument_type`` 也**不采信**：PR #96 曾把它写成 CLI 的
     ``request.type``（取数通道），那可能是 auto 回落的结果（个股被标成 fund）。
@@ -596,12 +657,56 @@ def resolve_price_plan(record, code=None):
         caliber = record.get("price_caliber")
         if caliber not in (PRICE_CALIBER_QFQ, PRICE_CALIBER_NAV):
             caliber = price_caliber_for(inst_type)
+        if _is_basis_uncertain(record):
+            # issue #99：口径未确认 → 结算前重判一次，只接受「确认」结果。
+            rejudged = rejudge_record(record, code)
+            if rejudged is not None:
+                return rejudged
         return (inst_type, recorded, caliber,
-                f"记录价源 price_source={recorded}")
+                f"记录价源 price_source={recorded}（记录时确定，结算不再更改）")
 
     inst_type, source, caliber, basis = classify_instrument(code)
     return (inst_type, source, caliber,
-            f"老记录无 price_source → {basis}；默认 stock/qfq")
+            f"老记录无 price_source → {basis}；默认 stock/qfq"
+            f"（记录时确定，结算不再更改）")
+
+
+def _is_basis_uncertain(record):
+    """记录的口径是否**未确认**（issue #99）。
+
+    只有显式 ``basis_uncertain=true`` 才算未确认。老记录没有这个键 —— 它们
+    在引入该字段之前写下，按当时的规则已确认过口径，**不重判**（否则会把
+    已经按记录价源结算过的历史记录改成另一套口径）。
+    """
+    return record.get("basis_uncertain") is True
+
+
+def rejudge_record(record, code=None):
+    """重判一条 ``basis_uncertain`` 记录的口径（issue #99）。
+
+    返回 ``(instrument_type, price_source, caliber, basis)`` 并**原地更新**
+    ``record`` 的四个口径字段 + ``basis_uncertain``；仍然无法确认时返回
+    ``None``（记录保持原样，下次结算再试）。
+
+    严格单向：只有 ``uncertain → 确认``。已确认记录、已结算记录一律不动 ——
+    「记录时确定、结算时不再更改」是口径契约，重判只是补齐记录时缺的依据。
+    """
+    if not _is_basis_uncertain(record):
+        return None
+    if isinstance(record.get("settled"), dict):
+        # 已结算记录的数值不得改变：口径已随结算生效，不再重判。
+        return None
+    code = _normalize_code(code or record.get("code"))
+    inst_type, source, caliber, basis, uncertain = \
+        classify_instrument_detailed(code)
+    if uncertain:
+        return None
+    record["instrument_type"] = inst_type
+    record["price_source"] = source
+    record["price_caliber"] = caliber
+    record["instrument_basis"] = f"首次结算前重判：{basis}"
+    record["basis_uncertain"] = False
+    return (inst_type, source, caliber, record["instrument_basis"])
 
 
 def load_price_bars(code, instrument_type=None, price_source=None):
@@ -781,12 +886,18 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
     每次重算（缓存更新后可用新数据修正），幂等。价源**严格按记录里写下的
     ``price_source`` 走**（:func:`resolve_price_plan`），绝不换源；缓存按
     ``(code, price_source)`` 分键 —— 同一代码在个股与基金两侧都可能有记录。
+
+    issue #99：``basis_uncertain=true`` 的记录（记录时无可用缓存）在**首次
+    结算成功前**重判一次口径，重判成功会把记录字段改写成确认值并写盘，code
+    列进返回的 ``rejudged``。已确认 / 已结算记录永不重判。
     """
     price_loader = price_loader or load_price_bars
     wanted = None if not codes else {_normalize_code(c) for c in codes}
     stats = {"days": 0, "settled": 0, "not_matured": 0, "pending": 0,
              "failed": 0, "reasons": {}, "pending_reasons": {},
-             "failed_reasons": {}, "basis": {}, "warnings": []}
+             "failed_reasons": {}, "basis": {}, "warnings": [],
+             # issue #99：本次结算前完成「口径未确认 → 确认」重判的 code。
+             "rejudged": []}
     cache = {}
     for day in list_days(ledger_dir):
         payload = load_day(day, ledger_dir)
@@ -799,7 +910,18 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
                 continue
             if not isinstance(record, dict):
                 continue
+            before = (record.get("instrument_type"), record.get("price_source"),
+                      record.get("price_caliber"), record.get("instrument_basis"),
+                      record.get("basis_uncertain"))
             inst_type, source, caliber, basis = resolve_price_plan(record, code)
+            if before != (record.get("instrument_type"), record.get("price_source"),
+                          record.get("price_caliber"),
+                          record.get("instrument_basis"),
+                          record.get("basis_uncertain")):
+                # 只有「未确认 → 确认」会改字段（见 rejudge_record 的单向约束）。
+                changed = True
+                if code not in stats["rejudged"]:
+                    stats["rejudged"].append(code)
             stats["basis"].setdefault(code, basis)
             cache_key = (code, source)
             if cache_key not in cache:
@@ -949,10 +1071,13 @@ def build_report(ledger_dir=None):
 
     settle_counts = {SETTLE_STATUS_SETTLED: 0, SETTLE_STATUS_NOT_MATURED: 0,
                      SETTLE_STATUS_PENDING: 0, SETTLE_STATUS_FAILED: 0}
+    uncertain = 0
     for _day, _code, record in all_records:
         status = infer_settle_status(record)
         if status in settle_counts:
             settle_counts[status] += 1
+        if _is_basis_uncertain(record):
+            uncertain += 1
     pending = settle_counts[SETTLE_STATUS_PENDING]
     failed = settle_counts[SETTLE_STATUS_FAILED]
 
@@ -1039,6 +1164,9 @@ def build_report(ledger_dir=None):
         "settle_status": settle_counts,
         "pending": pending,
         "failed": failed,
+        # issue #99：口径未确认（记录时无可用缓存）的记录条数。这些记录在首次
+        # 结算成功前会被重判一次；数量长期不降说明缓存一直没补齐。
+        "basis_uncertain": uncertain,
         "directional_matured": hit_n,
         "hit_rate": hit_rate,
         "horizon_days": HORIZON_DAYS,
@@ -1069,6 +1197,10 @@ def format_report(report):
         f"待结算 pending {report['pending']} 条，"
         f"结算失败 {report['failed']} 条",
     ]
+    if report.get("basis_uncertain"):
+        # issue #99：口径未确认的记录单独提示，避免「pending 一堆」却看不出原因。
+        lines.append(f"  口径未确认 {report['basis_uncertain']} 条"
+                     f"（记录时无可用缓存，首次结算成功前重判一次）")
     if report["by_action"]:
         lines.append("  按 action：")
         for action in sorted(report["by_action"], key=lambda item: str(item)):

@@ -171,6 +171,10 @@ def evaluate(ledger_dir=None):
     print(line)
     if stats["pending_reasons"]:
         print(f"  pending 原因：{stats['pending_reasons']}")
+    # issue #99：口径未确认 → 确认的重判必须可见，否则「记录时钉错来源又悄悄
+    # 改掉」没人能复核。只列 code，依据文本在台账的 instrument_basis 里。
+    if stats.get("rejudged"):
+        print(f"  口径重判（记录时无可用缓存 → 已确认）：{', '.join(stats['rejudged'])}")
     for warning in stats.get("warnings") or []:
         print(f"  [WARN] {warning}")
     if not LOG.exists():
