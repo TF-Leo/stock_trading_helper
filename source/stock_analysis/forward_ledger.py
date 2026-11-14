@@ -45,26 +45,32 @@ R4 的 C 路径（校准，Brier 改善 ≥0.02）要求 **≥200 条已到期�
   ``insufficient_data`` **没有方向**，不参与命中率与校准（只在 ``by_action`` 里
   计数），避免把「不动作」当成猜对。
 
-场外基金（issue #95）
----------------------
+场外基金（issue #95 / PR #96 复验）
+-----------------------------------
 基金净值不在 ``stock_*_qfq.csv`` 里，而在 ``fund_*.csv``（OTC 场外基金只有单位
 净值，``meta.get_fund_daily`` 把 ``open`` 补成净值；场内 ETF 是真实 OHLC）。
-``load_price_bars`` 因此**按标的类型选源**，取价口径不变
-（``open_{d+1+20} / open_{d+1} − 1``）：
+结算**按记录里已记录的价源**取价，取价口径不变（``open_{d+1+20} / open_{d+1} − 1``）：
 
-* 类型判定优先用记录里的 ``instrument_type``（记录阶段从 CLI 的
-  ``request.type`` 落下，additive 字段）；老记录没有该字段时退回文件探测 ——
-  **先找 ``stock_*_qfq.csv``，再找 ``fund_*.csv``**，与修复前行为一致
-  （``510300`` 这类场内 ETF 两份缓存都有，老记录仍走个股路径，不改变历史口径）。
-* 结算里的 ``price_source`` 写真实来源：个股 ``local_qfq_cache``、
-  基金 ``fund_nav``。
-* ``settle_status`` 把「没到期 / 数据未到」和「真失败」分开：
+* 记录阶段写入 ``instrument_type`` / ``price_source`` / ``price_caliber`` /
+  ``instrument_basis``（additive 字段）。类型**不取 CLI 的 ``request.type``** ——
+  那是取数通道，``auto`` 失败会回落到另一侧（实测把个股标成 fund、把 ETF 标成
+  fund），按它结算会永久用错口径。判定依据是**数据文件类型**（``fund_*.csv`` 是
+  净值还是交易所 OHLC）＋代码段静态信息，见 :func:`classify_instrument`。
+* 个股与**场内 ETF** 都走 ``stock_*_qfq.csv``（前复权，与修复前口径一致）；
+  只有**场外基金**走 ``fund_*.csv`` 的单位净值（净值对净值）。
+* **绝不跨源回退**：记录里写的是哪个来源，结算就只读那个文件；该文件缺失 /
+  损坏 / 空 / 无 ``open`` 列 → ``no_price_data``（``failed``），不再滑到另一个
+  口径。老记录（无 ``price_source`` / ``instrument_type``）按 brief 默认
+  **stock/qfq**；只有当 ``fund_*.csv`` 存在、确认是**净值**、且没有
+  ``stock_*_qfq.csv`` 时才判 fund。判定依据写进 ``settle_all()`` 返回的
+  ``basis``（不拼进 ``settle_reason``：那是个可聚合的枚举，拼字符串会让按
+  reason 计数失真）。
+* ``settle_status`` 把「没到期 / 数据未到 / 从未结算」和「真失败」分开：
   ``settled`` / ``not_matured``（还没攒够 20 根）/ ``pending``
-  （``no_bars_after_as_of``：as_of 之后一根都没有，通常是缓存还没更新）/
-  ``failed``（``no_price_data`` / ``open_missing`` / ``price_parse_error``）。
-  ``pending`` 与 ``not_matured`` **不计入失败率**。``price_source`` 取
-  ``load_price_bars`` 实际读到的文件（``bars.attrs``），老记录探测到
-  ``fund_*.csv`` 也会如实标 ``fund_nav``。
+  （``no_bars_after_as_of``：as_of 之后一根都没有，通常是缓存还没更新；以及
+  **从未跑过 evaluate** 的记录）/ ``failed``（``no_price_data`` /
+  ``open_missing`` / ``price_parse_error``）。``pending`` 与 ``not_matured``
+  **不计入失败率**。
 * ``confidence`` 当作「该方向判断正确的概率」用于校准（Brier）。这是 C 路径的
   操作性定义；它回答的是「置信度可不可信」，不回答「买点好不好」。
 """
@@ -89,20 +95,32 @@ HORIZON_DAYS = 20
 
 DIRECTIONAL_ACTIONS = ("buy", "sell")
 
-#: 标的类型（issue #95）。记录阶段从 CLI 的 ``request.type`` 落下；
-#: 决定结算时读 ``stock_*_qfq.csv`` 还是 ``fund_*.csv``。
-INSTRUMENT_TYPES = ("stock", "fund")
+#: 标的类型（issue #95 / PR #96 复验）。**不是** CLI 的 ``request.type``：
+#: 那是取数通道（``auto`` 会回落），按它结算会把个股/ETF 永久钉在错误口径上。
+#: ``etf`` 与 ``stock`` 都读 ``stock_*_qfq.csv``（前复权，与历史口径一致），
+#: 只有 ``fund``（场外基金）读 ``fund_*.csv`` 的单位净值。
+INSTRUMENT_TYPES = ("stock", "etf", "fund")
 
-#: 结算来源标注（写进 ``settled.price_source``，issue #95 要求真实来源）。
+#: 结算来源标注（写进 ``settled.price_source``）。
 PRICE_SOURCE_STOCK = "local_qfq_cache"
 PRICE_SOURCE_FUND = "fund_nav"
+PRICE_SOURCES = (PRICE_SOURCE_STOCK, PRICE_SOURCE_FUND)
+
+#: 取价口径（记录阶段写下，结算严格按记录走）：
+#: ``qfq_open_to_open`` = 前复权开盘对开盘；``nav_to_nav`` = 单位净值对单位净值
+#: （OTC 场外基金没有开盘价，``open`` 由净值补齐）。
+PRICE_CALIBER_QFQ = "qfq_open_to_open"
+PRICE_CALIBER_NAV = "nav_to_nav"
 
 #: ``settle_status`` 取值。``pending`` / ``not_matured`` 都**不算失败**：
-#: 前者是「as_of 之后还没有行情」（缓存没更新），后者是「还没攒够 20 根」。
+#: 前者是「as_of 之后还没有行情」（缓存没更新）或「从未跑过 evaluate」，
+#: 后者是「还没攒够 20 根」。
 SETTLE_STATUS_SETTLED = "settled"
 SETTLE_STATUS_NOT_MATURED = "not_matured"
 SETTLE_STATUS_PENDING = "pending"
 SETTLE_STATUS_FAILED = "failed"
+SETTLE_STATUSES = (SETTLE_STATUS_SETTLED, SETTLE_STATUS_NOT_MATURED,
+                   SETTLE_STATUS_PENDING, SETTLE_STATUS_FAILED)
 
 #: ``settle_reason`` → ``settle_status`` 的**非失败**映射。未列出的
 #: （``no_price_data`` / ``open_missing`` / ``price_parse_error``）一律 ``failed``。
@@ -111,6 +129,11 @@ _NON_FAILURE_STATUS = {
     "not_matured": SETTLE_STATUS_NOT_MATURED,
     "no_bars_after_as_of": SETTLE_STATUS_PENDING,
 }
+
+#: 场内基金代码段：沪市 5 开头（510/511/512/513/515/516/518/588…），
+#: 深市 15/16/18（159 ETF、160/161/162/163/164/165/166/167/168 LOF、180）。
+#: 这些**不是**场外基金，结算走 ``stock_*_qfq.csv``（前复权），与历史口径一致。
+ETF_CODE_PREFIXES = ("5", "15", "16", "18")
 
 #: ``confidence`` 校准分箱（左闭右开，最后一箱右闭）。
 CONFIDENCE_BINS = ((0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0))
@@ -208,6 +231,101 @@ def _normalize_code(code):
     return digits[-6:] if len(digits) >= 6 else text
 
 
+def _is_etf_code(code):
+    """场内基金代码段（ETF/LOF）：沪市 ``5*``、深市 ``15/16/18*``。
+
+    只用于**没有**可靠数据文件证据时的静态兜底 —— 真正的判定看
+    :func:`classify_instrument` 读到的缓存文件内容。
+    """
+    code = _normalize_code(code)
+    return len(code) == 6 and code.startswith(ETF_CODE_PREFIXES)
+
+
+def _fund_file_kind(path):
+    """``fund_*.csv`` 是**场外净值**还是**场内交易所 OHLC**。
+
+    判据（任一成立即 ``etf``）：
+
+    * 有 ``amount`` / ``postVol`` / ``postAmt`` 列 —— 交易所行情独有；
+    * ``open`` 与 ``close`` 存在差异 —— 净值路径下 ``get_fund_daily`` 把
+      ``open/high/low`` 全部补成净值，三者逐值相等。
+
+    读不出来返回 ``None``（调用方不得据此判定，宁可退回 stock/qfq）。
+    """
+    import pandas as pd
+
+    try:
+        frame = pd.read_csv(path, index_col=0, parse_dates=True)
+    except Exception:
+        return None
+    if frame is None or len(frame) == 0 or "open" not in frame.columns:
+        return None
+    if any(col in frame.columns for col in ("amount", "postVol", "postAmt")):
+        return "etf"
+    if "close" not in frame.columns:
+        return None
+    try:
+        diff = (frame["open"].astype(float) - frame["close"].astype(float)).abs()
+        return "etf" if bool((diff > 1e-9).any()) else "fund"
+    except Exception:
+        return None
+
+
+def classify_instrument(code, data_dir=None):
+    """判定标的类型与实际价源（PR #96 复验 P1-2 / P1-3）。
+
+    返回 ``(instrument_type, price_source, price_caliber, basis)``：
+
+    * ``instrument_type`` ∈ :data:`INSTRUMENT_TYPES`；
+    * ``price_source`` / ``price_caliber`` 是**结算时必须读的那一个来源**；
+    * ``basis`` 是判定依据（人可读，写进记录便于事后复核）。
+
+    **不看 CLI 的 ``request.type``** —— 它是取数通道，``auto`` 失败会回落
+    （实测把个股标成 fund、把 ETF 标成 fund），据此结算会永久用错口径。
+    判定顺序：
+
+    1. ``stock_*_qfq.csv`` 存在 → ``stock``（个股）或 ``etf``（代码段属场内基金），
+       一律 ``local_qfq_cache`` / ``qfq_open_to_open``。ETF 维持 qfq 口径 ——
+       ``fund_*.csv`` 里的 ETF 是**未复权**交易所行情，换成它会在除权日凭空
+       造出 1.3–2.5% 的跌幅。
+    2. 只有 ``fund_*.csv``，且内容是**单位净值**（``open == close``）→ ``fund`` /
+       ``fund_nav`` / ``nav_to_nav``。
+    3. 只有 ``fund_*.csv``，但内容是交易所 OHLC（未复权）→ **无法确定 qfq
+       口径**：按 brief 默认走原 stock/qfq 路径，``basis`` 写明实情。结算时
+       ``stock_*_qfq.csv`` 不存在即 ``no_price_data``（并输出「拒绝换源」告警），
+       **不会**拿未复权价冒充 qfq 或净值。
+    4. 两份都没有 → 按代码段静态判定（``etf`` / ``stock``），
+       ``price_source`` 取该类型的常规来源，结算时缺文件即 ``no_price_data``。
+    """
+    code = _normalize_code(code)
+    root = str(data_dir or DATA_DIR)
+    stock_path = os.path.join(root, f"stock_{code}_qfq.csv")
+    fund_path = os.path.join(root, f"fund_{code}.csv")
+    static_type = "etf" if _is_etf_code(code) else "stock"
+
+    if os.path.exists(stock_path):
+        return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
+                f"stock_{code}_qfq.csv 存在（前复权）")
+
+    if os.path.exists(fund_path):
+        kind = _fund_file_kind(fund_path)
+        if kind == "fund":
+            return ("fund", PRICE_SOURCE_FUND, PRICE_CALIBER_NAV,
+                    f"仅 fund_{code}.csv 且 open==close（单位净值）")
+        if kind == "etf":
+            # 只有未复权的交易所行情：口径无法确定 → 按 brief 走原 stock/qfq
+            # 路径并写明实情。结算时该文件不存在 → no_price_data + 拒绝换源告警，
+            # 绝不拿未复权价冒充 qfq 或净值。
+            return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
+                    f"仅 fund_{code}.csv 且为交易所 OHLC（未复权，非净值）；"
+                    f"无 stock_*_qfq.csv，按原 stock/qfq 路径并告警")
+        return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
+                f"fund_{code}.csv 存在但无法解析，退回代码段静态判定")
+
+    return (static_type, PRICE_SOURCE_STOCK, PRICE_CALIBER_QFQ,
+            f"无本地缓存，按代码段静态判定（{'场内基金' if static_type == 'etf' else '个股'}）")
+
+
 def _sub_block(source, keys, missing, prefix):
     """从 CLI 子块里摘出 ``keys``；源块缺失或键缺失都记进 ``missing``。
 
@@ -256,9 +374,13 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
         "cli_exit": cli_exit,
         "elapsed_s": elapsed_s,
         "recorded_at": _now_iso(now),
-        # issue #95 additive：结算时按类型选价源（``stock_*_qfq.csv`` / ``fund_*.csv``）。
-        # 老记录没有这个键，``load_price_bars`` 退回文件探测。
+        # PR #96 复验 P1-2/P1-3 additive：记录**当时实际使用的**标的类型与价源。
+        # 结算严格按这里走，绝不换源。老记录没有这些键时按 brief 默认 stock/qfq，
+        # 只有明确的净值缓存且无 stock 缓存才判 fund（见 :func:`classify_instrument`）。
         "instrument_type": None,
+        "price_source": None,
+        "price_caliber": None,
+        "instrument_basis": None,
         "missing": {},
         "settled": None,
         "settle_reason": None,
@@ -267,6 +389,15 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
         "settle_status": None,
     }
     missing = rec["missing"]
+
+    # 类型/价源在**记录时**就定下来（不依赖结算时的文件状态，否则缓存一变
+    # 口径就跟着变）。payload 只用于确认「这只标的确实跑过 CLI」，不参与
+    # 类型判定 —— ``request.type`` 是取数通道，auto 会回落。
+    inst_type, price_source, price_caliber, basis = classify_instrument(code)
+    rec["instrument_type"] = inst_type
+    rec["price_source"] = price_source
+    rec["price_caliber"] = price_caliber
+    rec["instrument_basis"] = basis
 
     if not isinstance(payload, dict):
         reason = ("cli_failed" if cli_exit not in (0, None) else "cli_no_json")
@@ -307,16 +438,6 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
                              FLOW_KEYS + FLOW_EXTRA_KEYS, missing, "flow")
     rec["valuation"] = _sub_block(evidence.get("valuation"),
                                   VALUATION_KEYS, missing, "valuation")
-
-    # issue #95：CLI 的 ``request.type`` 是唯一可靠的标的类型来源（``board``
-    # 只看 5 开头，场外基金 0/1 段会被判成 unknown，不能用来选价源）。
-    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
-    inst_type = request.get("type")
-    if inst_type in INSTRUMENT_TYPES:
-        rec["instrument_type"] = inst_type
-    else:
-        missing["instrument_type"] = (
-            "cli_block_absent" if not request else "field_absent_in_cli_output")
 
     market = payload.get("market_regime")
     rec["market_regime"] = _sub_block(market, REGIME_KEYS, missing, "market_regime")
@@ -429,69 +550,114 @@ def record_day(codes, as_of=None, ledger_dir=None, runner=None, now=None):
 # 结算
 # ---------------------------------------------------------------------------
 def price_source_for(instrument_type):
-    """标的类型 → ``settled.price_source`` 标注（issue #95）。"""
+    """标的类型 → 该类型的常规 ``price_source`` 标注（仅作**缺省**）。
+
+    ``etf`` 与 ``stock`` 都读 ``stock_*_qfq.csv``（``local_qfq_cache``），
+    只有 ``fund``（场外基金）读单位净值（``fund_nav``）。
+    """
     return PRICE_SOURCE_FUND if instrument_type == "fund" else PRICE_SOURCE_STOCK
 
 
-def price_cache_path(code, instrument_type):
+def price_caliber_for(instrument_type):
+    """标的类型 → 该类型的常规取价口径（``qfq_open_to_open`` / ``nav_to_nav``）。"""
+    return PRICE_CALIBER_NAV if instrument_type == "fund" else PRICE_CALIBER_QFQ
+
+
+def price_cache_path(code, instrument_type, data_dir=None):
     """该标的的价格缓存路径；``fund`` 走 ``fund_*.csv``，其余走 ``stock_*_qfq.csv``。"""
     code = _normalize_code(code)
+    root = str(data_dir or DATA_DIR)
     if instrument_type == "fund":
-        return os.path.join(DATA_DIR, f"fund_{code}.csv")
-    return os.path.join(DATA_DIR, f"stock_{code}_qfq.csv")
+        return os.path.join(root, f"fund_{code}.csv")
+    return os.path.join(root, f"stock_{code}_qfq.csv")
 
 
-def load_price_bars(code, instrument_type=None):
-    """读该标的的日线缓存；缺失 / 不可读返回 ``None``（issue #95）。
+def resolve_price_plan(record, code=None):
+    """记录 → 结算价源计划 ``(instrument_type, price_source, caliber, basis)``。
 
-    个股读 ``stock_*_qfq.csv``（前复权），场外基金读 ``fund_*.csv``（单位净值，
-    ``open`` 由 ``data_loader.meta.get_fund_daily`` 用净值补齐）。
+    **结算严格按记录里写下的价源走，绝不换源**（PR #96 复验 P1-1 / P1-3）。
 
-    ``instrument_type`` 为空（老记录没有这个键）时**文件探测**：先
-    ``stock_*_qfq.csv``，再 ``fund_*.csv``。顺序是有意的 —— ``510300`` 这类
-    场内 ETF 两份缓存都可能存在，先个股与修复前行为一致，历史口径不变。
+    * 记录有 ``price_source``（本版本记录阶段落的）→ 直接用记录值；``fund_nav``
+      读 ``fund_*.csv``，``local_qfq_cache`` 读 ``stock_*_qfq.csv``。
+    * 老记录（无 ``price_source``）→ 按 brief 默认 **stock/qfq**，判定与记录
+      阶段同一套规则（:func:`classify_instrument`）：只有 ``fund_*.csv`` 存在、
+      内容确认为**单位净值**（``open == close`` 且无交易所列）、且**没有**
+      ``stock_*_qfq.csv`` 时才判 ``fund`` / ``fund_nav``。判定依据写进 ``basis``。
 
-    返回的 DataFrame 在 ``attrs["price_source"]`` 上标注**实际读到的**来源，
-    供 :func:`compute_settlement` 写进结算记录：老记录即使没落
-    ``instrument_type``，只要真读了 ``fund_*.csv`` 也不会被标成
-    ``local_qfq_cache``（issue #95 要求 2）。
+    老记录里即便有 ``instrument_type`` 也**不采信**：PR #96 曾把它写成 CLI 的
+    ``request.type``（取数通道），那可能是 auto 回落的结果（个股被标成 fund）。
+    """
+    code = _normalize_code(code or record.get("code"))
+    recorded = record.get("price_source")
+    inst_type = record.get("instrument_type")
+    if recorded in PRICE_SOURCES:
+        if inst_type not in INSTRUMENT_TYPES:
+            inst_type = "fund" if recorded == PRICE_SOURCE_FUND else "stock"
+        caliber = record.get("price_caliber")
+        if caliber not in (PRICE_CALIBER_QFQ, PRICE_CALIBER_NAV):
+            caliber = price_caliber_for(inst_type)
+        return (inst_type, recorded, caliber,
+                f"记录价源 price_source={recorded}")
+
+    inst_type, source, caliber, basis = classify_instrument(code)
+    return (inst_type, source, caliber,
+            f"老记录无 price_source → {basis}；默认 stock/qfq")
+
+
+def load_price_bars(code, instrument_type=None, price_source=None):
+    """读该标的的日线缓存；缺失 / 不可读返回 ``None``。
+
+    **单一来源，绝不跨源回退**（PR #96 复验 P1-1）：``price_source`` 指定了
+    哪个文件就只读那个；该文件不存在、读不出、为空、没有 ``open`` 列，一律返回
+    ``None``，由上层记 ``no_price_data``。不再「stock 坏了就滑到 fund」——
+    那会拿另一套口径（未复权 / 净值）算出收益并标成看似正常的来源。
+
+    ``price_source`` 为空时按 ``instrument_type`` 取常规来源（``fund`` →
+    ``fund_*.csv``，其余 → ``stock_*_qfq.csv``）；两者都为空按 brief 默认
+    **stock/qfq**。这里**不做**任何跨源探测：老记录到底该读哪一份，由
+    :func:`resolve_price_plan` 在调用前一次性定好（它才看得到 ``fund_*.csv``
+    是净值还是交易所行情）。
+
+    返回的 DataFrame 在 ``attrs["price_source"]`` 上标注**实际读到的**来源。
     """
     import pandas as pd
 
-    if instrument_type in INSTRUMENT_TYPES:
-        candidates = [(price_cache_path(code, instrument_type),
-                       price_source_for(instrument_type))]
+    if price_source in PRICE_SOURCES:
+        source = price_source
     else:
-        candidates = [(price_cache_path(code, "stock"), PRICE_SOURCE_STOCK),
-                      (price_cache_path(code, "fund"), PRICE_SOURCE_FUND)]
-    for path, source in candidates:
-        if not os.path.exists(path):
-            continue
-        try:
-            bars = pd.read_csv(path, index_col=0, parse_dates=True)
-        except Exception:
-            continue
-        if bars is None or len(bars) == 0 or "open" not in bars.columns:
-            continue
-        bars = bars.sort_index()
-        try:
-            bars.attrs["price_source"] = source
-        except Exception:  # pragma: no cover - 老 pandas 没有 attrs
-            pass
-        return bars
-    return None
+        source = price_source_for(instrument_type)
+    path = price_cache_path(
+        code, "fund" if source == PRICE_SOURCE_FUND else "stock")
+    if not os.path.exists(path):
+        return None
+    try:
+        bars = pd.read_csv(path, index_col=0, parse_dates=True)
+    except Exception:
+        # 存在但读不出来 = 该来源不可用；**不滑到另一个口径**。
+        return None
+    if bars is None or len(bars) == 0 or "open" not in bars.columns:
+        return None
+    bars = bars.sort_index()
+    try:
+        bars.attrs["price_source"] = source
+    except Exception:  # pragma: no cover - 老 pandas 没有 attrs
+        pass
+    return bars
 
 
-def _call_price_loader(loader, code, instrument_type):
-    """按 loader 的签名传参：新 loader 收 ``instrument_type``，旧替身只收 code。
+def _call_price_loader(loader, code, instrument_type, price_source=None):
+    """按 loader 的签名传参：新 loader 收 ``price_source``，旧替身只收 code。
 
     测试与外部调用历史上注入的都是 ``lambda code: frame``；为了不让 issue #95
-    破坏这些调用方，只有 loader 显式声明了 ``instrument_type`` 参数才传。
+    破坏这些调用方，只有 loader 显式声明了对应参数才传。
     """
     try:
         params = inspect.signature(loader).parameters
     except (TypeError, ValueError):
         params = {}
+    if "price_source" in params:
+        return loader(code, instrument_type=instrument_type,
+                      price_source=price_source)
     if "instrument_type" in params:
         return loader(code, instrument_type=instrument_type)
     return loader(code)
@@ -509,16 +675,20 @@ def settle_status_for(reason):
     return _NON_FAILURE_STATUS.get(reason, SETTLE_STATUS_FAILED)
 
 
-def compute_settlement(record, bars, horizon=HORIZON_DAYS):
+def compute_settlement(record, bars, horizon=HORIZON_DAYS, price_source=None):
     """``open_{d+1+h} / open_{d+1} − 1``；返回 ``(settled, reason)``。
 
     ``settled`` 为 ``None`` 时 ``reason`` 说明为什么（``not_matured`` /
     ``no_price_data`` / ``open_missing`` ...）。**不猜、不缩短持有期。**
 
-    ``price_source`` 标注**真实来源**（issue #95）：优先用
-    ``bars.attrs["price_source"]``（:func:`load_price_bars` 实际读到的文件），
-    其次按记录的 ``instrument_type`` 推断 —— 个股 ``local_qfq_cache``、
-    基金 ``fund_nav``。注入自定义 ``price_loader`` 时没有 attrs，走类型推断。
+    ``price_source`` 由 :func:`resolve_price_plan` 按记录决定，**不由读到的
+    文件反推**（PR #96 复验：先换源再按文件自报来源，等于把错误口径包装成
+    正常结果）。调用方不传时退回 ``bars.attrs``（:func:`load_price_bars`
+    实际读到的文件）与记录里的类型。
+
+    取价口径（``qfq_open_to_open`` / ``nav_to_nav``）记在**记录级**
+    ``price_caliber``（记录阶段落下），不写进 ``settled`` —— 那会让已结算记录
+    被重写，违反「老台账首次 evaluate 只允许新增 ``settle_status``」的迁移约束。
     """
     if bars is None or len(bars) == 0:
         return None, "no_price_data"
@@ -559,37 +729,64 @@ def compute_settlement(record, bars, horizon=HORIZON_DAYS):
         "entry_open": round(entry_open, 6),
         "exit_open": round(exit_open, 6),
         "horizon_days": int(horizon),
-        "price_source": _price_source_of(record, bars),
+        "price_source": price_source or _price_source_of(record, bars),
     }, None
 
 
 def _price_source_of(record, bars):
-    """结算来源：先看价源文件自报（``bars.attrs``），再退回记录类型。"""
+    """结算来源兜底：记录里写下的价源优先，其次 ``bars.attrs``，最后按类型。"""
+    recorded = record.get("price_source")
+    if recorded in PRICE_SOURCES:
+        return recorded
     attrs = getattr(bars, "attrs", None)
     if isinstance(attrs, dict):
         source = attrs.get("price_source")
-        if source in (PRICE_SOURCE_STOCK, PRICE_SOURCE_FUND):
+        if source in PRICE_SOURCES:
             return source
     return price_source_for(record.get("instrument_type"))
+
+
+def _no_price_data_warning(code, price_source):
+    """记录价源缺失时的告警文案：说清「另一侧有缓存但**拒绝换源**」。
+
+    PR #96 复验 P1-1 的核心是「宁可 failed 也不换源」，但失败原因必须可见 ——
+    否则运维只看到 ``no_price_data``，不知道旁边明明有另一份（错误口径的）缓存。
+    """
+    other = (PRICE_SOURCE_STOCK if price_source == PRICE_SOURCE_FUND
+             else PRICE_SOURCE_FUND)
+    other_path = price_cache_path(code, "fund" if other == PRICE_SOURCE_FUND
+                                  else "stock")
+    if os.path.exists(other_path):
+        return (f"{code}: 记录价源 {price_source} 不可用；另一来源存在但口径不同，"
+                f"已按规则拒绝换源（{other_path}）")
+    return None
 
 
 def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_DAYS,
                now=None):
     """结算所有已到期记录。
 
-    返回 ``{"days", "settled", "not_matured", "pending", "failed", "reasons"}``。
+    返回 ``{"days", "settled", "not_matured", "pending", "failed",
+    "reasons", "pending_reasons", "failed_reasons", "basis", "warnings"}``。
+
     ``not_matured``（未攒够 20 根）与 ``pending``（``no_bars_after_as_of``，
     数据未到）**都不算失败**，``failed`` 只统计真拿不到价的情况。
+    ``reasons`` 是 pending + failed 原因的并集（既有键，语义不变）；
+    ``pending_reasons`` / ``failed_reasons`` 分开计数，供输出避免
+    「失败 0 条」后面挂一串 pending 原因（PR #96 复验 P2-2）。
+    ``basis`` 是 ``{code: 判定依据}``，让「为什么这只票用了这个价源」可追溯。
+    ``warnings`` 记录「本该用 A 口径、A 缺失而 B 存在」这类**拒绝换源**的情况：
+    结果是 ``failed``，但原因必须可见，不能像修复前那样静默滑过去。
 
-    每次重算（缓存更新后可用新数据修正），幂等。价源按记录类型选：
-    ``price_loader`` 若接受 ``instrument_type`` 就传，否则按 code 调用（兼容
-    旧的单参测试替身）。缓存按 ``(code, instrument_type)`` 分键 —— 同一代码
-    在个股与基金两侧都可能有记录，混用缓存会拿错价。
+    每次重算（缓存更新后可用新数据修正），幂等。价源**严格按记录里写下的
+    ``price_source`` 走**（:func:`resolve_price_plan`），绝不换源；缓存按
+    ``(code, price_source)`` 分键 —— 同一代码在个股与基金两侧都可能有记录。
     """
     price_loader = price_loader or load_price_bars
     wanted = None if not codes else {_normalize_code(c) for c in codes}
     stats = {"days": 0, "settled": 0, "not_matured": 0, "pending": 0,
-             "failed": 0, "reasons": {}}
+             "failed": 0, "reasons": {}, "pending_reasons": {},
+             "failed_reasons": {}, "basis": {}, "warnings": []}
     cache = {}
     for day in list_days(ledger_dir):
         payload = load_day(day, ledger_dir)
@@ -602,12 +799,20 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
                 continue
             if not isinstance(record, dict):
                 continue
-            inst_type = record.get("instrument_type")
-            cache_key = (code, inst_type)
+            inst_type, source, caliber, basis = resolve_price_plan(record, code)
+            stats["basis"].setdefault(code, basis)
+            cache_key = (code, source)
             if cache_key not in cache:
-                cache[cache_key] = _call_price_loader(price_loader, code, inst_type)
-            settled, reason = compute_settlement(record, cache[cache_key],
-                                                 horizon=horizon)
+                cache[cache_key] = _call_price_loader(
+                    price_loader, code, inst_type, price_source=source)
+            bars = cache[cache_key]
+            settled, reason = compute_settlement(record, bars,
+                                                 horizon=horizon,
+                                                 price_source=source)
+            if reason == "no_price_data":
+                note = _no_price_data_warning(code, source)
+                if note and note not in stats["warnings"]:
+                    stats["warnings"].append(note)
             status = settle_status_for(reason)
             if (record.get("settled") != settled
                     or record.get("settle_reason") != reason
@@ -623,9 +828,13 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
             elif status == SETTLE_STATUS_PENDING:
                 stats["pending"] += 1
                 stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+                stats["pending_reasons"][reason] = (
+                    stats["pending_reasons"].get(reason, 0) + 1)
             else:
                 stats["failed"] += 1
                 stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+                stats["failed_reasons"][reason] = (
+                    stats["failed_reasons"].get(reason, 0) + 1)
         if changed:
             payload["updated_at"] = _now_iso(now)
             _atomic_write(day_path(day, ledger_dir), payload)
@@ -681,11 +890,55 @@ def iter_records(ledger_dir=None):
                 yield day, code, record
 
 
+def infer_settle_status(record):
+    """记录的 ``settle_status``；缺键（老台账 / 从未 evaluate）时按事实反推。
+
+    **绝不能把「从未结算」当成 ``settled``**（PR #96 复验 P2-1）：只跑过
+    ``record`` 没跑过 ``evaluate`` 的记录 ``settled`` / ``settle_reason`` /
+    ``settle_status`` 全是 ``None``，旧反推逻辑会返回 ``settled``，汇总里凭空
+    多出已结算条数。正确口径：
+
+    * ``settled`` 是 dict → ``settled``；
+    * ``settle_reason`` 非空 → 按 :func:`settle_status_for`（``not_matured`` /
+      ``no_bars_after_as_of`` / 真失败）；
+    * 两者都为空 → ``pending``（等下一次 ``evaluate``）。
+    """
+    status = record.get("settle_status")
+    if status in SETTLE_STATUSES:
+        return status
+    if isinstance(record.get("settled"), dict):
+        return SETTLE_STATUS_SETTLED
+    reason = record.get("settle_reason")
+    if reason is None:
+        return SETTLE_STATUS_PENDING
+    return settle_status_for(reason)
+
+
+def _record_price_source(record):
+    """记录实际使用的价源：结算记录 > 记录级字段 > 类型缺省（老台账）。"""
+    settled = record.get("settled") or {}
+    for value in (settled.get("price_source"), record.get("price_source")):
+        if value in PRICE_SOURCES:
+            return value
+    return price_source_for(record.get("instrument_type"))
+
+
+def _record_price_caliber(record):
+    """记录实际使用的取价口径：记录级字段 > 按价源推断（老台账）。"""
+    caliber = record.get("price_caliber")
+    if caliber in (PRICE_CALIBER_QFQ, PRICE_CALIBER_NAV):
+        return caliber
+    if _record_price_source(record) == PRICE_SOURCE_FUND:
+        return PRICE_CALIBER_NAV
+    return PRICE_CALIBER_QFQ
+
+
 def build_report(ledger_dir=None):
     """汇总报告（纯字典，便于测试与 ``--json`` 复用）。空台账返回零值，不崩。
 
-    issue #95：``pending``（``no_bars_after_as_of``，数据未到）单独计数，
-    不进 ``failed``、也不进失败率分母；``failed`` 只数真拿不到价的记录。
+    issue #95：``pending``（``no_bars_after_as_of``，数据未到；或从未跑过
+    ``evaluate``）单独计数，不进 ``failed``、也不进失败率分母；``failed``
+    只数真拿不到价的记录。
     """
     days = list_days(ledger_dir)
     all_records = list(iter_records(ledger_dir))
@@ -697,10 +950,7 @@ def build_report(ledger_dir=None):
     settle_counts = {SETTLE_STATUS_SETTLED: 0, SETTLE_STATUS_NOT_MATURED: 0,
                      SETTLE_STATUS_PENDING: 0, SETTLE_STATUS_FAILED: 0}
     for _day, _code, record in all_records:
-        status = record.get("settle_status")
-        if status is None:
-            # 老台账没有这个键：从 settled / settle_reason 反推，口径与现在一致。
-            status = settle_status_for(record.get("settle_reason"))
+        status = infer_settle_status(record)
         if status in settle_counts:
             settle_counts[status] += 1
     pending = settle_counts[SETTLE_STATUS_PENDING]
@@ -794,6 +1044,10 @@ def build_report(ledger_dir=None):
         "horizon_days": HORIZON_DAYS,
         "by_action": by_action,
         "calibration": {"bins": calibration_bins, "brier": brier, "n": total_n},
+        # PR #96 复验 P1-3：已结算记录按实际取价口径分层，净值对净值与
+        # 开盘对开盘不能混在一起比。
+        "by_price_caliber": _layer(_record_price_caliber),
+        "by_price_source": _layer(_record_price_source),
         "by_flow_caliber": _layer(
             lambda r: (r.get("flow") or {}).get("caliber") or "unavailable"),
         "by_flow_available": _layer(
@@ -810,9 +1064,9 @@ def format_report(report):
         f"（{report['days']} 天），记录 {report['records']} 条",
         f"  已到期 {report['matured']} 条，其中有方向 {report['directional_matured']} 条，"
         f"方向命中率 {_pct(report['hit_rate'])}（持有 {report['horizon_days']} 交易日）",
-        # issue #95：pending（数据未到）单独列出，不进失败率。
+        # issue #95：pending（数据未到 / 从未 evaluate）单独列出，不进失败率。
         f"  未到期 {report['settle_status']['not_matured']} 条，"
-        f"数据未到 pending {report['pending']} 条，"
+        f"待结算 pending {report['pending']} 条，"
         f"结算失败 {report['failed']} 条",
     ]
     if report["by_action"]:
@@ -831,7 +1085,9 @@ def format_report(report):
     if report["calibration"]["brier"] is not None:
         lines.append(f"    总体 Brier {report['calibration']['brier']:.4f}"
                      f"（n={report['calibration']['n']}；R4 C 路径门槛：改善 ≥0.02）")
-    for title, key in (("按 flow.caliber", "by_flow_caliber"),
+    for title, key in (("按 price.caliber", "by_price_caliber"),
+                       ("按 price.source", "by_price_source"),
+                       ("按 flow.caliber", "by_flow_caliber"),
                        ("按 flow.available", "by_flow_available"),
                        ("按 valuation.pb 分位", "by_valuation_pb")):
         lines.append(f"  {title}：")
