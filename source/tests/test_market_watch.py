@@ -346,6 +346,9 @@ def test_corrupt_cache_is_treated_as_missing(monkeypatch, tmp_path):
     json.dumps({"schema": 1, "count": 1,
                 "entries": [{"code": "600000"}]}),            # 条目缺日期
     json.dumps({"schema": 1, "count": 5, "entries": []}),     # count 不一致
+    json.dumps({"schema": 1, "count": ["x"], "entries": []}),  # count 是 list
+    json.dumps({"schema": 1, "count": "abc", "entries": []}),  # count 非数字字符串
+    json.dumps({"schema": 1, "count": None, "entries": []}),   # count 是 null
 ])
 def test_corrupt_cache_is_ignored_and_refetched(monkeypatch, tmp_path, payload):
     """坏缓存**不等于**请求失败：忽略坏缓存并重新请求一次（P3-1）。"""
@@ -626,7 +629,13 @@ def test_render_does_not_touch_network(monkeypatch):
 # ---------------------------------------------------------------------------
 # 6) CLI 接线
 # ---------------------------------------------------------------------------
-def _run_cli(monkeypatch, state_dir, code=HIT_CODE):
+def _patch_cli_deps(monkeypatch, state_dir):
+    """把 CLI 的重活（行情 / 回测 / 状态 / 名称）全部打桩，只留真实接线。
+
+    ``monkeypatch.setattr(cli, "last_fetch_info", ...)`` 等必须打在 ``cli`` 的
+    **同名绑定**上（``cli.py`` 是 ``from ... import last_fetch_info``），否则
+    真实函数仍会触网。
+    """
     import cli
     import stock_analysis.data_loader.meta as meta
     from stock_analysis.backtest.engine import BacktestResult
@@ -665,7 +674,27 @@ def _run_cli(monkeypatch, state_dir, code=HIT_CODE):
     monkeypatch.setenv("ASTOCK_MARKET_WATCH_OFFLINE", "0")
     monkeypatch.setenv(mw.STATE_DIR_ENV, state_dir)
     mw.reset_cache()
+    return cli
+
+
+def _run_cli(monkeypatch, state_dir, code=HIT_CODE):
+    cli = _patch_cli_deps(monkeypatch, state_dir)
     return cli.advise_internal(code, fast=True, no_regime=True)
+
+
+def _run_main(monkeypatch, capsys, state_dir, code=HIT_CODE):
+    """真跑 ``cli.main()``：覆盖 main 的 try/except 与 ``--json`` 输出/退出码。
+
+    直接调用 ``advise_internal`` 测不到顶层异常处理 —— 而 P3 缺陷正是
+    ``int(count)`` 的 TypeError/ValueError 漏到 main，变成 exit 30 + 空 stdout。
+    """
+    cli = _patch_cli_deps(monkeypatch, state_dir)
+    monkeypatch.setattr(sys, "argv",
+                        ["cli.py", code, "--json", "--fast", "--no-regime"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    captured = capsys.readouterr()
+    return exc.value.code, captured
 
 
 def test_cli_adds_market_watch_block(monkeypatch, tmp_path):
@@ -729,6 +758,44 @@ def test_error_response_market_watch_isomorphic():
     block = doc["evidence"]["market_watch"]
     assert set(block) == set(mw.MARKET_WATCH_KEYS)
     assert block == {"available": False, "stale": False, "as_of": None, "hit": None}
+
+
+@pytest.mark.parametrize("bad_count", [["x"], "abc", None])
+def test_cli_json_survives_non_integer_cache_count(monkeypatch, capsys, tmp_path,
+                                                   bad_count):
+    """``count`` 是 list / 字符串 / null 时 CLI 必须正常出 JSON（P3）。
+
+    修复前 ``read_cache_checked`` 直接 ``int(count)``：list 抛 TypeError、
+    非数字字符串抛 ValueError，一路漏到 ``cli.main`` 的兜底 -> exit 30，
+    且 ``--json`` 的 stdout **完全为空**。现在坏缓存按「缓存损坏」忽略并
+    重取一次，CLI 正常返回完整文档。
+    """
+    state = _state(tmp_path)
+    path = Path(mw.cache_path(state))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema": 1, "count": bad_count, "entries": []}),
+                    encoding="utf-8")
+
+    counter = _Counter()  # 接口本身正常
+    monkeypatch.setattr(mw, "_http_get", counter)
+    mw.reset_cache()
+
+    code, captured = _run_main(monkeypatch, capsys, state)
+
+    assert code != 30, captured.err
+    assert code in (0, 10, 20, 40), (code, captured.err)
+    assert captured.err == "", "CLI 不得把未捕获异常写成「错误：…」"
+    document = json.loads(captured.out)  # stdout 必须是完整 JSON 文档
+    assert set(document) >= {
+        "schema_version", "request", "instrument", "recommendation",
+        "evidence", "diagnostics",
+    }
+    assert set(document["evidence"]["market_watch"]) == set(mw.MARKET_WATCH_KEYS)
+    assert len(counter.calls) == 1, "坏 count 必须被忽略并重取一次"
+    warnings = document["diagnostics"]["warnings"]
+    corrupt = [w for w in warnings if "缓存损坏" in w]
+    assert corrupt, warnings
+    assert "count" in corrupt[0], "损坏原因必须带字段名 count"
 
 
 # ---------------------------------------------------------------------------

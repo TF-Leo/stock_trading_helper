@@ -49,7 +49,7 @@ LINK_URL           东财 App 详情页（可为空）
   ``null`` / 非列表 / 非 2xx / 非 JSON / 行字段不合法一律抛
   :class:`MarketWatchError`，**绝不返回空 dict 冒充「无监控」**。
 * 缓存损坏（JSON 不可解析 / schema 不符 / ``entries`` 非列表 / 单条字段不合法 /
-  ``count`` 与条数不符）**不等于请求失败**：坏缓存一律忽略并**重新请求一次**，
+  ``count`` 不是整数或与条数不符）**不等于请求失败**：坏缓存一律忽略并**重新请求一次**，
   失败原因在 ``PoolSnapshot.error`` 里写清「缓存损坏」与「请求失败」两件事，
   不再把坏缓存误报成「接口请求失败」。
 
@@ -306,7 +306,7 @@ def read_cache_checked(state_dir: Optional[str] = None):
     * ``None`` —— 缓存可用（``payload`` 为 dict）；
     * :data:`CACHE_MISSING` —— 文件不存在（正常冷启动，不需要告警）；
     * ``"corrupt: <原因>"`` —— 文件存在但不可用（JSON 坏 / schema 不符 /
-      ``entries`` 非列表 / 单条字段不合法 / ``count`` 与条数不符）。
+      ``entries`` 非列表 / 单条字段不合法 / ``count`` 不是整数或与条数不符）。
 
     校验必须比 ``read_cache`` 严格：只检查「顶层是 dict + entries 是 list」会
     放过「entries 里全是垃圾」的缓存，装载时条目被静默丢光，``available`` 变
@@ -336,7 +336,15 @@ def read_cache_checked(state_dir: Optional[str] = None):
         if not _valid_cached_entry(item):
             return None, f"corrupt: 第 {index} 条缓存字段不合法"
     count = payload.get("count")
-    if count is not None and int(count) != len(entries):
+    try:
+        count_value = int(count)
+    except Exception:
+        # ``count`` 只可能是本模块 ``write_cache`` 写出的 int。list / 非数字
+        # 字符串等取值是**缓存损坏**，不是调用方错误：绝不能把 ``int()`` 的
+        # TypeError / ValueError 漏到 CLI 顶层，否则会变成 exit 30 且 ``--json``
+        # stdout 为空（P3 复验缺陷）。报错文本必须带上字段名，便于定位。
+        return None, f"corrupt: count 字段不是整数（{type(count).__name__}）"
+    if count_value != len(entries):
         return None, f"corrupt: count={count} 与条数 {len(entries)} 不一致"
     return payload, None
 
