@@ -944,6 +944,13 @@ def test_error_response_instrument_keys_isomorphic(monkeypatch):
                                     bars=23, start='2026-09-08', end='2026-10-16',
                                     last_close=1329.0, elapsed=0.01)
     assert set(doc["instrument"]) == set(ok["instrument"])
+    # T8 四个报价字段必须同时存在于两条路径；错误路径只补 null（取数阶段未到
+    # 报价解析），成功路径的值另由 test_quote_fields 覆盖。
+    for name in ("turnover_rate_pct", "volume_ratio",
+                 "market_cap_yi", "float_market_cap_yi"):
+        assert name in ok["instrument"], f"成功路径缺 T8 字段: {name}"
+        assert name in doc["instrument"], f"错误路径缺 T8 字段: {name}"
+        assert doc["instrument"][name] is None
     assert doc["instrument"]["one_word_limit"] is None
     assert doc["instrument"]["is_suspended"] is None
     assert doc["instrument"]["is_st_source"] == "unavailable"

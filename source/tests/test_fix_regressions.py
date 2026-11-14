@@ -341,6 +341,26 @@ def test_g35_error_response_covers_schema_declarations():
         missing = set(dc.__dataclass_fields__) - set(doc[key])
         assert not missing, f"{key} 缺 schema 声明字段: {sorted(missing)}"
 
+    # instrument：schema.Instrument 未声明全部 additive 字段（one_word_limit /
+    # T8 四键），故以 golden 的**成功路径**结构为准逐键同构。历史事故：issue #92
+    # 成功路径新增 one_word_limit 后错误路径漏补 → probe 的 error_shape 判 FAIL。
+    # 双向差集任一非空即红，新增键只改一侧会被这里拦下。
+    import json
+    from pathlib import Path
+    golden = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "advice_render" /
+         "cli_json_structure.golden.json").read_text(encoding="utf-8"))
+    assert set(doc['instrument']) == set(golden['instrument']), (
+        "instrument 键集合与成功路径不同构：错误路径缺 "
+        f"{sorted(set(golden['instrument']) - set(doc['instrument']))}，"
+        "多 "
+        f"{sorted(set(doc['instrument']) - set(golden['instrument']))}")
+    # T8 四个报价字段：错误路径必须存在且显式 null（取数阶段尚未解析报价）。
+    for name in ("turnover_rate_pct", "volume_ratio",
+                 "market_cap_yi", "float_market_cap_yi"):
+        assert name in doc['instrument'], f"错误路径缺 T8 字段: {name}"
+        assert doc['instrument'][name] is None, f"{name} 应为 null: {doc['instrument'][name]!r}"
+
     # 不适用字段必须是显式 null，不得编造 [1,5] 之类的值
     assert doc['recommendation']['horizon_days'] == [None, None]
     assert doc['recommendation']['stop_method'] is None
