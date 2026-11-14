@@ -11,7 +11,7 @@
 # license:  Apache-2.0 (vendor/a-stock-data/LICENSE)
 # sections: 市场前缀 / V3.9.0 helper / §1.1 腾讯财经 / §1.2 腾讯 K 线 / §1.6 复权因子 / §12 交易日历 / 东财限流 / §4.5 日级资金流 / 备用源速查 fund_flow_backup / §6.8 ST 名单
 # manifest: source/stock_analysis/data_sources/_astock_manifest.json
-# body_sha256: ba914924a3e6df6db07a2b090ea23cb7b40f8bec10ffd2373c526f9a668e390e
+# body_sha256: 62ba2c14f26098b0efc9fef19ce7cabeaa27cc1c45b2a8ffcaf549dc1f911bf6
 #
 # Regenerate: python tools/astock_extract.py
 # Verify:     python tools/astock_extract.py --check
@@ -601,7 +601,7 @@ def _em_clist_all(fs, fields, page_size=100):
     raise requests.ConnectionError('东财 push2 / push2delay 均不可达: ' + '; '.join(errors))
 
 @_v39_contract
-def st_stock_list():
+def st_stock_list(allow_duplicates=False):
     """全市场 ST / *ST 名单（风险警示）— 当日快照。
 
     沪深：东财「风险警示板」过滤（含 B 股）；北交所：东财不纳入该过滤，改为拉北交所全表按名称筛。
@@ -629,7 +629,7 @@ def st_stock_list():
             continue
         rows.append({'code': code, 'market': 'bj' if is_bj else 'sh' if market_id == 1 else 'sz', 'name': name, 'st_type': '*ST' if name.startswith('*') else 'ST', 'price': _v39_num(rec.get('f2')), 'pct_change': _v39_num(rec.get('f3'))})
     frame = _v39_frame(rows, 'eastmoney', url)
-    if frame.empty or frame.duplicated(['code']).any():
+    if frame.empty or (not allow_duplicates and frame.duplicated(['code']).any()):
         raise RuntimeError('ST 名单为空或代码重复，不能当成完整快照')
     frame.attrs['coverage'] = '沪深京'
     return frame

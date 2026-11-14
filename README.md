@@ -108,13 +108,13 @@ python cli.py 600519 --start 20200101 --json
     "board": "sh_main",
     "price_limit_pct": 0.10,
     "is_st": false,
-    "is_st_source": "exchange_list",
+    "is_st_source": "quote_name",
     "is_suspended": false,
     "limit_up": 1542.53,
     "limit_down": 1262.07,
     "quote_stale": false,
     "one_word_limit": null,
-    "status_source": "eastmoney_st_list+tencent_quote"
+    "status_source": "tencent_quote"
   },
   "data": {
     "bars": 1643,
@@ -310,8 +310,8 @@ python cli.py 600519 --start 20200101 --json
 - **name**: 标的名称
 - **board**: 板块（"sh_main"/"sh_star"/"sz_main"/"sz_gem"/"bj"/"fund"/"unknown"）
 - **price_limit_pct**: 涨跌停幅度（0.10 表示 10%）。有实时报价时以腾讯 `limit_up/last_close` 推算为准；否则按板块静态规则（主板 10%、创业板/科创板 20%、北交所 30%）。**2026-07-06 起沪深主板 ST/*ST 已由 5% 并轨为 10%**（交易所《交易规则（2026 年修订）》），故不再对主板 ST 做 5% 修正；创业板/科创板 ST 仍 20%，北交所 ST 30%
-- **is_st**: 是否 ST/*ST（**真实值**：收盘后预计算的东财 §6.8 名单优先，其次腾讯报价名称前缀；两者都不可用时，若本地名称带 ST 前缀则判 `true` 并在 `diagnostics.warnings` 注明「仅依据名称」，否则为 `null`，不再默认 `false`）
-- **is_st_source**: `is_st` 的判定来源（issue #106 additive）：`exchange_list`（交易所/东财 ST 名单）、`quote_name`（腾讯实时报价名称）、`local_name`（本地名称）、`unavailable`（三者都不可用，`is_st` 为 `null`）。名单与名称冲突时按「是 ST」保守处理并告警；**`unavailable` 只表示未知，渲染层写「ST 状态未知」，绝不显示成「非 ST」**
+- **is_st**: 是否 ST/*ST（**真实值**：收盘后预计算的东财 §6.8 名单优先，其次腾讯报价名称前缀；两者都不可用时，若本地名称带 ST 前缀则判 `true` 并在 `diagnostics.warnings` 注明「仅依据名称」，否则为 `null`，不再默认 `false`）。**基金不参与 ST 判定**：恒为 `null`，且 `is_st_source=not_applicable`（issue #109）
+- **is_st_source**: `is_st` 的判定来源（issue #106 additive）：`exchange_list`（交易所/东财 ST 名单）、`quote_name`（腾讯实时报价名称）、`local_name`（本地名称）、`unavailable`（三者都不可用，`is_st` 为 `null`）、`not_applicable`（基金不参与 ST 判定，`is_st` 为 `null`，issue #109）。名单与名称冲突时按「是 ST」保守处理并告警；**`unavailable` 只表示未知，渲染层写「ST 状态未知」，绝不显示成「非 ST」**。取数失败 / 数据不足的错误响应（`recommendation.status` 为 `data_source_error` / `insufficient_data`）**不渲染**「ST 状态未知」：ST 状态根本没解析，属于「未尝试」而非「尝试后未知」
 - **is_suspended**: 是否停牌。判据是「交易日 10:00 后 / 已收盘 / 非交易日」腾讯报价定格（`is_stale=true` 且当日成交量为 0）；**盘前（<10:00）返回 `null`**，不把集合竞价前的正常定格误判为停牌
 - **limit_up / limit_down**: 腾讯实时快照给出的当日涨停价 / 跌停价（元）；报价不可用时为 `null`
 - **quote_stale**: 腾讯报价是否定格（`is_stale`）。**它本身不等于停牌**，只是"报价非当日真实成交"的信号

@@ -389,6 +389,32 @@ def test_fund_ignores_st_unknown_wording():
     assert "ST 状态未知" not in render_advice(payload)
 
 
+def test_fund_unknown_board_still_skips_st_unknown():
+    """issue #109：基金靠 status_source 前缀拦，不靠 board。
+
+    场内基金（159xxx 等）的 board 是 ``unknown``，旧实现的
+    ``board == 'fund'`` 分支在真实响应里点不到。
+    """
+    payload = _fund_payload(is_st=None, is_st_source="unavailable",
+                            status_source="fund_static")
+    payload["instrument"]["board"] = "unknown"
+    assert "ST 状态未知" not in render_advice(payload)
+
+
+def test_error_response_does_not_render_st_unknown():
+    """issue #109：取数失败/数据不足时 ST 状态根本没解析，不渲染「ST 状态未知」。"""
+    from decision.schema import create_error_response
+
+    doc = create_error_response("data_source_error", "行情拉取失败", "600000",
+                                "stock")
+    assert "ST 状态未知" not in render_advice(doc)
+    assert doc["instrument"]["is_st"] is None  # 错误路径仍是显式 null
+
+    short = create_error_response("insufficient_data", "数据不足（仅 5 根 < 100）",
+                                  "600000", "stock")
+    assert "ST 状态未知" not in render_advice(short)
+
+
 def test_t2_any_non_today_signal_replaces_current_price():
     """quote_stale=false 但 data.stale=true + lag_days=4 也必须走「收盘为」。"""
     output = _render("data_stale_lag4")
