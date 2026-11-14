@@ -129,6 +129,13 @@ PRICE_CALIBER_NAV = "nav_to_nav"
 #: 说清「当时定下的是什么、以后不会变」。两种状态各用一句，避免同义异文。
 BASIS_CONFIRMED_SUFFIX = "口径已确认：记录时确定，结算时不再更改"
 BASIS_UNCERTAIN_SUFFIX = "口径未确认：首次结算成功前允许一次重判"
+#: 重判后的 ``instrument_basis`` 前缀（issue #105）。结算阶段不再写内联字面量：
+#: 记录阶段、结算阶段、重判阶段都用这里的常量，避免同义异文（曾出现
+#: 「结算不再更改」与常量「结算时不再更改」差一个字）。
+BASIS_REJUDGED_PREFIX = "首次结算前重判："
+#: 老记录（无 ``price_source``）的一次性迁移说明（issue #105）。
+BASIS_LEGACY_UNCERTAIN = "老记录无 price_source：口径未在记录时钉住；" \
+    + BASIS_UNCERTAIN_SUFFIX
 
 #: ``settle_status`` 取值。``pending`` / ``not_matured`` 都**不算失败**：
 #: 前者是「as_of 之后还没有行情」（缓存没更新）或「从未跑过 evaluate」，
@@ -147,6 +154,26 @@ _NON_FAILURE_STATUS = {
     "not_matured": SETTLE_STATUS_NOT_MATURED,
     "no_bars_after_as_of": SETTLE_STATUS_PENDING,
 }
+
+#: 一个 ``settled`` 块要算「已结算」必须带的字段（issue #105）。
+#: ``hit`` 不在其中：``hold`` / ``avoid`` 没有方向，合法值就是 ``None``。
+SETTLEMENT_REQUIRED_FIELDS = ("ret_20d", "entry_date", "settle_date",
+                              "entry_open", "exit_open")
+
+
+def has_settlement(record):
+    """``record`` 是否**真的已结算**（issue #105）。
+
+    旧判据是 ``isinstance(record.get("settled"), dict)``：空 ``{}`` 或半截块
+    （例如只剩 ``{"hit": True}``）都会被当成已结算，``build_report`` 随即把它
+    计入「已到期」，命中率分母与校准条数凭空多出。这里要求 ``settled`` 非
+    null、是 dict、必需字段齐全且值不为 ``None``；``hit`` 允许为 ``None``。
+    """
+    settled = record.get("settled")
+    if not isinstance(settled, dict):
+        return False
+    return all(settled.get(key) is not None
+               for key in SETTLEMENT_REQUIRED_FIELDS)
 
 #: 场内基金代码段：沪市 5 开头（510/511/512/513/515/516/518/588…），
 #: 深市 15/16/18（159 ETF、160/161/162/163/164/165/166/167/168 LOF、180）。
@@ -435,6 +462,10 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
         # 首次结算成功前允许一次重判（只能 uncertain → 确认）。已确认记录恒为
         # False，永不重判 —— 口径记录时确定、结算时不再更改。
         "basis_uncertain": False,
+        # issue #105 additive：重判是一次**显式**事件，直接记在记录里，不再靠
+        # 结算前后比对四个口径字段来推断（字段抖动会误报 / 漏报）。
+        "basis_rejudged": False,
+        "basis_rejudged_at": None,
         "missing": {},
         "settled": None,
         "settle_reason": None,
@@ -630,7 +661,7 @@ def price_cache_path(code, instrument_type, data_dir=None):
     return os.path.join(root, f"stock_{code}_qfq.csv")
 
 
-def resolve_price_plan(record, code=None):
+def resolve_price_plan(record, code=None, now=None):
     """记录 → 结算价源计划 ``(instrument_type, price_source, caliber, basis)``。
 
     **结算严格按记录里写下的价源走，绝不换源**（PR #96 复验 P1-1 / P1-3）。
@@ -641,9 +672,10 @@ def resolve_price_plan(record, code=None):
       阶段同一套规则（:func:`classify_instrument`）：只有 ``fund_*.csv`` 存在、
       内容确认为**单位净值**（``open == close`` 且无交易所列）、且**没有**
       ``stock_*_qfq.csv`` 时才判 ``fund`` / ``fund_nav``。判定依据写进 ``basis``。
-    * ``basis_uncertain=true`` 的记录（issue #99：记录时无可用缓存）→ 重新判定
-      一次，**只允许 uncertain → 确认**：新判定确认了口径就采用新值；仍无法
-      确认就沿用记录值（不把确认记录改成 uncertain，见 :func:`rejudge_record`）。
+    * ``basis_uncertain=true`` 的记录（issue #99：记录时无可用缓存；issue #105：
+      老记录无 ``price_source`` 经迁移补标）→ 重新判定一次，**只允许
+      uncertain → 确认**：新判定确认了口径就采用新值；仍无法确认就沿用记录值
+      （不把确认记录改成 uncertain，见 :func:`rejudge_record`）。
 
     老记录里即便有 ``instrument_type`` 也**不采信**：PR #96 曾把它写成 CLI 的
     ``request.type``（取数通道），那可能是 auto 回落的结果（个股被标成 fund）。
@@ -651,6 +683,15 @@ def resolve_price_plan(record, code=None):
     code = _normalize_code(code or record.get("code"))
     recorded = record.get("price_source")
     inst_type = record.get("instrument_type")
+    pinned_by_settlement = False
+    if recorded not in PRICE_SOURCES and has_settlement(record):
+        # issue #105：已结算老记录没有记录级 ``price_source``，但结算块里写了
+        # 当时**实际用的**来源。沿用它，避免下一次结算按当前缓存重新分类、
+        # 把已结算记录的口径换掉（已结算数值 0 漂移）。
+        settled_source = record["settled"].get("price_source")
+        if settled_source in PRICE_SOURCES:
+            recorded = settled_source
+            pinned_by_settlement = True
     if recorded in PRICE_SOURCES:
         if inst_type not in INSTRUMENT_TYPES:
             inst_type = "fund" if recorded == PRICE_SOURCE_FUND else "stock"
@@ -659,41 +700,80 @@ def resolve_price_plan(record, code=None):
             caliber = price_caliber_for(inst_type)
         if _is_basis_uncertain(record):
             # issue #99：口径未确认 → 结算前重判一次，只接受「确认」结果。
-            rejudged = rejudge_record(record, code)
+            rejudged = rejudge_record(record, code, now=now)
             if rejudged is not None:
                 return rejudged
+        origin = "结算块" if pinned_by_settlement else "记录"
         return (inst_type, recorded, caliber,
-                f"记录价源 price_source={recorded}（记录时确定，结算不再更改）")
+                f"{origin}价源 price_source={recorded}"
+                f"（{BASIS_CONFIRMED_SUFFIX}）")
 
-    inst_type, source, caliber, basis = classify_instrument(code)
+    # 老记录：迁移补标过 ``basis_uncertain`` 的，也在首次能确认口径时钉住，
+    # 避免每次结算按当时缓存重新分类（缓存一变口径就换）。
+    if _is_basis_uncertain(record):
+        rejudged = rejudge_record(record, code, now=now)
+        if rejudged is not None:
+            return rejudged
+    inst_type, source, caliber, basis, uncertain = \
+        classify_instrument_detailed(code)
+    stated = BASIS_UNCERTAIN_SUFFIX if uncertain else BASIS_CONFIRMED_SUFFIX
     return (inst_type, source, caliber,
-            f"老记录无 price_source → {basis}；默认 stock/qfq"
-            f"（记录时确定，结算不再更改）")
+            f"老记录无 price_source → {basis}；{stated}")
 
 
 def _is_basis_uncertain(record):
     """记录的口径是否**未确认**（issue #99）。
 
-    只有显式 ``basis_uncertain=true`` 才算未确认。老记录没有这个键 —— 它们
-    在引入该字段之前写下，按当时的规则已确认过口径，**不重判**（否则会把
-    已经按记录价源结算过的历史记录改成另一套口径）。
+    只有显式 ``basis_uncertain=true`` 才算未确认。带 ``price_source`` 的老记录
+    没有这个键 —— 它们在引入该字段之前写下，口径已按记录价源钉住，**不重判**。
+    无 ``price_source`` 的老记录由 :func:`_migrate_legacy_record` 一次性补标
+    ``basis_uncertain=true``（issue #105）：它们从未钉住口径，必须走一次
+    uncertain → 确认，而不是每次结算重新分类。
     """
     return record.get("basis_uncertain") is True
 
 
-def rejudge_record(record, code=None):
-    """重判一条 ``basis_uncertain`` 记录的口径（issue #99）。
+def _migrate_legacy_record(record):
+    """一次性迁移老记录（issue #105）：无 ``price_source`` 且未结算。
+
+    这些记录在记录阶段没有写口径，旧实现每次结算都按**当时**的缓存重新分类
+    —— 缓存一变，同一条记录的结算口径就跟着换。记录当日的缓存状态已无法
+    还原，**不伪造**当时的判定；改为补写显式 ``basis_uncertain=true``，交给
+    既有的一次性重判（只允许 uncertain → 确认）在首次能确定口径时钉住，之后
+    永不改。幂等：只处理「缺键 + 无价源 + 未结算」的记录，已结算记录不动。
+    """
+    if record.get("price_source"):
+        return False
+    if has_settlement(record):
+        return False
+    if "basis_uncertain" in record:
+        return False
+    record["basis_uncertain"] = True
+    record["basis_uncertain_source"] = "legacy_record_without_price_source"
+    previous = record.get("instrument_basis")
+    record["instrument_basis"] = (
+        BASIS_LEGACY_UNCERTAIN
+        + (f"（原记录：{previous}）" if previous else ""))
+    return True
+
+
+def rejudge_record(record, code=None, now=None):
+    """重判一条 ``basis_uncertain`` 记录的口径（issue #99 / #105）。
 
     返回 ``(instrument_type, price_source, caliber, basis)`` 并**原地更新**
     ``record`` 的四个口径字段 + ``basis_uncertain``；仍然无法确认时返回
     ``None``（记录保持原样，下次结算再试）。
+
+    重判成功后写**显式标记** ``basis_rejudged=true`` / ``basis_rejudged_at``：
+    ``settle_all`` 据此报告 ``rejudged``，不再比对四个口径字段前后值（issue
+    #105：字段抖动会误报，且「没变」不等于「没重判」）。
 
     严格单向：只有 ``uncertain → 确认``。已确认记录、已结算记录一律不动 ——
     「记录时确定、结算时不再更改」是口径契约，重判只是补齐记录时缺的依据。
     """
     if not _is_basis_uncertain(record):
         return None
-    if isinstance(record.get("settled"), dict):
+    if has_settlement(record):
         # 已结算记录的数值不得改变：口径已随结算生效，不再重判。
         return None
     code = _normalize_code(code or record.get("code"))
@@ -704,8 +784,10 @@ def rejudge_record(record, code=None):
     record["instrument_type"] = inst_type
     record["price_source"] = source
     record["price_caliber"] = caliber
-    record["instrument_basis"] = f"首次结算前重判：{basis}"
+    record["instrument_basis"] = f"{BASIS_REJUDGED_PREFIX}{basis}"
     record["basis_uncertain"] = False
+    record["basis_rejudged"] = True
+    record["basis_rejudged_at"] = _now_iso(now)
     return (inst_type, source, caliber, record["instrument_basis"])
 
 
@@ -910,18 +992,21 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
                 continue
             if not isinstance(record, dict):
                 continue
-            before = (record.get("instrument_type"), record.get("price_source"),
-                      record.get("price_caliber"), record.get("instrument_basis"),
-                      record.get("basis_uncertain"))
-            inst_type, source, caliber, basis = resolve_price_plan(record, code)
-            if before != (record.get("instrument_type"), record.get("price_source"),
-                          record.get("price_caliber"),
-                          record.get("instrument_basis"),
-                          record.get("basis_uncertain")):
-                # 只有「未确认 → 确认」会改字段（见 rejudge_record 的单向约束）。
+            # issue #105：老记录没有 price_source → 一次性补标显式
+            # ``basis_uncertain``，让首次能确认口径的结算把它钉住。
+            migrated = _migrate_legacy_record(record)
+            marker_before = record.get("basis_rejudged_at")
+            inst_type, source, caliber, basis = resolve_price_plan(
+                record, code, now=now)
+            # issue #105：``rejudged`` 只看记录里的**显式标记**是否在本次结算
+            # 里新写入，不再比对四个口径字段（字段抖动会误报 / 漏报）。
+            marker_after = record.get("basis_rejudged_at")
+            if marker_after is not None and marker_after != marker_before:
                 changed = True
                 if code not in stats["rejudged"]:
                     stats["rejudged"].append(code)
+            elif migrated:
+                changed = True
             stats["basis"].setdefault(code, basis)
             cache_key = (code, source)
             if cache_key not in cache:
@@ -1027,8 +1112,11 @@ def infer_settle_status(record):
     """
     status = record.get("settle_status")
     if status in SETTLE_STATUSES:
-        return status
-    if isinstance(record.get("settled"), dict):
+        # issue #105：``settle_status="settled"`` 只是一句自报，必须同时有
+        # 完整的 ``settled`` 块；空 dict / 半截块按事实重新反推。
+        if status != SETTLE_STATUS_SETTLED or has_settlement(record):
+            return status
+    if has_settlement(record):
         return SETTLE_STATUS_SETTLED
     reason = record.get("settle_reason")
     if reason is None:
@@ -1038,7 +1126,7 @@ def infer_settle_status(record):
 
 def _record_price_source(record):
     """记录实际使用的价源：结算记录 > 记录级字段 > 类型缺省（老台账）。"""
-    settled = record.get("settled") or {}
+    settled = record.get("settled") if has_settlement(record) else {}
     for value in (settled.get("price_source"), record.get("price_source")):
         if value in PRICE_SOURCES:
             return value
@@ -1065,7 +1153,7 @@ def build_report(ledger_dir=None):
     days = list_days(ledger_dir)
     all_records = list(iter_records(ledger_dir))
     matured = [(day, code, r) for day, code, r in all_records
-               if isinstance(r.get("settled"), dict)]
+               if has_settlement(r)]
     directional = [(day, code, r) for day, code, r in matured
                    if r["settled"].get("hit") is not None]
 
@@ -1090,7 +1178,7 @@ def build_report(ledger_dir=None):
                                                     "hit_rate": None, "n": 0})
         bucket["records"] += 1
         settled = record.get("settled")
-        if isinstance(settled, dict):
+        if has_settlement(record):
             bucket["matured"] += 1
             if settled.get("hit") is not None:
                 bucket["_hits"] = bucket.get("_hits", 0) + (1 if settled["hit"] else 0)
