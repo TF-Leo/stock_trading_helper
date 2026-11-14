@@ -41,6 +41,44 @@
     写进 README）。
 - **跳过项**：无。
 
+## 2026-11-14 · issue #1 / R11 T7：事件风险预计算（解禁/增减持/预告/质押）
+
+- **分支**：`task/event-risk`（父 `origin/main` = `0722fec`）；未改
+  `source/decision/*`，未引入依赖，`--json` 只做 additive（新增
+  `evidence.events`）。
+- **设计**：`tools/precompute_events.py` 只在收盘后（18:30–18:50 时段）串行
+  取数，写 `source/stock_analysis/data/state/events/events.json`（`data/` 已
+  gitignore）；CLI 主路径只读缓存（`data_loader/events.py`），**盘前零请求**
+  （socket + `_http_get` 双桩测试）。四类子项独立 `available/stale/as_of/
+  items[]`；失败只影响该子项，保留上一轮数据并标 `stale=true`。
+- **端点取证（实测，不是凭记忆）**：钉死 `f215349` 的 SKILL.md §3.6/§14.1/
+  §14.3/§14.5，再本机真跑：
+  - `600000/002475/300750` × 4 端点 → **12 请求 / 12.23s**（≈1.02s/请求，
+    与串行下限一致）；`002475` 预告 3 行、三者质押各 1 行（最新统计日
+    2026-11-13）。
+  - `688512` → 解禁 2 条（2026-11-16，占总股本 37.81%）、减持 1 条；
+    渲染实测 `⚠️ 解禁：2026-11-16 解禁 12374.87 万股（占总股本 37.81%）`。
+  - **实测校正**：解禁股数取 `ABLE_FREE_SHARES`（与 `FREE_RATIO` 对齐），
+    不是 `FREE_SHARES`（后者是更大的流通股口径，600050 实测对不上）；
+    质押表按个股累积多年历史（600000 实测 633 行/127 页），只取
+    `TRADE_DATE desc` 第 1 页 1 行，允许 `pages>1`。
+- **阈值（写死常量，理由见 `docs/EVENT_RISK.md`）**：20 自然日窗口；
+  解禁 ≥1.0% 或 ≥500 万股；减持合计 ≥0.5% 或 ≥500 万股；预告类型黑名单
+  （首亏/续亏/预减/增亏/略减）或同比上限 ≤-20%；质押 ≥20%。每类至多一行；
+  无事件整段消失；过期写「事件数据过期（{D}）」，不写「无事件」。
+- **测试**：新增 `source/tests/test_events_context.py` **47 项**（四类命中/
+  未命中/过期/接口失败、第 20 日与阈值边界、盘前零请求、10 只×4 端点串行
+  估算、失败隔离、保留旧子项、端点 9201/错误码/多页/非列表/北交所质押）。
+  全量 `pytest tests/ -q` → **906 passed, 1 failed**；唯一失败
+  `test_probe_requirements.py::test_current_environment_passes_via_probe`
+  是基线就存在的解释器版本不符（缺口盘点 U7），与本轮无关。
+- **门禁说明**：本机 Linux 无 `pwsh`，`tools/check_gates.ps1` 无法执行；
+  以 `pytest` 全量 + `tools/probe.py` 可跑项为准。`cli.py` **687 行**（≤700）。
+- **风险**：①限流——40 请求串行 ≥39s，绝不可放盘前；②「无事件 vs 坏了」已
+  分开，但若东财对所有个股静默返回 0 行（code=0）仍无法与「确实无事件」
+  区分（见 `docs/EVENT_RISK.md` §6）；③阈值可能带来 warning 疲劳，已按
+  「20 日内 + 重大额度 + 每类一行」收敛。
+
 ## 2026-11-14 · PR #97 复验非阻塞项收口（2×P2 + 3×P3）
 
 - **分支**：`TF-Leo/fix-pr97`（父 = PR #97 head `c3756af`）；**未改

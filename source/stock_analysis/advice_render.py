@@ -11,6 +11,8 @@ T3        个股 regime 与指数 regime 的口径冲突（``market_regime.index
 T4        估值分位一句（``evidence.valuation``）
 T5        资金流方向 + 口径标签（``evidence.flow``）
 T6        交易所重点监控池命中（``evidence.market_watch``）—— 硬风险告警
+T7        事件风险（``evidence.events``）：解禁 / 股东增减持 / 业绩预告 /
+          股权质押 —— 只报 20 日内且达到阈值的重大事件
 ========  ==========================================================
 
 设计边界（硬约束）
@@ -57,6 +59,14 @@ T6        交易所重点监控池命中（``evidence.market_watch``）—— �
   ``evidence.market_watch.as_of`` 与 warnings 说明 —— 命中是风险提示，
   宁可多报也不因缓存旧了一天就静默隐藏。命中行位置固定在可执行性闸门之后、
   价格/建议行之前。
+* ``evidence.events``（T7）：四类子项（``lockup`` / ``holder_trades`` /
+  ``forecast`` / ``pledge``）各自 ``available`` / ``stale`` / ``as_of`` /
+  ``items[]``。只报**距快照日 20 个自然日内**且达到阈值的重大事件，每类最多
+  一行；无事件则整类消失。阈值见 :data:`EVENT_THRESHOLDS`（写死在代码里，
+  理由见 ``docs/EVENT_RISK.md``）。``available=False`` 或 ``stale=True`` 时
+  必须先输出 ``⚠️ 事件数据过期（{D}）``，**绝不**把「没取到」写成「无事件」。
+  基金 / ``--as-of`` 回放的 ``fund_not_supported`` / ``replay_not_supported``
+  整段消失（由 warnings 说明原因）。
 * ``compact=True`` 只处理 ``diagnostics.warnings``，结果由 **封闭词表替换 +
   整段删除** 两部分组成：
 
@@ -82,6 +92,7 @@ T6        交易所重点监控池命中（``evidence.market_watch``）—— �
 """
 from __future__ import annotations
 
+import datetime as _dt
 import math
 import re
 from typing import Any, Dict, List, Optional
@@ -90,6 +101,9 @@ __all__ = [
     "render_advice",
     "CALIBER_LABELS",
     "COMPACT_GLOSSARY",
+    "EVENT_STALE_MARK",
+    "EVENT_THRESHOLDS",
+    "EVENT_WINDOW_DAYS",
     "MARKET_WATCH_MARK",
     "PERCENTILE_WINDOW_DAYS",
     "DEFAULT_DISCLAIMER",
@@ -106,6 +120,35 @@ CALIBER_LABELS = {
 }
 
 DEFAULT_DISCLAIMER = "本结果不构成投资建议，市场有风险，投资需谨慎。"
+
+# ---------------------------------------------------------------------------
+# T7：事件风险阈值（写死在代码里；理由见 docs/EVENT_RISK.md）
+# ---------------------------------------------------------------------------
+#: 事件窗口：距快照日 20 个**自然日**内（含第 20 日）。与 20 日持有期同一尺度。
+EVENT_WINDOW_DAYS = 20
+#: 解禁：占总股本 ≥1.0%，或解禁股数 ≥500 万股（任一即报）。
+LOCKUP_RATIO_PCT_MIN = 1.0
+LOCKUP_SHARES_MIN_10K = 500.0
+#: 股东减持：窗口内合计占总股本 ≥0.5%，或合计 ≥500 万股（任一即报）。
+HOLDER_REDUCE_PCT_MIN = 0.5
+HOLDER_REDUCE_SHARES_MIN_10K = 500.0
+#: 业绩预告：负面类型，或预告净利同比上限 ≤ -20%。
+FORECAST_NEGATIVE_TYPES = frozenset({"首亏", "续亏", "预减", "增亏", "略减"})
+FORECAST_CHANGE_PCT_MAX = -20.0
+#: 股权质押：最新统计日质押比例 ≥20%。
+PLEDGE_RATIO_PCT_MIN = 20.0
+#: 用户可见的过期前缀（测试与 Hermes 侧按此识别）。
+EVENT_STALE_MARK = "⚠️ 事件数据过期"
+#: 阈值表的只读快照（测试与文档共用）。
+EVENT_THRESHOLDS = {
+    "window_days": EVENT_WINDOW_DAYS,
+    "lockup_ratio_pct_min": LOCKUP_RATIO_PCT_MIN,
+    "lockup_shares_10k_min": LOCKUP_SHARES_MIN_10K,
+    "holder_reduce_pct_min": HOLDER_REDUCE_PCT_MIN,
+    "holder_reduce_shares_10k_min": HOLDER_REDUCE_SHARES_MIN_10K,
+    "forecast_change_pct_max": FORECAST_CHANGE_PCT_MAX,
+    "pledge_ratio_pct_min": PLEDGE_RATIO_PCT_MIN,
+}
 
 #: 一字板事实在 ``diagnostics.warnings`` 里的措辞（由 ``status.execution_block``
 #: 产生）。渲染层只读 CLI 已经写出的事实，不重新判定行情。
@@ -843,6 +886,268 @@ def _market_watch_line(payload: Dict[str, Any]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# T7：事件风险（解禁 / 增减持 / 业绩预告 / 质押）
+# ---------------------------------------------------------------------------
+_EVENT_SECTION_ORDER = ("lockup", "holder_trades", "forecast", "pledge")
+_EVENT_SECTION_LABELS = {
+    "lockup": "解禁",
+    "holder_trades": "股东增减持",
+    "forecast": "业绩预告",
+    "pledge": "股权质押",
+}
+#: 这些原因表示「该口径本就不适用」，不是取数失败：不进过期行。
+_EVENT_HIDDEN_REASONS = frozenset(
+    {"fund_not_supported", "replay_not_supported", "not_supported"})
+
+
+def _event_ref_date(section: Dict[str, Any]) -> Optional[str]:
+    """事件窗口的基准日：缓存快照日（不是事件自身日期）。"""
+    return (_date_text(section.get("fetched_at"))
+            or _date_text(section.get("as_of")))
+
+
+def _days_between(later: Optional[str], earlier: Optional[str]) -> Optional[int]:
+    """``later - earlier`` 的自然日数；任一不可解析返回 ``None``。"""
+    if not later or not earlier:
+        return None
+    try:
+        return (_dt.date.fromisoformat(later)
+                - _dt.date.fromisoformat(earlier)).days
+    except ValueError:
+        return None
+
+
+def _fmt_event_pct(value) -> Optional[str]:
+    """百分数数值（1.5 表示 1.5%）→ ``1.5%``。"""
+    number = _num(value)
+    if number is None:
+        return None
+    text = f"{number:.2f}".rstrip("0").rstrip(".")
+    return f"{text or '0'}%"
+
+
+def _fmt_10k(value) -> Optional[str]:
+    """万股数值 → ``1200 万股``（只取绝对量，方向由文案表达）。"""
+    number = _num(value)
+    if number is None:
+        return None
+    text = f"{abs(number):.2f}".rstrip("0").rstrip(".")
+    return f"{text or '0'} 万股"
+
+
+def _fmt_change_span(item: Dict[str, Any]) -> Optional[str]:
+    low = _num(item.get("change_pct_lower"))
+    high = _num(item.get("change_pct_upper"))
+    if low is None and high is None:
+        return None
+    if low is not None and high is not None:
+        return f"{low:.1f}%~{high:.1f}%"
+    value = low if low is not None else high
+    return f"{value:.1f}%"
+
+
+def _fmt_amount_span(item: Dict[str, Any]) -> Optional[str]:
+    """金额区间用**同一单位**（按较大绝对值选亿/万/元），避免 ``-1.2亿~-8000万``。"""
+    low = _num(item.get("amount_lower"))
+    high = _num(item.get("amount_upper"))
+    values = [value for value in (low, high) if value is not None]
+    if not values:
+        return None
+    scale = max(abs(value) for value in values)
+    if scale >= 1e8:
+        unit, digits, suffix = 1e8, 2, "亿"
+    elif scale >= 1e4:
+        unit, digits, suffix = 1e4, 0, "万"
+    else:
+        unit, digits, suffix = 1.0, 0, "元"
+
+    def _one(value):
+        text = f"{value / unit:.{digits}f}".rstrip("0").rstrip(".")
+        return f"{text or '0'}{suffix}"
+
+    low_text = _one(low) if low is not None else None
+    high_text = _one(high) if high is not None else None
+    if low_text and high_text and low_text != high_text:
+        return f"{low_text}~{high_text}"
+    return low_text or high_text
+
+
+def _events_stale_line(events: Dict[str, Any]) -> Optional[str]:
+    """任一子项取数失败 / 过期 → 一行 ``⚠️ 事件数据过期（{D}）：{labels}``。"""
+    stale_keys = []
+    for key in _EVENT_SECTION_ORDER:
+        section = _dict(events.get(key))
+        reason = _text(section.get("reason"))
+        if reason in _EVENT_HIDDEN_REASONS:
+            continue
+        if section.get("stale") is True or section.get("available") is False:
+            stale_keys.append(key)
+    if not stale_keys:
+        return None
+    dates = [_date_text(_dict(events.get(key)).get("as_of")) for key in stale_keys]
+    dates = [day for day in dates if day]
+    day = min(dates) if dates else (_date_text(events.get("as_of")) or "未知")
+    labels = "、".join(_EVENT_SECTION_LABELS[key] for key in stale_keys)
+    return f"{EVENT_STALE_MARK}（{day}）：{labels}"
+
+
+def _lockup_line(events: Dict[str, Any]) -> Optional[str]:
+    """未来 20 日内、达到额度阈值的解禁；只报最近的一批。"""
+    section = _dict(events.get("lockup"))
+    if section.get("available") is not True:
+        return None
+    ref = _event_ref_date(section)
+    if not ref:
+        return None
+    best = None
+    for raw in section.get("items") or []:
+        item = _dict(raw)
+        day = _date_text(item.get("date"))
+        days = _days_between(day, ref)
+        if days is None or days < 0 or days > EVENT_WINDOW_DAYS:
+            continue
+        ratio = _num(item.get("ratio_pct"))
+        shares = _num(item.get("shares_10k"))
+        qualifies = ((ratio is not None and ratio >= LOCKUP_RATIO_PCT_MIN)
+                     or (shares is not None
+                         and abs(shares) >= LOCKUP_SHARES_MIN_10K))
+        if not qualifies:
+            continue
+        rank = (days, -(ratio or 0.0),
+                -(abs(shares) if shares is not None else 0.0))
+        if best is None or rank < best[0]:
+            best = (rank, day, ratio, shares)
+    if best is None:
+        return None
+    _rank, day, ratio, shares = best
+    share_text, ratio_text = _fmt_10k(shares), _fmt_event_pct(ratio)
+    if share_text and ratio_text:
+        detail = f"解禁 {share_text}（占总股本 {ratio_text}）"
+    elif share_text:
+        detail = f"解禁 {share_text}"
+    elif ratio_text:
+        detail = f"解禁（占总股本 {ratio_text}）"
+    else:
+        return None
+    return f"⚠️ 解禁：{day} {detail}"
+
+
+def _holder_trade_line(events: Dict[str, Any]) -> Optional[str]:
+    """近 20 日减持公告合计达到阈值；按公告条数 + 总股数/占比聚合。"""
+    section = _dict(events.get("holder_trades"))
+    if section.get("available") is not True:
+        return None
+    ref = _event_ref_date(section)
+    if not ref:
+        return None
+    rows = []
+    for raw in section.get("items") or []:
+        item = _dict(raw)
+        if _text(item.get("direction")) != "减持":
+            continue
+        days = _days_between(ref, _date_text(item.get("notice_date")))
+        if days is None or days < 0 or days > EVENT_WINDOW_DAYS:
+            continue
+        rows.append(item)
+    if not rows:
+        return None
+    total_pct = sum(abs(value) for value in
+                    (_num(item.get("change_pct_total")) for item in rows)
+                    if value is not None)
+    total_shares = sum(abs(value) for value in
+                       (_num(item.get("change_shares_10k")) for item in rows)
+                       if value is not None)
+    if not (total_pct >= HOLDER_REDUCE_PCT_MIN
+            or total_shares >= HOLDER_REDUCE_SHARES_MIN_10K):
+        return None
+    share_text = _fmt_10k(total_shares) if total_shares else None
+    pct_text = _fmt_event_pct(total_pct) if total_pct else None
+    if share_text and pct_text:
+        detail = f"合计 {share_text}（占总股本 {pct_text}）"
+    elif share_text:
+        detail = f"合计 {share_text}"
+    elif pct_text:
+        detail = f"合计占总股本 {pct_text}"
+    else:
+        return None
+    return f"⚠️ 股东减持：近 {EVENT_WINDOW_DAYS} 日 {len(rows)} 笔，{detail}"
+
+
+def _forecast_line(events: Dict[str, Any]) -> Optional[str]:
+    """近 20 日负面业绩预告：取最新公告日，优先「归母净利润」指标。"""
+    section = _dict(events.get("forecast"))
+    if section.get("available") is not True:
+        return None
+    ref = _event_ref_date(section)
+    if not ref:
+        return None
+    candidates = []
+    for raw in section.get("items") or []:
+        item = _dict(raw)
+        days = _days_between(ref, _date_text(item.get("notice_date")))
+        if days is None or days < 0 or days > EVENT_WINDOW_DAYS:
+            continue
+        forecast_type = _text(item.get("forecast_type"))
+        upper = _num(item.get("change_pct_upper"))
+        negative = (forecast_type in FORECAST_NEGATIVE_TYPES
+                    or (upper is not None
+                        and upper <= FORECAST_CHANGE_PCT_MAX))
+        if negative:
+            candidates.append(item)
+    if not candidates:
+        return None
+    latest = max((_date_text(item.get("notice_date")) or "")
+                 for item in candidates)
+    rows = [item for item in candidates
+            if _date_text(item.get("notice_date")) == latest]
+    primary = next(
+        (item for item in rows
+         if "归母" in (_text(item.get("indicator")) or "")), rows[0])
+    forecast_type = _text(primary.get("forecast_type")) or "业绩预告"
+    indicator = _text(primary.get("indicator")) or "业绩"
+    detail = _fmt_amount_span(primary) or _fmt_change_span(primary)
+    text = f"{indicator} {detail}" if detail else indicator
+    return f"⚠️ 业绩预告：{forecast_type}（{text}，{latest} 公告）"
+
+
+def _pledge_line(events: Dict[str, Any]) -> Optional[str]:
+    """最新中国结算统计日的质押比例；达到阈值才报。"""
+    section = _dict(events.get("pledge"))
+    if section.get("available") is not True:
+        return None
+    items = section.get("items") or []
+    if not items:
+        return None
+    item = _dict(items[0])
+    ratio = _num(item.get("ratio_pct"))
+    if ratio is None or ratio < PLEDGE_RATIO_PCT_MIN:
+        return None
+    day = _date_text(item.get("date"))
+    suffix = f"（{day} 中国结算）" if day else "（中国结算）"
+    return f"⚠️ 股权质押：质押比例 {_fmt_event_pct(ratio)}{suffix}"
+
+
+def _events_lines(payload: Dict[str, Any]) -> List[str]:
+    """``evidence.events`` → 至多 1 条过期提示 + 每类至多 1 行事件。
+
+    整块缺失、基金 / 回放口径、或没有任何达阈值事件时返回 ``[]``。
+    """
+    events = _dict(_dict(payload.get("evidence")).get("events"))
+    if not events:
+        return []
+    lines: List[str] = []
+    stale = _events_stale_line(events)
+    if stale:
+        lines.append(stale)
+    for builder in (_lockup_line, _holder_trade_line,
+                    _forecast_line, _pledge_line):
+        line = builder(events)
+        if line:
+            lines.append(line)
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 def render_advice(payload: dict, compact: bool = False) -> str:
@@ -881,6 +1186,11 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     market_watch = _market_watch_line(document)
     if market_watch:
         lines.append(market_watch)
+
+    # T7：事件风险（解禁 / 增减持 / 预告 / 质押）—— 每类至多一行；
+    # 取数失败 / 过期时先出「事件数据过期（{D}）」，绝不写成「无事件」。
+    for event_line in _events_lines(document):
+        lines.append(event_line)
 
     lines.append(_price_line(document))
 

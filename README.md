@@ -648,6 +648,48 @@ Referer: https://vipmoney.eastmoney.com/
 离线开关：`ASTOCK_MARKET_WATCH_OFFLINE=1`（测试默认开启）；
 状态目录覆盖：`MARKET_WATCH_STATE_DIR`。
 
+### evidence.events（T7，issue #1 / R11 缺口表 #7–#10）
+
+四类**事件风险**：限售解禁 / 股东增减持 / 业绩预告 / 股权质押。上游
+a-stock-data v3.10.4 §3.6、§14.1、§14.3、§14.5（东财 `datacenter-web`）。
+`schema_version` 仍为 `1.0`（additive）；**不参与** `action` / `confidence` /
+仓位 / 触发器。
+
+**只在收盘后预计算，盘前零联网**：
+
+```bash
+# 18:30–18:50 时段；默认 14 只自选，10 只 × 4 端点 = 40 请求，串行 ≥39s
+python tools/precompute_events.py
+python tools/precompute_events.py 600000,000001 --json
+python tools/precompute_events.py --estimate        # 不触网，只算串行耗时
+
+# CLI 主路径只读如下缓存（data/ 已 gitignore），不发起任何请求
+source/stock_analysis/data/state/events/events.json
+```
+
+```
+evidence.events = {
+  available, stale, as_of, fetched_at, reason, code,
+  lockup:        {available, stale, as_of, fetched_at, reason, error, items[]},
+  holder_trades: {...}, forecast: {...}, pledge: {...}
+}
+```
+
+- 每个子项**独立**成功/失败：任一子端点坏掉只影响该子项，其余三项与主建议
+  不受影响；失败时保留上一轮数据并标 `stale=true`，没有旧数据则
+  `available=false`。
+- **「无事件」与「接口坏了」分开**：带个股条件的 0 行 = 确实没有；
+  请求失败 / `code≠0` / 结构改变 / 非 JSON = 坏了。渲染层对后者输出
+  `⚠️ 事件数据过期（{D}）：…`，**绝不**写成「无事件」。
+- **只报 20 日内 + 重大额度**，每类至多一行：解禁 ≥1.0% 或 ≥500 万股；
+  减持合计 ≥0.5% 或 ≥500 万股；预告类型黑名单（首亏/续亏/预减/增亏/略减）
+  或同比上限 ≤-20%；质押 ≥20%。阈值常量见
+  `advice_render.EVENT_THRESHOLDS`，理由见 `docs/EVENT_RISK.md`。
+- 基金：`available=false, reason=fund_not_supported`，不告警、不渲染。
+  `--as-of` 回放：`reason=replay_not_supported`（事件只有当前快照，套到
+  过去等于前视）。
+- 状态目录覆盖：`EVENTS_STATE_DIR`。
+
 ### 前向台账（P1，issue #56）：每日记录 + 20 交易日结算
 
 回放历史得不出资金流方向与置信度校准的结论（R3 §8.2：资金流只有 79 个决策日、

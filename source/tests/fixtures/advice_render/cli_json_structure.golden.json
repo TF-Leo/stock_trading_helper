@@ -81,6 +81,7 @@
     "deflated_sharpe",
     "dispersion",
     "edge",
+    "events",
     "excess_vs_buy_hold",
     "flow",
     "market_watch",
@@ -153,6 +154,18 @@
     "as_of",
     "available",
     "hit",
+    "stale"
+  ],
+  "evidence.events": [
+    "as_of",
+    "available",
+    "code",
+    "fetched_at",
+    "forecast",
+    "holder_trades",
+    "lockup",
+    "pledge",
+    "reason",
     "stale"
   ]
 }

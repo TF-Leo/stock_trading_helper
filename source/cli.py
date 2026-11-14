@@ -15,6 +15,8 @@ from stock_analysis.data_loader.status import resolve_trading_status
 from decision.context import evidence_context
 from stock_analysis.data_sources.market_watch import (  # T6 重点监控池
     market_watch_evidence as _market_watch_evidence, with_market_watch_block)
+from stock_analysis.data_loader.events import (  # T7 事件风险（只读缓存）
+    events_evidence as _events_evidence, with_events_block)
 from stock_analysis.backtest.analyzer import run_strategy_tournament, calc_buy_hold_baseline
 from stock_analysis.backtest.engine import BacktestConfig
 from stock_analysis.strategy.registry import (
@@ -89,8 +91,10 @@ from decision.schema import (  # noqa: E402
 )
 from decision.schema import empty_metrics as _empty_metrics  # noqa: E402
 
-# T6：错误路径也必须带键同构的 ``evidence.market_watch``（G35），不改 decision/*。
-create_error_response = with_market_watch_block(_create_error_response)
+# T6/T7：错误路径也必须带键同构的 ``evidence.market_watch`` /
+# ``evidence.events``（G35），不改 decision/*。
+create_error_response = with_events_block(
+    with_market_watch_block(_create_error_response))
 
 
 def _stability_score(consensus):
@@ -497,6 +501,9 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     # 监控池是全市场名单，与 data_type 无关，故不传类型。
     market_watch_block, mw_notes = _market_watch_evidence(code, as_of=as_of)
     warnings.extend(mw_notes)
+    # T7：事件风险（收盘后预计算缓存）；只展示/只告警，不改 action。
+    events_block, event_notes = _events_evidence(code, data_type, as_of=as_of)
+    warnings.extend(event_notes)
 
     # 构建响应
     response = {
@@ -601,6 +608,8 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'flow': flow_block, 'valuation': valuation_block,  # P1-2/P1-1 只展示，不改 action
             # T6 additive：交易所重点监控池（只展示 / 只告警，不改 action）
             'market_watch': market_watch_block,
+            # T7 additive：事件风险（只展示 / 只告警，不改 action）
+            'events': events_block,
         },
         'candidates': final_candidates,
         'diagnostics': {
