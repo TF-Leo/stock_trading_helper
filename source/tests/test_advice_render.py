@@ -566,6 +566,8 @@ CLOSED_GLOSSARY = {
     "ProxyError": "代理异常",
     "no_edge": "无统计优势",
     "95% CI": "置信区间",
+    # N4：整句短语优先于 ``no_edge``，避免「统计上无优势，判无统计优势」重复。
+    "统计上无优势，判 no_edge": "统计上无优势",
 }
 
 
@@ -591,6 +593,8 @@ def _parens_balanced(text: str) -> bool:
 DELETION_ONLY_WARNINGS = (
     *REAL_WARNINGS,
     "接口失败 https://example.com/a?b=1（RuntimeError: timeout）；已回退旧缓存（P0-3）",
+    # N1：删除后残留的连续空格也必须在输出里折叠。
+    "接口失败（issue #1 决策）  已回退旧缓存",
     "状态未知：停牌/退市/代码无效无法区分",
     # token 落在整对括号里，括号被整段删除 → 结果仍只是删除。
     "统计证据不足（p_positive=0.42，n=12）",
@@ -611,10 +615,32 @@ GLOSSARY_CASES = (
     ("上游抛 ProxyError", "上游抛代理异常"),
     # 两个词表 token 相邻：接缝里的空格也不得留下「中文 空格 中文」。
     ("is_st p_positive", "ST 标记买侧期望胜率"),
-    # P4：no_edge 告警不得把 95% CI / no_edge 漏给用户。
+    # P4：no_edge 告警不得把 95% CI / no_edge 漏给用户，也不得同义重复（N4）。
     ("超额收益 95% CI 上界 ≤ 0：统计上无优势，判 no_edge（B8）",
-     "超额收益置信区间上界 ≤ 0：统计上无优势，判无统计优势"),
+     "超额收益置信区间上界 ≤ 0：统计上无优势"),
+    # N1：相邻两个词表 token 之间即使是多个空格，也不得留下连续空格。
+    ("is_st  p_positive", "ST 标记买侧期望胜率"),
+    ("状态 is_st   p_positive 只能依据名称判断",
+     "状态 ST 标记买侧期望胜率只能依据名称判断"),
 )
+
+#: N2：删除段把两侧文本拼成词表 token 时，不得在删除结果上二次替换。
+#: 期望值里保留拼接出的 token 原文，证明命中判定只发生在原文位置。
+SEAM_CONCATENATION_CASES = (
+    ("is_（issue #1 决策）st 只能依据名称判断", "is_st 只能依据名称判断"),
+    ("p_（issue #1 决策）positive 缺失", "p_positive 缺失"),
+    ("trigger.（issue #1 决策）current 缺失", "trigger.current 缺失"),
+)
+
+#: N3：真实告警 fixture 至少覆盖的 6 类语义（标记取自真实告警措辞）。
+REAL_WARNING_CATEGORY_MARKERS = {
+    "停牌": "判定停牌/无成交",
+    "ST 名单失败": "ST 名单接口失败（RuntimeError",
+    "退市": "疑似退市/长期停牌",
+    "一字板": "一字涨停（最高=最低=涨停价）",
+    "代理异常": "ProxyError",
+    "日历不可用": "未做缺口核验（日历不可用）",
+}
 
 #: token 前后粘连字母/数字/下划线/中文/dot 时不得替换（词边界）。
 GLOSSARY_BOUNDARY_WARNINGS = (
@@ -632,6 +658,45 @@ GLOSSARY_BOUNDARY_WARNINGS = (
 
 def test_compact_glossary_is_closed_set():
     assert COMPACT_GLOSSARY == CLOSED_GLOSSARY
+
+
+def test_compact_real_warnings_fixture_covers_six_categories():
+    """N3：fixture 名实相符，至少覆盖 6 类真实告警。"""
+    assert REAL_WARNINGS_FIXTURE.name == "compact_real_warnings.json"
+    assert len(REAL_WARNINGS) >= len(REAL_WARNING_CATEGORY_MARKERS)
+    joined = "\n".join(REAL_WARNINGS)
+    for category, marker in REAL_WARNING_CATEGORY_MARKERS.items():
+        assert marker in joined, (category, marker)
+
+
+@pytest.mark.parametrize("warning,expected", SEAM_CONCATENATION_CASES)
+def test_compact_does_not_resubstitute_token_created_by_deletion(warning, expected):
+    """N2：删除后拼接出的 token 不得触发第二次替换。
+
+    命中判定只对原文做；删除段留下的 ``is_st`` / ``p_positive`` 等原文片段
+    必须保持原样（它们不是原文里独立存在的 token）。
+    """
+    compacted = _compact_single(warning)
+    assert compacted == expected
+    assert _is_deletion_subsequence(compacted, warning)
+    for label in CLOSED_GLOSSARY.values():
+        assert label not in compacted
+
+
+def test_compact_collapses_spaces_left_by_deletion():
+    """N1：删除段残留的多余空格也必须折叠。"""
+    assert (_compact_single("接口失败（issue #1 决策）  已回退旧缓存")
+            == "接口失败已回退旧缓存")
+
+
+def test_compact_no_edge_synonym_is_not_duplicated():
+    """N4：不得出现「统计上无优势，判无统计优势」同义重复，语义不变。"""
+    warning = "超额收益 95% CI 上界 ≤ 0：统计上无优势，判 no_edge（B8）"
+    compacted = _compact_single(warning)
+    assert compacted == "超额收益置信区间上界 ≤ 0：统计上无优势"
+    assert "判无统计优势" not in compacted
+    assert "统计上无优势" in compacted
+    assert compacted.count("统计上无优势") == 1
 
 
 @pytest.mark.parametrize("warning", DELETION_ONLY_WARNINGS)
@@ -692,6 +757,8 @@ def test_compact_no_edge_warning_has_no_jargon_and_keeps_semantics():
     assert "no_edge" not in warning_line
     assert "置信区间" in warning_line
     assert "统计上无优势" in warning_line
+    assert warning_line.count("统计上无优势") == 1
+    assert "判无统计优势" not in warning_line
     assert "没有机会" not in compact
 
 
