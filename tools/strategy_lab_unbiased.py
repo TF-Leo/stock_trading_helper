@@ -705,10 +705,13 @@ def cmd_verify(args) -> int:
             missing_ref += 1
             continue
         md5 = _md5(path)
-        same = (md5 == r.get("csv_md5")
-                and entry.get("rows") == r.get("rows")
-                and entry.get("first") == r.get("first")
-                and entry.get("last") == r.get("last"))
+        md5_same = md5 == r.get("csv_md5")
+        # 判定以 **md5** 为准（它是文件内容的完整指纹）。元数据（rows/first/last）
+        # 只作为附加诊断：本工具的 manifest 记录的是落盘 csv/ 的首末日，
+        # 若两者不一致说明 manifest 写错了，但**文件本身可能是对的**。
+        # 早期版本用 and 把两者串起来，导致 md5 正确但元数据过期时被误判为
+        # 不一致（实测 2,471 只误报）。
+        same = md5_same
         if same:
             match += 1
         else:
@@ -721,7 +724,7 @@ def cmd_verify(args) -> int:
                 bs, code, path, r,
                 str(r.get("first") or DEFAULT_START),
                 str(r.get("last") or DEFAULT_END))
-            detail.append({"code": code, "md5_ok": md5 == r.get("csv_md5"),
+            detail.append({"code": code, "md5_ok": md5_same,
                            "rows": [entry.get("rows"), r.get("rows")],
                            "first": [entry.get("first"), r.get("first")],
                            "last": [entry.get("last"), r.get("last")],
