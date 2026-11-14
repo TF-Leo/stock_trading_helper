@@ -65,8 +65,10 @@ T7        事件风险（``evidence.events``）：解禁 / 股东增减持 / 业
   一行；无事件则整类消失。阈值见 :data:`EVENT_THRESHOLDS`（写死在代码里，
   理由见 ``docs/EVENT_RISK.md``）。``available=False`` 或 ``stale=True`` 时
   必须先输出 ``⚠️ 事件数据过期（{D}）``，**绝不**把「没取到」写成「无事件」。
-  基金 / ``--as-of`` 回放的 ``fund_not_supported`` / ``replay_not_supported``
-  整段消失（由 warnings 说明原因）。
+  专用文案：缓存未生成 → 「未生成」；探针失败 → 「接口疑似异常」；
+  北交所 ``not_supported`` → 「ℹ️ …：未覆盖」。基金 / ``--as-of`` 回放的
+  ``fund_not_supported`` / ``replay_not_supported`` 整段消失（由 warnings
+  说明原因）。
 * ``compact=True`` 只处理 ``diagnostics.warnings``，结果由 **封闭词表替换 +
   整段删除** 两部分组成：
 
@@ -896,8 +898,14 @@ _EVENT_SECTION_LABELS = {
     "pledge": "股权质押",
 }
 #: 这些原因表示「该口径本就不适用」，不是取数失败：不进过期行。
+#: P3-1：``not_supported`` 不再静默 —— 由 ``_events_coverage_line`` 明确写「未覆盖」。
 _EVENT_HIDDEN_REASONS = frozenset(
-    {"fund_not_supported", "replay_not_supported", "not_supported"})
+    {"fund_not_supported", "replay_not_supported"})
+#: P2-2：接口疑似异常有独立文案，不与「过期」混写。
+_EVENT_SUSPECT_REASONS = frozenset(
+    {"interface_suspected", "empty_pool_suspected"})
+#: 缓存从未生成 / 无该标的：写「未生成」，不写「过期（未知）」。
+_EVENT_MISSING_REASONS = frozenset({"cache_missing", "code_missing"})
 
 
 def _event_ref_date(section: Dict[str, Any]) -> Optional[str]:
@@ -973,12 +981,19 @@ def _fmt_amount_span(item: Dict[str, Any]) -> Optional[str]:
 
 
 def _events_stale_line(events: Dict[str, Any]) -> Optional[str]:
-    """任一子项取数失败 / 过期 → 一行 ``⚠️ 事件数据过期（{D}）：{labels}``。"""
+    """任一子项取数失败 / 过期 → 一行 ``⚠️ 事件数据过期（{D}）：{labels}``。
+
+    P2-2 / P3-1 / P3-2 的专用原因（接口疑似异常、未覆盖、未生成）各有独立
+    文案，不在这里重复出现。
+    """
     stale_keys = []
     for key in _EVENT_SECTION_ORDER:
         section = _dict(events.get(key))
         reason = _text(section.get("reason"))
-        if reason in _EVENT_HIDDEN_REASONS:
+        if (reason in _EVENT_HIDDEN_REASONS
+                or reason in _EVENT_SUSPECT_REASONS
+                or reason in _EVENT_MISSING_REASONS
+                or reason == "not_supported"):
             continue
         if section.get("stale") is True or section.get("available") is False:
             stale_keys.append(key)
@@ -989,6 +1004,45 @@ def _events_stale_line(events: Dict[str, Any]) -> Optional[str]:
     day = min(dates) if dates else (_date_text(events.get("as_of")) or "未知")
     labels = "、".join(_EVENT_SECTION_LABELS[key] for key in stale_keys)
     return f"{EVENT_STALE_MARK}（{day}）：{labels}"
+
+
+def _events_missing_line(events: Dict[str, Any]) -> Optional[str]:
+    """P3-2：缓存从未生成 → 「未生成」，绝不渲染成「过期（未知）」。"""
+    reason = _text(events.get("reason"))
+    if reason not in _EVENT_MISSING_REASONS:
+        return None
+    labels = "、".join(_EVENT_SECTION_LABELS[key]
+                     for key in _EVENT_SECTION_ORDER
+                     if _text(_dict(events.get(key)).get("reason"))
+                     not in (None, ""))
+    labels = labels or "解禁、股东增减持、业绩预告、股权质押"
+    if reason == "cache_missing":
+        detail = "预计算未运行，请先运行 tools/precompute_events.py"
+    else:
+        detail = "缓存存在但该标的未包含在内，请重跑 tools/precompute_events.py"
+    return f"⚠️ 事件数据未生成：{labels}（{detail}）"
+
+
+def _events_suspect_line(events: Dict[str, Any]) -> Optional[str]:
+    """P2-2：对照探针失败 / 全票池皆空 → 「不可用」，不是「无事件」。"""
+    keys = []
+    for key in _EVENT_SECTION_ORDER:
+        if _text(_dict(events.get(key)).get("reason")) in _EVENT_SUSPECT_REASONS:
+            keys.append(key)
+    if not keys:
+        return None
+    labels = "、".join(_EVENT_SECTION_LABELS[key] for key in keys)
+    return f"{EVENT_STALE_MARK}：{labels}（接口疑似异常，本轮空结果不采信）"
+
+
+def _events_coverage_line(events: Dict[str, Any]) -> Optional[str]:
+    """P3-1：``not_supported`` 显式写「未覆盖」，不得渲染成「无事件」。"""
+    keys = [key for key in _EVENT_SECTION_ORDER
+            if _text(_dict(events.get(key)).get("reason")) == "not_supported"]
+    if not keys:
+        return None
+    labels = "、".join(_EVENT_SECTION_LABELS[key] for key in keys)
+    return f"ℹ️ {labels}：未覆盖（该市场无此统计口径）"
 
 
 def _lockup_line(events: Dict[str, Any]) -> Optional[str]:
@@ -1136,9 +1190,11 @@ def _events_lines(payload: Dict[str, Any]) -> List[str]:
     if not events:
         return []
     lines: List[str] = []
-    stale = _events_stale_line(events)
-    if stale:
-        lines.append(stale)
+    for builder in (_events_missing_line, _events_suspect_line,
+                    _events_stale_line, _events_coverage_line):
+        line = builder(events)
+        if line:
+            lines.append(line)
     for builder in (_lockup_line, _holder_trade_line,
                     _forecast_line, _pledge_line):
         line = builder(events)

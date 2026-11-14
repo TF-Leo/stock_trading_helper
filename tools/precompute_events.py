@@ -5,8 +5,8 @@
 为什么必须预计算
 ----------------
 东财 ``datacenter-web`` 与 ``push2`` 同属东财风控面（IP 级封禁史）。10 只标的
-× 4 个端点 = 40 次请求，串行 ≥1s 即 ≥40s，**绝不可**放进 09:15 盘前窗口。
-本工具只在收盘后（18:30–18:50 时段）运行一次，把结果落到
+× 4 个端点 + 4 个对照探针 = 44 次请求，串行 ≥1s 即 ≥43s，**绝不可**放进
+09:15 盘前窗口。本工具只在收盘后（18:30–18:50 时段）运行一次，把结果落到
 
     source/stock_analysis/data/state/events/events.json   （``data/`` 已 gitignore）
 
@@ -27,9 +27,22 @@ pledge     §14.5 ``RPT_CSDC_LIST``                  1 次；该股最近统计�
 质押表按个股累积多年历史（实测 600000 有 633 行 / 127 页），只取按
 ``TRADE_DATE`` 倒序的第 1 页 1 行，**不**声称拿到全部历史。
 
-每个请求都带个股条件，所以 **0 行 = 确实没有**（合法的空结果）。请求失败 /
+逐票请求都带个股条件，所以 **0 行 = 确实没有**（合法的空结果）。请求失败 /
 非 2xx / 非 JSON / 结构改变 / 结果超过一页 = **接口坏了**，抛异常；该子项
-标 ``stale=True`` 并保留上一轮缓存，其余三个子项继续，不受影响。
+标 ``stale=True`` 并保留上一轮缓存，其余三个子项继续，不受影响。（对照探针
+本身不带个股条件，见下。）
+
+P2-1 行级归属校验：返回的每一行还要再核对 ``SECURITY_CODE`` 与日期窗口
+（解禁 ``FREE_DATE``、增减持/预告 ``NOTICE_DATE``、质押 ``TRADE_DATE<=as_of``）；
+他票行 / 窗口外行 / 日期不可解析 / 重复行**丢弃**并计入子项 ``warnings``，
+不会把别的标的的事件入库。
+
+P2-2 「无事件 vs 接口坏了」：每轮先发 4 个对照探针（每报表 1 次，与票池
+大小无关）：CSDC 无条件 ``pageSize=1``；解禁 ``FREE_DATE>=as_of``；预告 /
+增减持 ``NOTICE_DATE>=as_of-30d``。探针抛错或 0 行 → 本轮该子项对所有代码
+标 ``available=false, reason=interface_suspected``（有旧数据则保留 + stale），
+并跳过该子项的逐票请求。零成本兜底：全票池该子项皆空且上一轮有数据 →
+``empty_pool_suspected`` + warning。
 
 限流
 ----
@@ -44,6 +57,7 @@ pledge     §14.5 ``RPT_CSDC_LIST``                  1 次；该股最近统计�
     python tools/precompute_events.py 600000 000001      # 指定票池
     python tools/precompute_events.py --codes 600000,000001 --json
     python tools/precompute_events.py --estimate         # 只估算耗时，不触网
+    python tools/precompute_events.py --probes-only      # 只跑 4 个对照探针
     python tools/precompute_events.py --out-dir /tmp/events
 
 退出码：0 = 全部子项成功；1 = 有子项失败；2 = 参数/配置错误。
@@ -92,6 +106,96 @@ _CODE_RE = re.compile(r"^\d{6}$")
 
 class EventsFetchError(RuntimeError):
     """事件端点取数 / 解析失败。"""
+
+
+class FetchResult(list):
+    """单个子项的取数结果。
+
+    继承 ``list``：既有的调用方 / 测试仍可把它当 items 列表用（``==``、
+    迭代、``len``）。额外携带：
+
+    * ``warnings`` —— P2-1 丢弃的行、P3-4 未知类型等，随子项一起落盘；
+    * ``reason`` —— 例如北交所质押的 ``not_supported``（P3-1）。
+    """
+
+    def __init__(self, items=(), warnings=None, reason=None):
+        super().__init__(items)
+        self.warnings = [str(item) for item in (warnings or [])]
+        self.reason = reason
+
+
+_DROP_LABELS = {
+    "other_code": "他票行",
+    "out_of_window": "窗口外行",
+    "invalid_date": "日期不可解析",
+    "duplicate": "重复行",
+}
+
+
+class _RowCheck:
+    """P2-1：逐行归属校验的统计器（丢弃原因 → 条数 → 一条 warning）。"""
+
+    def __init__(self):
+        self.counts = {}
+        self.seen = set()
+
+    def reject(self, reason: str) -> None:
+        self.counts[reason] = self.counts.get(reason, 0) + 1
+
+    def duplicate(self, key: str) -> bool:
+        if key in self.seen:
+            self.reject("duplicate")
+            return True
+        self.seen.add(key)
+        return False
+
+    def warnings(self):
+        if not self.counts:
+            return []
+        total = sum(self.counts.values())
+        detail = "、".join(f"{_DROP_LABELS[key]} {value}"
+                          for key, value in self.counts.items() if value)
+        return [f"丢弃 {total} 行（{detail}）"]
+
+
+def _row_key(item: dict) -> str:
+    return json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _row_attribution(row: dict, code: str, date_field: str,
+                     start: str = None, end: str = None, check: _RowCheck = None):
+    """校验一行确实属于请求的标的与日期窗口；失败返回 ``None`` 并记账。
+
+    上游 ``_em_event_rows()`` 对这一步逐行核对（``equal={"SECURITY_CODE": …}``
+    + 日期窗口）；本实现此前只信请求参数，一旦东财忽略筛选就会把别的标的
+    的行当成本标的的事件入库（张冠李戴）。这里按任务要求**丢弃**并计入
+    warning（不是整批抛错，避免一行坏数据丢掉整页好数据）。
+    """
+    row_code = str(row.get("SECURITY_CODE") or "").strip()
+    if row_code != code:
+        check.reject("other_code")
+        return None
+    try:
+        day = _day(row.get(date_field), date_field)
+    except EventsFetchError:
+        check.reject("invalid_date")
+        return None
+    if start is not None and day < start:
+        check.reject("out_of_window")
+        return None
+    if end is not None and day > end:
+        check.reject("out_of_window")
+        return None
+    return day
+
+
+def _coerce_result(result):
+    """fetcher 返回值 → ``(items, warnings, reason)``；兼容旧的 list 返回值。"""
+    if isinstance(result, FetchResult):
+        return list(result), result.warnings, result.reason
+    if isinstance(result, list):
+        return result, [], None
+    raise EventsFetchError(f"fetcher 返回值不是列表：{type(result).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -252,21 +356,28 @@ def fetch_lockup(code: str, as_of: str):
                     f"(FREE_DATE<='{end}')"),
         sort_columns="FREE_DATE", sort_types="1",
     )
+    check = _RowCheck()
     items = []
     for row in rows:
+        day = _row_attribution(row, code, "FREE_DATE", start, end, check)
+        if day is None:
+            continue
         ratio = _num(row.get("FREE_RATIO"), "FREE_RATIO")
         ratio_pct = None if ratio is None else round(ratio * 100.0, 4)
         if ratio_pct is not None and not 0.0 <= ratio_pct <= 100.0:
             raise EventsFetchError(f"FREE_RATIO 越界：{row.get('FREE_RATIO')!r}")
-        items.append({
-            "date": _day(row.get("FREE_DATE"), "FREE_DATE"),
+        item = {
+            "date": day,
             "type": str(row.get("FREE_SHARES_TYPE") or "").strip(),
             "shares_10k": _num(row.get("ABLE_FREE_SHARES"), "ABLE_FREE_SHARES"),
             "free_shares_10k": _num(row.get("FREE_SHARES"), "FREE_SHARES"),
             "ratio_pct": ratio_pct,
-        })
+        }
+        if check.duplicate(_row_key(item)):
+            continue
+        items.append(item)
     items.sort(key=lambda item: item["date"])
-    return items
+    return FetchResult(items, warnings=check.warnings())
 
 
 def fetch_holder_trades(code: str, as_of: str):
@@ -279,8 +390,12 @@ def fetch_holder_trades(code: str, as_of: str):
         sort_columns="NOTICE_DATE,SECURITY_CODE,HOLDER_NAME,START_DATE,END_DATE",
         sort_types="-1,1,1,1,1",
     )
+    check = _RowCheck()
     items = []
     for row in rows:
+        notice = _row_attribution(row, code, "NOTICE_DATE", start, as_of, check)
+        if notice is None:
+            continue
         direction = str(row.get("DIRECTION") or "").strip()
         if direction not in ("增持", "减持"):
             raise EventsFetchError(
@@ -290,8 +405,8 @@ def fetch_holder_trades(code: str, as_of: str):
             raise EventsFetchError(
                 f"增减持方向与变动股数符号不一致：{row.get('SECURITY_CODE')} "
                 f"{row.get('HOLDER_NAME')}")
-        items.append({
-            "notice_date": _day(row.get("NOTICE_DATE"), "NOTICE_DATE"),
+        item = {
+            "notice_date": notice,
             "holder": str(row.get("HOLDER_NAME") or "").strip(),
             "direction": direction,
             "change_shares_10k": shares,
@@ -302,13 +417,22 @@ def fetch_holder_trades(code: str, as_of: str):
             "channel": str(row.get("MARKET") or "").strip(),
             "start_date": _day(row.get("START_DATE"), "START_DATE"),
             "end_date": _day(row.get("END_DATE"), "END_DATE"),
-        })
+        }
+        if check.duplicate(_row_key(item)):
+            continue
+        items.append(item)
     items.sort(key=lambda item: item["notice_date"], reverse=True)
-    return items
+    return FetchResult(items, warnings=check.warnings())
 
 
 #: 业绩预告里属于「风险提示（黑名单）」的类型（封闭集合）。
 FORECAST_NEGATIVE_TYPES = frozenset({"首亏", "续亏", "预减", "增亏", "略减"})
+
+#: P3-4：已知 PREDICT_TYPE 封闭词表。不在表内的类型**不静默映射**，只告警；
+#: 新增类型（如「预亏」）不会被当成非负面而悄悄漏报。
+FORECAST_KNOWN_TYPES = frozenset(
+    FORECAST_NEGATIVE_TYPES
+    | {"预增", "略增", "扭亏", "续盈", "减亏", "预盈", "不确定"})
 
 
 def fetch_forecast(code: str, as_of: str):
@@ -321,27 +445,44 @@ def fetch_forecast(code: str, as_of: str):
         sort_columns="NOTICE_DATE,SECURITY_CODE,REPORT_DATE,PREDICT_FINANCE_CODE",
         sort_types="-1,1,-1,1",
     )
+    check = _RowCheck()
     items = []
+    unknown_types = set()
     for row in rows:
-        items.append({
-            "notice_date": _day(row.get("NOTICE_DATE"), "NOTICE_DATE"),
+        notice = _row_attribution(row, code, "NOTICE_DATE", start, as_of, check)
+        if notice is None:
+            continue
+        forecast_type = str(row.get("PREDICT_TYPE") or "").strip() or None
+        if forecast_type is not None and forecast_type not in FORECAST_KNOWN_TYPES:
+            unknown_types.add(forecast_type)
+        item = {
+            "notice_date": notice,
             "report_date": _day(row.get("REPORT_DATE"), "REPORT_DATE"),
             "indicator": str(row.get("PREDICT_FINANCE") or "").strip(),
-            "forecast_type": str(row.get("PREDICT_TYPE") or "").strip() or None,
+            "forecast_type": forecast_type,
             "amount_lower": _num(row.get("PREDICT_AMT_LOWER"), "PREDICT_AMT_LOWER"),
             "amount_upper": _num(row.get("PREDICT_AMT_UPPER"), "PREDICT_AMT_UPPER"),
             "change_pct_lower": _num(row.get("ADD_AMP_LOWER"), "ADD_AMP_LOWER"),
             "change_pct_upper": _num(row.get("ADD_AMP_UPPER"), "ADD_AMP_UPPER"),
-        })
+        }
+        if check.duplicate(_row_key(item)):
+            continue
+        items.append(item)
     items.sort(key=lambda item: (item["notice_date"], item["indicator"]), reverse=True)
-    return items
+    warnings = check.warnings()
+    if unknown_types:
+        warnings.append(
+            "未知 PREDICT_TYPE：" + "、".join(sorted(unknown_types))
+            + "（未按负面类型处理，请核对上游词表）")
+    return FetchResult(items, warnings=warnings)
 
 
 def fetch_pledge(code: str, as_of: str):
-    """§14.5 股权质押：中国结算周度统计；只覆盖沪深，北交所显式空结果。"""
+    """§14.5 股权质押：中国结算周度统计；只覆盖沪深，北交所显式 ``not_supported``。"""
     if _get_prefix(code) == "bj":
-        # 不是失败：上游明确只覆盖沪深，北交所没有该口径。
-        return []
+        # P3-1：不是「没有质押事件」，而是「该市场无此统计口径」。写入
+        # reason=not_supported，渲染层显示「未覆盖」，不得退化成「无事件」。
+        return FetchResult([], reason="not_supported")
     rows = _datacenter(
         "RPT_CSDC_LIST",
         filter_str=f'(SECURITY_CODE="{code}")',
@@ -351,9 +492,16 @@ def fetch_pledge(code: str, as_of: str):
         sort_columns="TRADE_DATE", sort_types="-1",
         page_size=1, allow_partial_page=True,
     )
-    if not rows:
-        return []
-    row = rows[0]
+    check = _RowCheck()
+    picked = None
+    for row in rows:
+        day = _row_attribution(row, code, "TRADE_DATE", None, as_of, check)
+        if day is not None:
+            picked = (row, day)
+            break
+    if picked is None:
+        return FetchResult([], warnings=check.warnings())
+    row, day = picked
     total = _num(row.get("REPURCHASE_BALANCE"), "REPURCHASE_BALANCE")
     free = _num(row.get("REPURCHASE_UNLIMITED_BALANCE"),
                 "REPURCHASE_UNLIMITED_BALANCE")
@@ -365,13 +513,14 @@ def fetch_pledge(code: str, as_of: str):
     ratio = _num(row.get("PLEDGE_RATIO"), "PLEDGE_RATIO")
     if ratio is not None and not 0.0 <= ratio <= 100.0:
         raise EventsFetchError(f"PLEDGE_RATIO 越界：{row.get('PLEDGE_RATIO')!r}")
-    return [{
-        "date": _day(row.get("TRADE_DATE"), "TRADE_DATE"),
+    item = {
+        "date": day,
         "ratio_pct": ratio,
         "pledged_shares_10k": total,
         "pledged_mktcap_10k": _num(row.get("PLEDGE_MARKET_CAP"), "PLEDGE_MARKET_CAP"),
         "pledge_count": _num(row.get("PLEDGE_DEAL_NUM"), "PLEDGE_DEAL_NUM"),
-    }]
+    }
+    return FetchResult([item], warnings=check.warnings())
 
 
 #: 子项顺序固定：估算、串行与测试都按这个顺序。
@@ -382,6 +531,63 @@ FETCHERS = (
     ("pledge", fetch_pledge),
 )
 REQUESTS_PER_CODE = len(FETCHERS)
+
+# ---------------------------------------------------------------------------
+# P2-2：每轮每报表 1 次「已知应该非空」的对照探针（共 4 请求）
+# ---------------------------------------------------------------------------
+#: 探针的最近公告窗口（天）。全市场 30 天窗口恒有大量公告。
+PROBE_LOOKBACK_DAYS = 30
+
+
+def probe_lockup(as_of: str):
+    """全市场未来解禁恒有排期 → 0 行即接口疑似异常。"""
+    return _datacenter(
+        "RPT_LIFT_STAGE",
+        filter_str=f"(FREE_DATE>='{as_of}')",
+        sort_columns="FREE_DATE", sort_types="1",
+        page_size=1, allow_partial_page=True,
+    )
+
+
+def probe_holder_trades(as_of: str):
+    """全市场近 30 天增减持公告恒有数据。"""
+    start = _shift(as_of, -PROBE_LOOKBACK_DAYS)
+    return _datacenter(
+        "RPT_SHARE_HOLDER_INCREASE",
+        filter_str=f"(NOTICE_DATE>='{start}')",
+        sort_columns="NOTICE_DATE", sort_types="-1",
+        page_size=1, allow_partial_page=True,
+    )
+
+
+def probe_forecast(as_of: str):
+    """全市场近 30 天业绩预告恒有数据。"""
+    start = _shift(as_of, -PROBE_LOOKBACK_DAYS)
+    return _datacenter(
+        "RPT_PUBLIC_OP_NEWPREDICT",
+        filter_str=f"(NOTICE_DATE>='{start}')",
+        sort_columns="NOTICE_DATE", sort_types="-1",
+        page_size=1, allow_partial_page=True,
+    )
+
+
+def probe_pledge(as_of: str):
+    """中国结算周度全市场统计恒有最新一行（无条件过滤）。"""
+    return _datacenter(
+        "RPT_CSDC_LIST",
+        filter_str="",
+        sort_columns="TRADE_DATE", sort_types="-1",
+        page_size=1, allow_partial_page=True,
+    )
+
+
+PROBES = (
+    ("lockup", probe_lockup),
+    ("holder_trades", probe_holder_trades),
+    ("forecast", probe_forecast),
+    ("pledge", probe_pledge),
+)
+PROBE_REQUESTS = len(PROBES)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +619,7 @@ class _Throttle:
             self.last = self.now_fn().timestamp()
 
 
-def _section_ok(items) -> dict:
+def _section_ok(items, warnings=None) -> dict:
     return {
         "available": True,
         "stale": False,
@@ -422,6 +628,7 @@ def _section_ok(items) -> dict:
         "reason": None,
         "error": None,
         "items": list(items),
+        "warnings": [str(item) for item in (warnings or [])],
     }
 
 
@@ -433,10 +640,34 @@ def _failed_section(previous, error: str) -> dict:
         carried["error"] = error
         carried["reason"] = "fetch_failed"
         carried["items"] = list(previous.get("items") or [])
+        carried["warnings"] = [str(item)
+                                for item in (previous.get("warnings") or [])]
         return carried
     section = events_loader.empty_section(reason="fetch_failed", available=False,
                                           stale=True, error=error)
     return section
+
+
+def _suspected_section(previous, error: str) -> dict:
+    """P2-2：对照探针失败 → 本轮该子项对**所有代码** ``available=false``。
+
+    有旧数据时保留 ``items`` 仅供审计 / 复查，但 ``available=false``（本轮
+    不采信任何结果），``stale=true`` + ``reason=interface_suspected``。
+    """
+    note = "本轮对照探针失败/0 行，接口疑似异常"
+    if isinstance(previous, dict) and isinstance(previous.get("items"), list):
+        carried = dict(previous)
+        carried["available"] = False
+        carried["stale"] = True
+        carried["reason"] = "interface_suspected"
+        carried["error"] = error
+        carried["items"] = list(previous.get("items") or [])
+        carried["warnings"] = [str(item)
+                               for item in (previous.get("warnings") or [])] + [note]
+        return carried
+    return events_loader.empty_section(
+        reason="interface_suspected", available=False, stale=True, error=error,
+        warnings=[note])
 
 
 def _write_payload(payload: dict, out_dir=None) -> str:
@@ -450,20 +681,85 @@ def _write_payload(payload: dict, out_dir=None) -> str:
     return path
 
 
+def _run_probes(probe_specs, run_day, throttle, stats) -> set:
+    """跑对照探针并把结果写进 ``stats``；返回疑似异常的子项键集合。"""
+    suspected = set()
+    for key, probe in probe_specs:
+        error = None
+        rows = []
+        try:
+            rows = throttle.call(probe, run_day)
+            if not rows:
+                error = "对照探针返回 0 行"
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        stats["probes"][key] = {"ok": error is None, "rows": len(rows),
+                                "error": error}
+        if error is not None:
+            suspected.add(key)
+            stats["interface_suspected"].append(key)
+            stats["failed_sections"] += 1
+            stats["failed"].append({"code": None, "section": key,
+                                    "reason": f"interface_suspected: {error}"})
+            message = (f"WARN 对照探针 {key} 失败：{error}；"
+                       "本轮该子项全部标 interface_suspected")
+            stats["warnings"].append(message)
+            print(message, file=sys.stderr)
+        else:
+            print(f"PROBE {key}: {len(rows)} 行（正常）", file=sys.stderr)
+    stats["probe_requests"] = len(probe_specs)
+    return suspected
+
+
+def run_probes(interval=DEFAULT_INTERVAL, probes=None, sleep_fn=time.sleep,
+               now_fn=_dt.datetime.now, as_of=None):
+    """只跑 4 个对照探针（不写缓存）；用于实测探针耗时 / 体检接口。"""
+    if interval < 1.0:
+        raise ValueError("interval 不得小于 1.0 秒（东财防封铁律）")
+    if probes is None:
+        probe_specs = list(PROBES)
+    elif isinstance(probes, dict):
+        probe_specs = list(probes.items())
+    else:
+        probe_specs = list(probes)
+    started = now_fn()
+    run_day = (_dt.date.fromisoformat(as_of).isoformat()
+               if as_of else started.date().isoformat())
+    throttle = _Throttle(interval, now_fn, sleep_fn)
+    stats = {"as_of": run_day, "requests": 0, "probe_requests": 0,
+             "probes": {}, "interface_suspected": [], "failed_sections": 0,
+             "failed": [], "warnings": []}
+    _run_probes(probe_specs, run_day, throttle, stats)
+    stats["requests"] = throttle.requests
+    stats["wall_seconds"] = round(now_fn().timestamp() - started.timestamp(), 2)
+    return stats
+
+
 def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
                retries=DEFAULT_RETRIES, retry_wait=DEFAULT_RETRY_WAIT,
-               fetchers=None, sleep_fn=time.sleep, now_fn=_dt.datetime.now,
-               as_of=None):
+               fetchers=None, probes=None, sleep_fn=time.sleep,
+               now_fn=_dt.datetime.now, as_of=None):
     """逐票、逐子项串行预计算；返回统计字典（不抛异常，失败逐子项记录）。
 
-    ``fetchers`` 可注入（测试用）；默认 :data:`FETCHERS`。任一子项失败只影响
-    该子项，其余继续；失败时保留上一轮的同名子项并标 ``stale=True``。
+    ``fetchers`` / ``probes`` 可注入（测试用）；默认 :data:`FETCHERS` /
+    :data:`PROBES`。任意子项失败只影响该子项，其余继续；失败时保留上一轮的
+    同名子项并标 ``stale=True``。
+
+    P2-2：先跑 4 个对照探针（每报表 1 次）。探针抛错或 0 行 → 本轮该子项对
+    **所有代码**标 ``available=false, reason=interface_suspected``，且跳过该子项
+    的逐票请求（反正接口已疑似异常，省请求）。
     """
     if interval < 1.0:
         raise ValueError("interval 不得小于 1.0 秒（东财防封铁律）")
     if retries < 0:
         raise ValueError("retries 不得为负")
     fetchers = tuple(fetchers or FETCHERS)
+    if probes is None:
+        probe_specs = list(PROBES)
+    elif isinstance(probes, dict):
+        probe_specs = list(probes.items())
+    else:
+        probe_specs = list(probes)
     started = now_fn()
     run_day = _dt.date.fromisoformat(as_of).isoformat() if as_of else started.date().isoformat()
     run_stamp = started.isoformat()
@@ -481,10 +777,15 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
         "interval_seconds": float(interval),
         "retries": int(retries),
         "requests": 0,
+        "probe_requests": 0,
+        "probes": {},
+        "interface_suspected": [],
+        "not_supported_sections": 0,
         "ok_sections": 0,
         "failed_sections": 0,
         "ok": [],
         "failed": [],
+        "warnings": [],
     }
 
     seen, ordered = set(), []
@@ -499,38 +800,96 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
             seen.add(code)
             ordered.append(code)
 
+    # --- P2-2 第一层：对照探针（每报表 1 次，与票池大小无关）-------------
+    suspected = _run_probes(probe_specs, run_day, throttle, stats)
+
+    # --- 逐票取数 --------------------------------------------------------
     payload = dict(existing)
     for code in ordered:
         previous = existing.get(code) if isinstance(existing.get(code), dict) else {}
         sections = {}
         for key, fetch in fetchers:
+            if key in suspected:
+                error = stats["probes"].get(key, {}).get("error") or "探针失败"
+                sections[key] = _suspected_section(previous.get(key), error)
+                continue
             last_error = None
-            items = None
+            result = None
             for attempt in range(int(retries) + 1):
                 try:
-                    items = throttle.call(fetch, code, run_day)
+                    result = throttle.call(fetch, code, run_day)
                     last_error = None
                     break
                 except Exception as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
                     if attempt < int(retries):
                         sleep_fn(retry_wait)
-            if items is None:
+            if result is None:
                 stats["failed_sections"] += 1
                 stats["failed"].append({"code": code, "section": key,
                                         "reason": last_error})
                 sections[key] = _failed_section(previous.get(key), last_error)
                 print(f"FAIL {code} {key}: {last_error}", file=sys.stderr)
                 continue
-            section = _section_ok(items)
+            try:
+                items, warnings, reason = _coerce_result(result)
+            except EventsFetchError as exc:
+                stats["failed_sections"] += 1
+                stats["failed"].append({"code": code, "section": key,
+                                        "reason": str(exc)})
+                sections[key] = _failed_section(previous.get(key), str(exc))
+                print(f"FAIL {code} {key}: {exc}", file=sys.stderr)
+                continue
+            if reason == "not_supported":
+                # P3-1：口径不适用 ≠ 取数失败 ≠ 无事件。保留 reason 供渲染。
+                section = events_loader.empty_section(
+                    reason="not_supported", available=False, stale=False,
+                    as_of=run_day, fetched_at=run_stamp, warnings=warnings)
+                sections[key] = section
+                stats["not_supported_sections"] += 1
+                print(f"N/A  {code} {key}: 该市场无此统计口径", file=sys.stderr)
+                continue
+            section = _section_ok(items, warnings)
             section["as_of"] = run_day
             section["fetched_at"] = run_stamp
             sections[key] = section
             stats["ok_sections"] += 1
             stats["ok"].append({"code": code, "section": key,
-                                "items": len(items), "as_of": run_day})
+                                "items": len(items), "as_of": run_day,
+                                "warnings": list(warnings)})
+            for warning in warnings:
+                stats["warnings"].append(f"{code} {key}: {warning}")
             print(f"OK   {code} {key}: {len(items)} 条", file=sys.stderr)
         payload[code] = sections
+
+    # --- P2-2 第二层（零成本兜底）：全票池皆空且上一轮有数据 -----------
+    for key, _fetch in fetchers:
+        if key in suspected:
+            continue
+        current = [(code, payload[code][key]) for code in ordered
+                   if isinstance(payload.get(code), dict)
+                   and isinstance(payload[code].get(key), dict)]
+        if not current or any(sec.get("items") for _code, sec in current):
+            continue
+        if any(bool(sec.get("error")) or sec.get("reason") == "not_supported"
+               for _code, sec in current):
+            continue
+        prior_has_data = any(
+            isinstance(existing.get(code), dict)
+            and isinstance(existing[code].get(key), dict)
+            and existing[code][key].get("items")
+            for code in ordered)
+        if not prior_has_data:
+            continue
+        message = (f"WARN 全票池 {key} 为空且上一轮有数据；"
+                   "已标 empty_pool_suspected（不得静默当作无事件）")
+        stats["warnings"].append(message)
+        print(message, file=sys.stderr)
+        for _code, section in current:
+            section["stale"] = True
+            section["reason"] = "empty_pool_suspected"
+            section["warnings"] = list(section.get("warnings") or []) + [
+                "全票池该子项为空且上一轮有数据，接口疑似异常"]
 
     stats["requests"] = throttle.requests
     stats["wall_seconds"] = round(now_fn().timestamp() - started.timestamp(), 2)
@@ -554,18 +913,20 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
 
 
 def estimate(n_codes: int, interval: float = DEFAULT_INTERVAL) -> dict:
-    """串行耗时估算：``n × 4`` 次请求，首次无等待，之后各等 ``interval``。"""
+    """串行耗时估算：``n × 4 + 4 探针`` 次请求，首次无等待，之后各等 ``interval``。"""
     if interval < 1.0:
         raise ValueError("interval 不得小于 1.0 秒（东财防封铁律）")
-    requests = int(n_codes) * REQUESTS_PER_CODE
+    requests = int(n_codes) * REQUESTS_PER_CODE + PROBE_REQUESTS
     return {
         "codes": int(n_codes),
         "requests": requests,
         "requests_per_code": REQUESTS_PER_CODE,
+        "probe_requests": PROBE_REQUESTS,
         "min_interval_seconds": float(interval),
         "min_serial_seconds": round(max(0, requests - 1) * float(interval), 2),
         "estimated_seconds": round(requests * float(interval), 2),
-        "note": "估算不含网络时延；串行下限是 (请求数-1)×间隔，含时延后接近 请求数×间隔",
+        "note": ("估算不含网络时延；每轮先跑 4 个对照探针（解禁/增减持/预告/质押），"
+                 "串行下限是 (请求数-1)×间隔，含时延后接近 请求数×间隔"),
     }
 
 
@@ -587,6 +948,8 @@ def build_parser():
                         help="预计算基准日（YYYY-MM-DD；默认今天，仅测试/补跑用）")
     parser.add_argument("--estimate", action="store_true",
                         help="只输出串行耗时估算，不触网")
+    parser.add_argument("--probes-only", action="store_true",
+                        help="只跑 4 个对照探针（体检接口，不写缓存）")
     parser.add_argument("--json", action="store_true", help="输出机读统计 JSON")
     return parser
 
@@ -603,6 +966,14 @@ def main(argv=None):
             stats = estimate(len(set(codes)), interval=args.interval)
             print(json.dumps(stats, ensure_ascii=False, indent=2))
             return 0
+        if args.probes_only:
+            stats = run_probes(interval=args.interval, as_of=args.as_of)
+            print(f"probe_requests={stats['requests']} "
+                  f"suspected={','.join(stats['interface_suspected']) or '-'} "
+                  f"wall={stats['wall_seconds']}s")
+            if args.json:
+                print(json.dumps(stats, ensure_ascii=False, indent=2))
+            return 0 if not stats["interface_suspected"] else 1
         stats = precompute(codes, out_dir=args.out_dir, interval=args.interval,
                            retries=args.retries, retry_wait=args.retry_wait,
                            as_of=args.as_of)
@@ -610,8 +981,12 @@ def main(argv=None):
         print(f"ERROR {exc}", file=sys.stderr)
         return 2
 
-    print(f"requests={stats['requests']} ok_sections={stats['ok_sections']} "
+    print(f"requests={stats['requests']} "
+          f"(probe={stats['probe_requests']}) "
+          f"ok_sections={stats['ok_sections']} "
           f"failed_sections={stats['failed_sections']} "
+          f"not_supported={stats['not_supported_sections']} "
+          f"suspected={','.join(stats['interface_suspected']) or '-'} "
           f"wall={stats['wall_seconds']}s interval={stats['interval_seconds']}s "
           f"-> {stats['path']}")
     for item in stats["failed"]:

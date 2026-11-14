@@ -38,7 +38,7 @@ pledge     §14.5 ``RPT_CSDC_LIST``                   最近一个统计日；�
       "<6位代码>": {
           "lockup":        {"available": bool, "stale": bool, "as_of": "YYYY-MM-DD",
                             "fetched_at": ISO, "reason": str|null, "error": str|null,
-                            "items": [...]},
+                            "warnings": [str], "items": [...]},
           "holder_trades": {...同构...},
           "forecast":      {...同构...},
           "pledge":        {...同构...},   # items 为 0 或 1 条
@@ -55,12 +55,17 @@ pledge     §14.5 ``RPT_CSDC_LIST``                   最近一个统计日；�
 
 「无事件」与「接口坏了」必须分开
 --------------------------------
-* 带个股条件的接口返回 0 行 = **确实没有**该事件（``available=True, items=[]``）。
-* 请求失败 / 非 2xx / 非 JSON / 结构改变 / 全市场 0 行 = **接口坏了**
-  （``available=False`` 或保留旧数据但 ``stale=True``），绝不返回空表冒充
-  「无事件」。上游 §14 的「全市场 0 行抛错」由预计算侧负责：本模块的预计算
-  每个请求都带个股条件，因此 0 行是合法的空结果；真正的接口故障由异常路径
-  区分。
+* 带个股条件的接口返回 0 行，且本轮**对照探针正常** = **确实没有**该事件
+  （``available=True, items=[]``）。
+* 请求失败 / 非 2xx / 非 JSON / 结构改变 / **对照探针失败或 0 行** = **接口坏了**
+  （``available=False`` 或保留旧数据但 ``stale=True``，``reason`` 为
+  ``interface_suspected``），绝不返回空表冒充「无事件」。
+* 零成本兜底：某子项全票池皆空且上一轮有数据 → ``empty_pool_suspected``
+  + warning，不得静默。
+* 预计算侧还会丢弃不属于该标的 / 该窗口的返回行（P2-1），丢弃条数写进
+  子项 ``warnings``；本模块读到后转成 CLI warnings。
+* 过期判定只用官方磁盘交易日历；缓存从未生成写「未生成」而不是
+  「过期（未知）」。
 
 本模块只服务「展示 / 风险提示」，不参与 ``action`` / ``confidence`` / 仓位 /
 触发器计算。
@@ -115,6 +120,9 @@ SECTION_LABELS = {
 #: 保证 G35 的「错误路径与成功路径键同构」在新增子块上继续成立。
 SECTION_BLOCK_KEYS = (
     "available", "stale", "as_of", "fetched_at", "reason", "error", "items",
+    # T7 P2-1/P3-4 additive：预计算阶段丢弃的行 / 未知字段类型在这里落盘，
+    # 由 CLI 转成 diagnostics.warnings；空子项也带它（键同构）。
+    "warnings",
 )
 EVENTS_KEYS = ("available", "stale", "as_of", "fetched_at", "reason") + SECTION_KEYS
 
@@ -125,6 +133,8 @@ REASON_TEXT = {
     "fund_not_supported": "场外基金无个股事件数据（上游 §3.6/§14 只覆盖个股）",
     "replay_not_supported": "事件数据是收盘后快照，--as-of 回放不提供历史状态",
     "fetch_failed": "取数阶段失败，事件数据不可得",
+    "interface_suspected": "接口疑似异常（对照探针报错或返回 0 行）",
+    "empty_pool_suspected": "全票池该子项为空且上一轮有数据，接口疑似异常",
     "not_supported": "该市场无此事件统计口径",
     "section_missing": "缓存中缺少该子项",
     "section_invalid": "缓存子项格式不可用",
@@ -175,18 +185,42 @@ def _date_only(value) -> Optional[str]:
 
 
 def _expected_trade_date(now=None):
-    """期望最新交易日（**纯本地**，复用资金流模块的磁盘日历口径）。"""
+    """期望最新交易日 —— **只用深交所官方磁盘日历**（纯本地，不触网）。
+
+    P3-3：旧实现复用 ``flow._expected_trade_date``，日历文件缺月时会退回
+    「按周末推算」并**立刻返回**，长假后首日（例如 2026-10-08）就会把
+    9-30 的快照误判成过期。这里改为：
+
+    * 只认官方日历（``astock.calendar_days_from_disk``）；
+    * 当前月日历缺失时**继续向前翻月**，直到找到有官方日历的月份，取其中
+      最近一个交易日；
+    * 连一份官方日历都没有 → 返回 ``(None, "calendar_unavailable")``，
+      调用方**不做**日期过期判定（宁可晚报，不误报）。
+
+    返回 ``(date | None, source)``，``source`` ∈ ``calendar_cache`` /
+    ``calendar_unavailable``。
+    """
+    moment = now or _dt.datetime.now()
+    candidate = moment.date()
+    if getattr(moment, "hour", 12) < 15:
+        candidate = candidate - _dt.timedelta(days=1)
     try:
-        from stock_analysis.data_loader.flow import _expected_trade_date as _base
-        return _base(now=now)
+        from stock_analysis.data_sources import astock
+        read_calendar = astock.calendar_days_from_disk
     except Exception:
-        moment = now or _dt.datetime.now()
-        candidate = moment.date()
-        if getattr(moment, "hour", 12) < 15:
-            candidate = candidate - _dt.timedelta(days=1)
-        while candidate.weekday() >= 5:
-            candidate = candidate - _dt.timedelta(days=1)
-        return candidate, "estimate"
+        read_calendar = None
+    for _ in range(62):
+        days = None
+        if read_calendar is not None:
+            try:
+                days = read_calendar(candidate.year, candidate.month)
+            except Exception:
+                days = None
+        if isinstance(days, dict) and days:
+            if days.get(candidate.isoformat()) is True:
+                return candidate, "calendar_cache"
+        candidate = candidate - _dt.timedelta(days=1)
+    return None, "calendar_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +231,8 @@ def empty_section(reason: Optional[str] = "fetch_failed",
                   stale: bool = False,
                   as_of: Optional[str] = None,
                   fetched_at: Optional[str] = None,
-                  error: Optional[str] = None) -> dict:
+                  error: Optional[str] = None,
+                  warnings: Optional[List[str]] = None) -> dict:
     """键齐全的空子项（成功 / 不可用 / 错误路径同构）。"""
     return {
         "available": bool(available),
@@ -207,6 +242,7 @@ def empty_section(reason: Optional[str] = "fetch_failed",
         "reason": reason,
         "error": error,
         "items": [],
+        "warnings": [str(item) for item in (warnings or [])],
     }
 
 
@@ -232,6 +268,8 @@ def _normalize_section(section) -> dict:
         "reason": section.get("reason"),
         "error": section.get("error"),
         "items": [dict(item) for item in items],
+        "warnings": [str(item) for item in (section.get("warnings") or [])
+                     if isinstance(section.get("warnings"), list)],
     }
     return block
 
@@ -327,13 +365,16 @@ def build_events_block(code, data_type="stock",
         return empty_events_block(reason=reason, stale=True, code=normalized)
 
     expected, _source = _expected_trade_date(now=now)
-    expected_iso = expected.isoformat()
+    expected_iso = expected.isoformat() if expected is not None else None
     blocks = {}
     stale_keys = []
     for key in SECTION_KEYS:
         section = _normalize_section(sections.get(key))
         fetched_day = _date_only(section.get("fetched_at")) or section.get("as_of")
-        if section.get("error") or (fetched_day and fetched_day < expected_iso):
+        # P3-3：只有官方日历可用时才做日期过期判定；日历不可用时宁可
+        # 不报过期，也不要在长假首日误报。显式 error / stale 仍照常生效。
+        if section.get("error") or (expected_iso and fetched_day
+                                    and fetched_day < expected_iso):
             section["stale"] = True
         if section["stale"] or not section["available"]:
             stale_keys.append(key)
@@ -399,10 +440,22 @@ def events_evidence(code, data_type="stock", as_of=None,
     for key in SECTION_KEYS:
         section = block[key]
         label = SECTION_LABELS[key]
+        for warning in section.get("warnings") or []:
+            notes.append(
+                f"事件风险行校验（{normalized}，{label}）：{warning}；"
+                "只展示，不影响 action")
         if section.get("error"):
             notes.append(
                 f"事件风险取数失败（{normalized}，{label}）：{section['error']}；"
                 f"已回退 {section.get('as_of') or '无可用'} 缓存（只展示，不影响 action）")
+        elif section.get("reason") == "interface_suspected":
+            notes.append(
+                f"事件风险接口疑似异常（{normalized}，{label}）："
+                "本轮对照探针报错或返回 0 行；该子项标为不可用（只展示，不影响 action）")
+        elif section.get("reason") == "empty_pool_suspected":
+            notes.append(
+                f"事件风险接口疑似异常（{normalized}，{label}）："
+                "全票池该子项为空且上一轮有数据；请核对接口（只展示，不影响 action）")
         elif section.get("stale"):
             notes.append(
                 f"事件风险缓存过期（{normalized}，{label}）："

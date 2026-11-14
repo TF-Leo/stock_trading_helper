@@ -171,7 +171,7 @@ def _payload(events=None):
 # 1) 数据层：缺失 / 损坏 / 过期 / 失败隔离
 # ===========================================================================
 def test_missing_cache_is_stale_not_empty(tmp_path):
-    """缓存缺失必须 ``stale=True``：渲染层据此报「过期」，不是「无事件」。"""
+    """缓存缺失必须显式「未生成」：既不是「无事件」，也不写成「过期（未知）」。"""
     block, notes = ev.events_evidence("600000", "stock",
                                       events_dir=str(tmp_path), now=NOW)
     assert block["available"] is False
@@ -181,7 +181,10 @@ def test_missing_cache_is_stale_not_empty(tmp_path):
         assert block[key]["available"] is False
         assert block[key]["stale"] is True
     assert any("不可用" in note for note in notes)
-    assert EVENT_STALE_MARK in render_advice(_payload(block))
+    output = render_advice(_payload(block))
+    assert "⚠️ 事件数据未生成" in output
+    assert "预计算未运行" in output
+    assert "（未知）" not in output
 
 
 def test_fund_is_not_supported_and_silent(tmp_path):
@@ -225,7 +228,11 @@ def test_cache_roundtrip_shape(tmp_path):
     assert notes == []
 
 
-def test_stale_by_fetch_date(tmp_path):
+def test_stale_by_fetch_date(monkeypatch, tmp_path):
+    # 官方日历在 conftest 里被默认置空（避免本机缓存影响测试）；这里显式
+    # 注入「上一交易日 = 2026-11-13」，只测日期过期判定本身。
+    monkeypatch.setattr(ev, "_expected_trade_date",
+                        lambda now=None: (_dt.date(2026, 11, 13), "calendar_cache"))
     sections = _sections()
     for section in sections.values():
         section["fetched_at"] = "2026-11-12T18:35:00"
@@ -352,7 +359,7 @@ def test_render_stale_and_events_can_coexist():
 
 
 def test_render_hidden_reasons_are_silent():
-    for reason in ("fund_not_supported", "replay_not_supported", "not_supported"):
+    for reason in ("fund_not_supported", "replay_not_supported"):
         block = _events_block(
             available=False, stale=False, reason=reason,
             lockup=_section([], available=False, reason=reason),
@@ -362,6 +369,47 @@ def test_render_hidden_reasons_are_silent():
         )
         output = render_advice(_payload(block))
         assert EVENT_STALE_MARK not in output, reason
+
+
+def test_render_not_supported_is_coverage_not_no_event():
+    """P3-1：北交所质押必须显示「未覆盖」，不能静默成「无事件」。"""
+    block = _events_block(
+        available=True, stale=False,
+        pledge=_section([], available=False, stale=False,
+                        reason="not_supported"),
+    )
+    output = render_advice(_payload(block))
+    assert "ℹ️ 股权质押：未覆盖" in output
+    assert EVENT_STALE_MARK not in output
+    assert "无事件" not in output
+
+
+def test_render_interface_suspected_is_not_no_event():
+    """P2-2：探针失败必须显式「接口疑似异常」，不得当成「无事件」。"""
+    block = _events_block(
+        available=False, stale=True, reason="interface_suspected",
+        lockup=_section([], available=False, stale=True,
+                        reason="interface_suspected"),
+        holder_trades=_section([], available=False, stale=True,
+                               reason="interface_suspected"),
+        forecast=_section([], available=False, stale=True,
+                          reason="interface_suspected"),
+        pledge=_section([], available=False, stale=True,
+                        reason="interface_suspected"),
+    )
+    output = render_advice(_payload(block))
+    assert "接口疑似异常" in output
+    assert "解禁" in output and "股权质押" in output
+
+
+def test_render_empty_pool_suspected_is_not_no_event():
+    block = _events_block(
+        available=True, stale=True,
+        lockup=_section([], stale=True, reason="empty_pool_suspected"),
+    )
+    output = render_advice(_payload(block))
+    assert "接口疑似异常，本轮空结果不采信" in output
+    assert "解禁" in output
 
 
 def test_window_day_20_included_and_day_21_excluded():
@@ -486,12 +534,34 @@ def _fake_fetchers(calls=None, fail=()):
                                          "forecast", "pledge")]
 
 
+def _fake_probes(empty=(), fail=()):
+    """P2-2 对照探针桩：默认每个报表返回 1 行（接口正常）。"""
+    def make(key):
+        def probe(as_of):
+            if key in fail:
+                raise RuntimeError("probe boom")
+            if key in empty:
+                return []
+            return [{"SECURITY_CODE": "999999", "NOTICE_DATE": as_of}]
+        return probe
+
+    return {key: make(key) for key in ("lockup", "holder_trades",
+                                       "forecast", "pledge")}
+
+
+def _empty_fetchers():
+    return [(key, lambda code, as_of: []) for key in
+            ("lockup", "holder_trades", "forecast", "pledge")]
+
+
 def test_precompute_one_request_per_endpoint_per_code(tmp_path):
     calls = []
     stats = pe.precompute(["600000", "600001", "600002"], out_dir=str(tmp_path),
                           fetchers=_fake_fetchers(calls),
+                          probes=_fake_probes(),
                           sleep_fn=lambda _s: None, now_fn=_Clock().now)
-    assert stats["requests"] == 12
+    assert stats["probe_requests"] == 4
+    assert stats["requests"] == 12 + 4
     assert stats["ok_sections"] == 12
     assert stats["failed_sections"] == 0
     assert [key for key, _code, _day in calls] == [
@@ -503,22 +573,25 @@ def test_precompute_one_request_per_endpoint_per_code(tmp_path):
 
 
 def test_precompute_10_codes_serial_estimate(tmp_path):
-    """10 只 × 4 端点 = 40 请求；串行下限 (40-1)×1s = 39s。"""
+    """10 只 × 4 端点 + 4 探针 = 44 请求；串行下限 (44-1)×1s = 43s。"""
     calls = []
     clock = _Clock()
     stats = pe.precompute([f"60000{i}" for i in range(10)],
                           out_dir=str(tmp_path),
                           fetchers=_fake_fetchers(calls),
+                          probes=_fake_probes(),
                           sleep_fn=clock.sleep, now_fn=clock.now)
-    assert stats["requests"] == 40
+    assert stats["requests"] == 44
+    assert stats["probe_requests"] == 4
     assert len(calls) == 40
-    assert clock.seconds == pytest.approx(39.0)
-    assert stats["wall_seconds"] == pytest.approx(39.0)
+    assert clock.seconds == pytest.approx(43.0)
+    assert stats["wall_seconds"] == pytest.approx(43.0)
 
     estimate = pe.estimate(10)
-    assert estimate["requests"] == 40
-    assert estimate["min_serial_seconds"] == 39.0
-    assert estimate["estimated_seconds"] == 40.0
+    assert estimate["requests"] == 44
+    assert estimate["probe_requests"] == 4
+    assert estimate["min_serial_seconds"] == 43.0
+    assert estimate["estimated_seconds"] == 44.0
     with pytest.raises(ValueError):
         pe.estimate(10, interval=0.9)
     with pytest.raises(ValueError):
@@ -539,6 +612,7 @@ def test_precompute_is_serial_not_concurrent(tmp_path):
     fetchers = [(key, make(key)) for key in
                 ("lockup", "holder_trades", "forecast", "pledge")]
     pe.precompute(["600000", "600001"], out_dir=str(tmp_path), fetchers=fetchers,
+                  probes=_fake_probes(),
                   sleep_fn=lambda _s: None, now_fn=_Clock().now)
     assert max_active[0] == 1
 
@@ -548,6 +622,7 @@ def test_precompute_failure_is_isolated(tmp_path):
     stats = pe.precompute(["600000", "600001"], out_dir=str(tmp_path),
                           retries=0,
                           fetchers=_fake_fetchers(calls, fail={"lockup"}),
+                          probes=_fake_probes(),
                           sleep_fn=lambda _s: None, now_fn=_Clock().now)
     assert stats["failed_sections"] == 2
     assert stats["ok_sections"] == 6
@@ -565,6 +640,7 @@ def test_precompute_preserves_prior_section_on_failure(tmp_path):
     _write_cache(str(tmp_path), _cache_payload({"600000": _sections()}))
     pe.precompute(["600000"], out_dir=str(tmp_path),
                   fetchers=_fake_fetchers(fail={"holder_trades"}),
+                  probes=_fake_probes(),
                   sleep_fn=lambda _s: None, now_fn=_Clock().now)
     payload = json.loads(Path(str(tmp_path), "events.json").read_text(encoding="utf-8"))
     section = payload["600000"]["holder_trades"]
@@ -586,11 +662,11 @@ def test_precompute_retries_same_section(tmp_path):
     fetchers = [("lockup", flaky), ("holder_trades", lambda c, d: []),
                 ("forecast", lambda c, d: []), ("pledge", lambda c, d: [])]
     stats = pe.precompute(["600000"], out_dir=str(tmp_path), retries=1,
-                          fetchers=fetchers, sleep_fn=lambda _s: None,
-                          now_fn=_Clock().now)
+                          fetchers=fetchers, probes=_fake_probes(),
+                          sleep_fn=lambda _s: None, now_fn=_Clock().now)
     assert attempts["n"] == 2
     assert stats["failed_sections"] == 0
-    assert stats["requests"] == 5
+    assert stats["requests"] == 4 + 1 + 2 + 2
 
 
 # ===========================================================================
@@ -669,6 +745,7 @@ def test_datacenter_non_2xx_and_non_json_raise(monkeypatch):
 def test_lockup_ratio_decimal_is_multiplied_by_100(monkeypatch):
     """FREE_RATIO 是小数（×100 得 %）；股数必须取 ABLE_FREE_SHARES。"""
     _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 1, "data": [{
+        "SECURITY_CODE": "600000",
         "FREE_DATE": "2026-11-18 00:00:00", "FREE_SHARES_TYPE": "首发原股东限售股份",
         "FREE_SHARES": 999999, "ABLE_FREE_SHARES": 1200, "FREE_RATIO": 0.015,
     }]}})
@@ -691,16 +768,20 @@ def test_holder_sign_direction_mismatch_raises(monkeypatch):
     assert "符号不一致" in str(exc.value)
 
 
-def test_pledge_bj_is_empty_without_request(monkeypatch):
+def test_pledge_bj_is_not_supported_without_request(monkeypatch):
+    """P3-1：北交所不是「无事件」，而是 ``not_supported``（渲染为未覆盖）。"""
     def _boom(*args, **kwargs):
         raise AssertionError("北交所质押不得发请求")
 
     monkeypatch.setattr(pe, "_datacenter", _boom)
-    assert pe.fetch_pledge("920999", REF_DAY) == []
+    result = pe.fetch_pledge("920999", REF_DAY)
+    assert list(result) == []
+    assert result.reason == "not_supported"
 
 
 def test_pledge_balance_mismatch_raises(monkeypatch):
     _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 1, "data": [{
+        "SECURITY_CODE": "600000",
         "TRADE_DATE": "2026-11-07", "PLEDGE_RATIO": 22.5,
         "REPURCHASE_BALANCE": 1000, "REPURCHASE_UNLIMITED_BALANCE": 400,
         "REPURCHASE_LIMITED_BALANCE": 400,
@@ -708,6 +789,272 @@ def test_pledge_balance_mismatch_raises(monkeypatch):
     with pytest.raises(pe.EventsFetchError) as exc:
         pe.fetch_pledge("600000", REF_DAY)
     assert "≠" in str(exc.value)
+
+
+# ===========================================================================
+# 4b) P2-1 行级归属校验：他票 / 窗口外 / 重复行 → 丢弃 + warning
+# ===========================================================================
+def _lockup_row(code, day, shares=1200.0, ratio=0.015):
+    return {"SECURITY_CODE": code, "FREE_DATE": day + " 00:00:00",
+            "FREE_SHARES_TYPE": "首发原股东限售股份",
+            "FREE_SHARES": shares * 100, "ABLE_FREE_SHARES": shares,
+            "FREE_RATIO": ratio}
+
+
+def test_lockup_drops_foreign_out_of_window_and_duplicate_rows(monkeypatch):
+    _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 1, "data": [
+        _lockup_row("600000", "2026-12-01"),
+        _lockup_row("000001", "2026-12-01"),       # 他票
+        _lockup_row("600000", "2020-01-01"),       # 窗口外（早于 -365 天）
+        _lockup_row("600000", "2026-12-01"),       # 与第 1 行完全重复
+    ]}})
+    result = pe.fetch_lockup("600000", REF_DAY)
+    assert len(result) == 1
+    assert result[0]["date"] == "2026-12-01"
+    text = " ".join(result.warnings)
+    assert "丢弃 3 行" in text
+    assert "他票行 1" in text
+    assert "窗口外行 1" in text
+    assert "重复行 1" in text
+
+
+def test_holder_trades_drops_foreign_out_of_window_and_duplicate_rows(monkeypatch):
+    def row(code, notice, holder="示例股东"):
+        return {"SECURITY_CODE": code, "NOTICE_DATE": notice,
+                "HOLDER_NAME": holder, "DIRECTION": "减持",
+                "CHANGE_NUM_SYMBOL": -100.0, "AFTER_CHANGE_RATE": 0.2,
+                "CHANGE_FREE_RATIO": 0.3, "TRADE_AVERAGE_PRICE": 10.0,
+                "MARKET": "二级市场", "START_DATE": "2026-11-05",
+                "END_DATE": "2026-11-09"}
+
+    _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 1, "data": [
+        row("600519", "2026-11-10"),
+        row("000001", "2026-11-10"),               # 他票
+        row("600519", "2026-01-01"),               # 窗口外（早于 -60 天）
+        row("600519", "2026-11-10"),               # 重复
+    ]}})
+    result = pe.fetch_holder_trades("600519", REF_DAY)
+    assert len(result) == 1
+    text = " ".join(result.warnings)
+    assert "丢弃 3 行" in text and "他票行 1" in text
+    assert "窗口外行 1" in text and "重复行 1" in text
+
+
+def test_forecast_drops_foreign_rows_and_warns_unknown_type(monkeypatch):
+    def row(code, notice, ptype):
+        return {"SECURITY_CODE": code, "NOTICE_DATE": notice,
+                "REPORT_DATE": "2026-09-30",
+                "PREDICT_FINANCE": "归属于上市公司股东的净利润",
+                "PREDICT_TYPE": ptype, "PREDICT_AMT_LOWER": -1e8,
+                "PREDICT_AMT_UPPER": -0.8e8, "ADD_AMP_LOWER": -50,
+                "ADD_AMP_UPPER": -30}
+
+    _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 1, "data": [
+        row("600519", "2026-11-10", "预减"),
+        row("000001", "2026-11-10", "预减"),       # 他票
+        row("600519", "2026-11-11", "预亏"),       # P3-4 未知类型
+    ]}})
+    result = pe.fetch_forecast("600519", REF_DAY)
+    assert {item["forecast_type"] for item in result} == {"预减", "预亏"}
+    text = " ".join(result.warnings)
+    assert "他票行 1" in text
+    assert "未知 PREDICT_TYPE：预亏" in text
+
+
+def test_pledge_drops_foreign_row(monkeypatch):
+    _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 3, "data": [{
+        "SECURITY_CODE": "000001", "TRADE_DATE": "2026-11-13 00:00:00",
+        "PLEDGE_RATIO": 22.5, "REPURCHASE_BALANCE": 1000,
+        "REPURCHASE_UNLIMITED_BALANCE": 400,
+        "REPURCHASE_LIMITED_BALANCE": 600,
+    }]}})
+    result = pe.fetch_pledge("600000", REF_DAY)
+    assert list(result) == []
+    assert "他票行 1" in " ".join(result.warnings)
+
+
+def test_precompute_keeps_bad_rows_out_of_cache_and_warns(monkeypatch, tmp_path):
+    """端到端：坏行不入库，warning 落盘并可被 CLI 读到。"""
+    def fake_datacenter(report, filter_str="", **kwargs):
+        if report == "RPT_LIFT_STAGE":
+            return [_lockup_row("600519", "2026-12-01"),
+                    _lockup_row("000001", "2026-12-01"),
+                    _lockup_row("600519", "2020-01-01"),
+                    _lockup_row("600519", "2026-12-01")]
+        return []
+
+    monkeypatch.setattr(pe, "_datacenter", fake_datacenter)
+    stats = pe.precompute(["600519"], out_dir=str(tmp_path),
+                          fetchers=pe.FETCHERS, probes=_fake_probes(),
+                          sleep_fn=lambda _s: None, now_fn=_Clock().now)
+    assert stats["failed_sections"] == 0
+    payload = json.loads(Path(str(tmp_path), "events.json").read_text(encoding="utf-8"))
+    lockup = payload["600519"]["lockup"]
+    assert len(lockup["items"]) == 1
+    assert any("丢弃 3 行" in warning for warning in lockup["warnings"])
+    block, notes = ev.events_evidence("600519", "stock",
+                                      events_dir=str(tmp_path), now=NOW)
+    assert any("丢弃 3 行" in note for note in notes)
+    assert len(block["lockup"]["items"]) == 1
+
+
+# ===========================================================================
+# 4c) P2-2 对照探针 / 零成本兜底
+# ===========================================================================
+def test_probe_zero_rows_marks_all_codes_interface_suspected(tmp_path):
+    calls = []
+    stats = pe.precompute(["600000", "600001"], out_dir=str(tmp_path),
+                          retries=0,
+                          fetchers=_fake_fetchers(calls),
+                          probes=_fake_probes(empty={"lockup"}),
+                          sleep_fn=lambda _s: None, now_fn=_Clock().now)
+    assert stats["interface_suspected"] == ["lockup"]
+    assert stats["probes"]["lockup"]["ok"] is False
+    assert stats["probes"]["lockup"]["rows"] == 0
+    assert all(key != "lockup" for key, _code, _day in calls)  # 跳过逐票请求
+    payload = json.loads(Path(str(tmp_path), "events.json").read_text(encoding="utf-8"))
+    for code in ("600000", "600001"):
+        lockup = payload[code]["lockup"]
+        assert lockup["available"] is False
+        assert lockup["stale"] is True
+        assert lockup["reason"] == "interface_suspected"
+        assert lockup["items"] == []
+        assert payload[code]["holder_trades"]["available"] is True
+    block, notes = ev.events_evidence("600000", "stock",
+                                      events_dir=str(tmp_path), now=NOW)
+    assert block["lockup"]["reason"] == "interface_suspected"
+    assert any("接口疑似异常" in note for note in notes)
+    assert "接口疑似异常" in render_advice(_payload(block))
+
+
+def test_probe_error_marks_interface_suspected(tmp_path):
+    stats = pe.precompute(["600000"], out_dir=str(tmp_path), retries=0,
+                          fetchers=_fake_fetchers(),
+                          probes=_fake_probes(fail={"forecast"}),
+                          sleep_fn=lambda _s: None, now_fn=_Clock().now)
+    assert stats["interface_suspected"] == ["forecast"]
+    payload = json.loads(Path(str(tmp_path), "events.json").read_text(encoding="utf-8"))
+    forecast = payload["600000"]["forecast"]
+    assert forecast["reason"] == "interface_suspected"
+    assert "probe boom" in (forecast["error"] or "")
+
+
+def test_probe_ok_and_empty_pool_is_genuine_empty(tmp_path):
+    stats = pe.precompute(["600000", "600001"], out_dir=str(tmp_path),
+                          fetchers=_empty_fetchers(), probes=_fake_probes(),
+                          sleep_fn=lambda _s: None, now_fn=_Clock().now)
+    assert stats["interface_suspected"] == []
+    assert stats["failed_sections"] == 0
+    payload = json.loads(Path(str(tmp_path), "events.json").read_text(encoding="utf-8"))
+    for code in ("600000", "600001"):
+        for key in ev.SECTION_KEYS:
+            section = payload[code][key]
+            assert section["available"] is True
+            assert section["stale"] is False
+            assert section["reason"] is None
+            assert section["items"] == []
+
+
+def test_all_pool_empty_after_prior_data_is_suspected(tmp_path):
+    _write_cache(str(tmp_path), _cache_payload({"600000": _sections()}))
+    stats = pe.precompute(["600000"], out_dir=str(tmp_path),
+                          fetchers=_empty_fetchers(), probes=_fake_probes(),
+                          sleep_fn=lambda _s: None, now_fn=_Clock().now)
+    payload = json.loads(Path(str(tmp_path), "events.json").read_text(encoding="utf-8"))
+    for key in ev.SECTION_KEYS:
+        section = payload["600000"][key]
+        assert section["reason"] == "empty_pool_suspected"
+        assert section["stale"] is True
+        assert section["items"] == []
+        assert any("上一轮有数据" in warning for warning in section["warnings"])
+    assert any("empty_pool_suspected" in warning for warning in stats["warnings"])
+
+
+def test_not_supported_bj_pledge_reaches_renderer(monkeypatch, tmp_path):
+    monkeypatch.setattr(pe, "_datacenter", lambda *a, **k: [])
+    stats = pe.precompute(["920999"], out_dir=str(tmp_path),
+                          fetchers=pe.FETCHERS, probes=_fake_probes(),
+                          sleep_fn=lambda _s: None, now_fn=_Clock().now)
+    assert stats["not_supported_sections"] == 1
+    assert stats["failed_sections"] == 0
+    payload = json.loads(Path(str(tmp_path), "events.json").read_text(encoding="utf-8"))
+    pledge = payload["920999"]["pledge"]
+    assert pledge["reason"] == "not_supported"
+    assert pledge["available"] is False and pledge["stale"] is False
+    block, _notes = ev.events_evidence("920999", "stock",
+                                       events_dir=str(tmp_path), now=NOW)
+    output = render_advice(_payload(block))
+    assert "ℹ️ 股权质押：未覆盖" in output
+    assert EVENT_STALE_MARK not in output
+
+
+# ===========================================================================
+# 4d) P3-3 长假后首日：过期判定用官方日历
+# ===========================================================================
+def _september_calendar():
+    return {"2026-09-30": True}
+
+
+def test_long_holiday_first_day_not_false_stale(monkeypatch, tmp_path):
+    """10-08 盘前：10 月日历缺失时，官方 9 月日历说明上一交易日是 9-30。"""
+    from stock_analysis.data_sources import astock
+
+    def fake(year, month):
+        return _september_calendar() if (year, month) == (2026, 9) else None
+
+    monkeypatch.setattr(astock, "calendar_days_from_disk", fake)
+    sections = _sections()
+    for section in sections.values():
+        section["as_of"] = "2026-09-30"
+        section["fetched_at"] = "2026-09-30T18:35:00"
+    _write_cache(str(tmp_path), _cache_payload(
+        {"600000": sections}, fetched_at="2026-09-30T18:35:00"))
+    now = _dt.datetime(2026, 10, 8, 9, 0)
+    block, _notes = ev.events_evidence("600000", "stock",
+                                       events_dir=str(tmp_path), now=now)
+    assert block["stale"] is False
+    assert EVENT_STALE_MARK not in render_advice(_payload(block))
+
+
+def test_official_calendar_still_flags_real_stale_after_holiday(monkeypatch, tmp_path):
+    """10-09 盘前（10-08 已收盘）：缓存仍是 9-30 → 确实过期。"""
+    from stock_analysis.data_sources import astock
+
+    def fake(year, month):
+        if (year, month) == (2026, 9):
+            return _september_calendar()
+        if (year, month) == (2026, 10):
+            return {"2026-10-08": True, "2026-10-07": False}
+        return None
+
+    monkeypatch.setattr(astock, "calendar_days_from_disk", fake)
+    sections = _sections()
+    for section in sections.values():
+        section["as_of"] = "2026-09-30"
+        section["fetched_at"] = "2026-09-30T18:35:00"
+    _write_cache(str(tmp_path), _cache_payload(
+        {"600000": sections}, fetched_at="2026-09-30T18:35:00"))
+    now = _dt.datetime(2026, 10, 9, 9, 0)
+    block, notes = ev.events_evidence("600000", "stock",
+                                      events_dir=str(tmp_path), now=now)
+    assert block["stale"] is True
+    assert any("过期" in note for note in notes)
+
+
+def test_calendar_unavailable_skips_date_staleness(monkeypatch, tmp_path):
+    from stock_analysis.data_sources import astock
+
+    monkeypatch.setattr(astock, "calendar_days_from_disk", lambda y, m: None)
+    sections = _sections()
+    for section in sections.values():
+        section["as_of"] = "2020-01-02"
+        section["fetched_at"] = "2020-01-02T18:35:00"
+    _write_cache(str(tmp_path), _cache_payload(
+        {"600000": sections}, fetched_at="2020-01-02T18:35:00"))
+    block, _notes = ev.events_evidence("600000", "stock",
+                                       events_dir=str(tmp_path), now=NOW)
+    # 官方日历不可用 → 不做日期判定；不误报过期（显式 stale/error 仍生效）。
+    assert block["stale"] is False
 
 
 # ===========================================================================
@@ -788,6 +1135,6 @@ def test_cli_missing_events_cache_is_stale_not_empty(monkeypatch, tmp_path):
     block = out["evidence"]["events"]
     assert block["available"] is False
     assert block["stale"] is True
-    assert EVENT_STALE_MARK in render_advice(out)
+    assert "⚠️ 事件数据未生成" in render_advice(out)
     assert any("事件风险上下文不可用" in warning
                for warning in out["diagnostics"]["warnings"])

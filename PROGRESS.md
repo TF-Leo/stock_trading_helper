@@ -41,6 +41,32 @@
     写进 README）。
 - **跳过项**：无。
 
+## 2026-11-14 · PR #101 复验修复（2×P2 + 5×P3）
+
+- **基线**：`origin/task/event-risk` = `3e23874`（PR 头），Hermes 复验结论
+  2×P2 + 5×P3。全部修在 PR 分支上，未合并。
+- **P2-1 行级归属校验**：`tools/precompute_events.py` 的四个 `fetch_*` 逐行
+  核对 `SECURITY_CODE` + 日期窗口（解禁 `FREE_DATE`、增减持/预告
+  `NOTICE_DATE`、质押 `TRADE_DATE<=as_of`）；他票 / 窗口外 / 日期不可解析 /
+  重复行**丢弃**并写进子项 `warnings`，CLI 转 `diagnostics.warnings`。
+  测试覆盖三种坏行，端到端断言不入缓存。
+- **P2-2 探针**：每轮先跑 4 个对照探针（CSDC 无条件 `pageSize=1`；
+  解禁 `FREE_DATE>=as_of`；预告/增减持 `NOTICE_DATE>=as_of-30d`）。探针
+  抛错或 0 行 → 全票池该子项 `available=false, reason=interface_suspected`，
+  跳过该子项逐票请求；零成本兜底（全票池皆空且上一轮有数据）→
+  `empty_pool_suspected` + warning。新增 `--probes-only`。
+  实测 4 请求 / **3.86s**；3 只票实测 16 请求 / 17.39s，1 只 8 请求 / 8.57s。
+- **P3 全部落地**：北交所 `not_supported` → 渲染「ℹ️ 股权质押：未覆盖」；
+  缓存未生成 → 「事件数据未生成（预计算未运行）」，不写「过期（未知）」；
+  过期判定只用官方磁盘交易日历（缺月向前翻，日历不可用则跳过日期判定）；
+  未知 `PREDICT_TYPE` → warning + 保留原值；`docs/EVENT_RISK.md` §7 写入
+  18:35 cron 示例（实际接线另行安排）。
+- **验证**：`pytest tests/test_events_context.py` 63 passed；
+  全量 `pytest tests/` **924 passed, 1 failed**（唯一失败是基线既存的
+  `test_probe_requirements` 解释器版本断言，与本改动无关）。
+- **未改**：`source/decision/*`、`action` / `confidence` / 仓位；未引入依赖；
+  盘前路径仍零联网（探针只在预计算侧跑）。
+
 ## 2026-11-14 · issue #1 / R11 T7：事件风险预计算（解禁/增减持/预告/质押）
 
 - **分支**：`task/event-risk`（父 `origin/main` = `0722fec`）；未改
@@ -74,9 +100,9 @@
   是基线就存在的解释器版本不符（缺口盘点 U7），与本轮无关。
 - **门禁说明**：本机 Linux 无 `pwsh`，`tools/check_gates.ps1` 无法执行；
   以 `pytest` 全量 + `tools/probe.py` 可跑项为准。`cli.py` **687 行**（≤700）。
-- **风险**：①限流——40 请求串行 ≥39s，绝不可放盘前；②「无事件 vs 坏了」已
-  分开，但若东财对所有个股静默返回 0 行（code=0）仍无法与「确实无事件」
-  区分（见 `docs/EVENT_RISK.md` §6）；③阈值可能带来 warning 疲劳，已按
+- **风险**：①限流——44 请求（含 4 探针）串行 ≥43s，绝不可放盘前；
+  ②「无事件 vs 坏了」已由对照探针 + 行级归属校验补齐（见本文件顶部
+  2026-11-14 复验修复）；③阈值可能带来 warning 疲劳，已按
   「20 日内 + 重大额度 + 每类一行」收敛。
 
 ## 2026-11-14 · PR #97 复验非阻塞项收口（2×P2 + 3×P3）
