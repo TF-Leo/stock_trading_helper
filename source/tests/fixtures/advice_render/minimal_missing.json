@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-11-13T09:15:00",
+  "request": {"code": "000002", "type": "stock", "fast": true},
+  "instrument": {
+    "code": "000002",
+    "name": "示例地产",
+    "is_st": null,
+    "is_suspended": null,
+    "limit_up": null,
+    "limit_down": null,
+    "quote_stale": null,
+    "status_source": "unavailable"
+  },
+  "data": {},
+  "market_regime": {},
+  "recommendation": {
+    "action": "hold",
+    "confidence": 0.5
+  },
+  "evidence": {},
+  "diagnostics": {"warnings": []}
+}
