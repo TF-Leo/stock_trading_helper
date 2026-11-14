@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-11-13T09:10:00",
+  "request": {"code": "000555", "type": "stock", "fast": true},
+  "instrument": {
+    "code": "000555",
+    "name": "示例传媒",
+    "board": "sz_main",
+    "price_limit_pct": 0.1,
+    "is_st": false,
+    "is_suspended": false,
+    "limit_up": 11.0,
+    "limit_down": 9.0,
+    "quote_stale": false,
+    "one_word_limit": null,
+    "status_source": "eastmoney_st_list+tencent_quote"
+  },
+  "data": {
+    "bars": 500,
+    "start": "2024-09-02",
+    "end": "2026-11-13",
+    "last_close": 10.0,
+    "source": "cache",
+    "from_cache": true,
+    "stale": false,
+    "lag_days": 0,
+    "expected_date": "2026-11-13"
+  },
+  "recommendation": {
+    "status": "no_edge",
+    "action": "hold",
+    "action_reason": [
+      "策略当前空仓；今日无合格买点（20 日期望样本不足）"
+    ],
+    "target_position": 0.0,
+    "review_date": "2026-12-11",
+    "confidence": 0.4,
+    "position_fraction": 0.0,
+    "horizon_days": [20, 20],
+    "entry_zone": null,
+    "stop_loss": null,
+    "take_profit": null,
+    "distance_to_trigger": {"buy_pct": null, "sell_pct": null},
+    "no_edge": true
+  },
+  "evidence": {"triggers": []},
+  "diagnostics": {"warnings": [], "elapsed_seconds": 10.0},
+  "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
+}

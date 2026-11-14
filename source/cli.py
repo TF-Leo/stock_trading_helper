@@ -537,6 +537,9 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'limit_up': None if trading is None else trading.limit_up,
             'limit_down': None if trading is None else trading.limit_down,
             'quote_stale': None if trading is None else trading.quote_stale,
+            # issue #92 additive：一字板显式字段（'up'/'down'/null）。
+            # 渲染层优先读它，diagnostics.warnings 文案匹配只作兜底。
+            'one_word_limit': None if trading is None else trading.one_word_limit,
             'status_source': 'fund_static' if trading is None else trading.status_source,
         },
         'data': {

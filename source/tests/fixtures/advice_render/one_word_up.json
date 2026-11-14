@@ -12,6 +12,7 @@
     "limit_up": 12.0,
     "limit_down": 8.0,
     "quote_stale": false,
+    "one_word_limit": "up",
     "status_source": "eastmoney_st_list+tencent_quote"
   },
   "data": {

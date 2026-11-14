@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""建议渲染层 v1 的离线测试（issue #1 / R11 T1–T5）。
+"""建议渲染层 v1 的离线测试（issue #1 / R11 T1–T5 + issue #92）。
 
 覆盖：
-* 6 个 fixture 的完整输出快照（正常买点 / 停牌 / 一字板 / ST+warning /
-  quote_stale / 可选字段全缺）；
-* T1 仓位/持有期/复审日的存在与 None 消失；
+* 9 个 fixture 的完整输出快照（正常买点 / 停牌 / 一字板 / 显式一字板字段 /
+  ST+warning / quote_stale / 可选字段全缺 / no_edge 白话 / 数据滞后）；
+* T1 仓位/持有期/复审日与触发事实行（triggers + distance_to_trigger）；
 * T2 可执行性闸门、盘前不误判、warnings 先于建议、action/confidence 不改写；
 * T3 regime 冲突（逆风/顺风/一致/指数缺失）；
 * T4 估值分位、四舍五入、无数据不编结论、小样本标注；
@@ -39,10 +39,12 @@ FIXTURE_NAMES = (
     "normal_buy",
     "suspended",
     "one_word_up",
+    "one_word_explicit",
     "st_warning",
     "quote_stale",
     "minimal_missing",
     "data_stale_lag4",
+    "no_edge",
 )
 
 
@@ -77,7 +79,7 @@ def test_render_snapshot(name):
 
 
 def test_fixtures_cover_required_cases():
-    assert len(FIXTURE_NAMES) == 7
+    assert len(FIXTURE_NAMES) == 9
     for name in FIXTURE_NAMES:
         assert (FIXTURES / f"{name}.json").is_file()
         assert (FIXTURES / f"{name}.expected.txt").is_file()
@@ -117,6 +119,132 @@ def test_t1_zero_position_is_rendered():
 
 
 # ---------------------------------------------------------------------------
+# T1b：触发事实行（issue #92）
+# ---------------------------------------------------------------------------
+def test_trigger_line_matches_json_values():
+    """触发价与距触发百分比逐值取自 JSON，渲染层不得重算。"""
+    payload = _payload("normal_buy")
+    trigger = payload["evidence"]["triggers"][0]
+    distance = payload["recommendation"]["distance_to_trigger"]["buy_pct"]
+    assert trigger["buy_price"] == 12.0 and distance == 0.0
+    assert "触发：均线趋势(3-5-8) 买信号已触发（触发价 12，现价距触发 0%）" \
+        in render_advice(payload)
+
+
+def test_trigger_line_sits_between_advice_and_reason():
+    lines = _advice_lines(_render("normal_buy"))
+    advice_at = next(i for i, line in enumerate(lines) if line.startswith("建议仓位"))
+    trigger_at = next(i for i, line in enumerate(lines) if line.startswith("触发："))
+    reason_at = next(i for i, line in enumerate(lines) if line.startswith("依据："))
+    assert advice_at < trigger_at < reason_at
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda p: p["evidence"].__setitem__("triggers", []),
+    lambda p: p["evidence"].pop("triggers"),
+    lambda p: p["evidence"].__setitem__("triggers", None),
+    lambda p: p["evidence"].__setitem__("triggers", {}),
+])
+def test_trigger_line_disappears_without_triggers(mutate):
+    payload = _payload("normal_buy")
+    mutate(payload)
+    assert "触发：" not in render_advice(payload)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda p: p["evidence"]["triggers"][0].__setitem__("buy_price", None),
+    lambda p: p["evidence"]["triggers"][0].__setitem__("indicator", ""),
+    lambda p: p["evidence"]["triggers"][0].__setitem__("state", "near_buy"),
+    lambda p: p["recommendation"].pop("distance_to_trigger"),
+    lambda p: p["recommendation"]["distance_to_trigger"].__setitem__("buy_pct", None),
+])
+def test_trigger_line_disappears_when_fields_missing(mutate):
+    payload = _payload("normal_buy")
+    mutate(payload)
+    assert "触发：" not in render_advice(payload)
+
+
+def test_trigger_line_uses_sell_side_fields():
+    payload = _payload("normal_buy")
+    payload["evidence"]["triggers"] = [{
+        "indicator": "示例指标", "state": "sell_triggered",
+        "buy_price": 13.0, "sell_price": 10.5,
+    }]
+    payload["recommendation"]["distance_to_trigger"] = {
+        "buy_pct": 8.3, "sell_pct": -12.5,
+    }
+    line = next(line for line in render_advice(payload).splitlines()
+                if line.startswith("触发："))
+    assert line == "触发：示例指标 卖信号已触发（触发价 10.5，现价距触发 -12.5%）"
+
+
+def test_trigger_line_lists_multiple_triggered_signals():
+    payload = _payload("normal_buy")
+    payload["evidence"]["triggers"] = [
+        {"indicator": "甲", "state": "buy_triggered",
+         "buy_price": 11.5, "sell_price": None},
+        {"indicator": "乙", "state": "buy_triggered",
+         "buy_price": 11.8, "sell_price": None},
+    ]
+    payload["recommendation"]["distance_to_trigger"] = {
+        "buy_pct": -4.17, "sell_pct": None,
+    }
+    assert ("触发：甲 买信号已触发（触发价 11.5，现价距触发 -4.17%）；"
+            "乙 买信号已触发（触发价 11.8，现价距触发 -4.17%）") in render_advice(payload)
+
+
+def test_trigger_line_avoids_current_price_wording_when_stale():
+    """行情非当日时不得写「现价」；距离值仍照抄 JSON。"""
+    payload = _payload("data_stale_lag4")
+    payload["evidence"]["triggers"] = [{
+        "indicator": "甲", "state": "buy_triggered",
+        "buy_price": 18.7, "sell_price": None,
+    }]
+    payload["recommendation"]["distance_to_trigger"] = {
+        "buy_pct": 0.0, "sell_pct": None,
+    }
+    line = next(line for line in render_advice(payload).splitlines()
+                if line.startswith("触发："))
+    assert "距触发 0%" in line
+    assert "现价距触发" not in line
+
+
+# ---------------------------------------------------------------------------
+# no_edge：一句不带术语的白话解释（issue #92）
+# ---------------------------------------------------------------------------
+def test_no_edge_has_plain_language_explanation():
+    reason = next(line for line in _render("no_edge").splitlines()
+                  if line.startswith("依据："))
+    assert "历史样本不足以支持买入判断，建议观望" in reason
+    assert "p_positive" not in reason
+    assert "CI" not in reason
+
+
+def test_no_edge_plain_sentence_is_not_a_forecast():
+    reason = next(line for line in _render("no_edge").splitlines()
+                  if line.startswith("依据："))
+    for word in ("上涨", "下跌", "必涨", "保证", "预计", "预测"):
+        assert word not in reason
+
+
+def test_no_edge_sell_is_not_told_to_wait():
+    payload = _payload("no_edge")
+    payload["recommendation"].update({
+        "action": "sell",
+        "action_reason": ["今日（2026-11-13）触发止损，目标仓位 0%"],
+    })
+    reason = next(line for line in render_advice(payload).splitlines()
+                  if line.startswith("依据："))
+    assert "风控离场" in reason
+    assert "建议观望" not in reason
+
+
+def test_non_no_edge_status_has_no_plain_sentence():
+    assert "历史样本不足以支持买入判断" not in _render("normal_buy")
+    assert "历史样本不足以支持买入判断" not in _render("st_warning")
+
+
+# ---------------------------------------------------------------------------
 # T2：可执行性 + 新鲜度 + warnings 顺序
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("name,reason", [
@@ -148,6 +276,44 @@ def test_t2_warnings_precede_advice():
                 if line.startswith("⚠️ 数据:")]
     assert len(warnings) == 2
     assert output.index("⚠️ 数据:") < output.index("动作 hold")
+
+
+# ---------------------------------------------------------------------------
+# 一字板：显式字段优先，warning 文案兜底（issue #92）
+# ---------------------------------------------------------------------------
+def test_one_word_gate_reads_explicit_field_without_warning():
+    payload = _payload("one_word_explicit")
+    assert payload["diagnostics"]["warnings"] == []
+    gate = _advice_lines(render_advice(payload))[0]
+    assert gate.startswith("【今日不建议执行】")
+    assert "一字涨停" in gate
+
+
+def test_one_word_gate_falls_back_to_warning_text():
+    payload = _payload("one_word_explicit")
+    payload["instrument"].pop("one_word_limit")
+    payload["diagnostics"]["warnings"] = [
+        "一字涨停（最高=最低=涨停价），买单无法成交，判定不可交易（P0-3）",
+    ]
+    gate = _advice_lines(render_advice(payload))[0]
+    assert "一字涨停" in gate
+
+
+def test_one_word_explicit_field_wins_over_warning_text():
+    payload = _payload("one_word_explicit")
+    payload["instrument"]["one_word_limit"] = "down"
+    payload["diagnostics"]["warnings"] = [
+        "一字涨停（最高=最低=涨停价），买单无法成交，判定不可交易（P0-3）",
+    ]
+    gate = _advice_lines(render_advice(payload))[0]
+    assert "一字跌停" in gate
+    assert "一字涨停" not in gate
+
+
+def test_one_word_null_field_without_warning_does_not_gate():
+    payload = _payload("one_word_explicit")
+    payload["instrument"]["one_word_limit"] = None
+    assert "不建议执行" not in render_advice(payload)
 
 
 def test_t2_quote_stale_replaces_current_price():
@@ -393,6 +559,26 @@ def _is_deletion_subsequence(shorter: str, longer: str) -> bool:
     return all(char in iterator for char in shorter)
 
 
+#: 与 ``advice_render._COMPACT_FIELD_LABELS`` 对应的固定词表（issue #92）。
+FIELD_LABEL_SUBSTITUTIONS = (
+    ("p_positive", "买侧期望胜率"),
+    ("trigger.current", "触发参考价"),
+    ("is_st", "ST 标记"),
+    ("ProxyError", "代理异常"),
+)
+
+
+def _substitute_field_labels(text: str) -> str:
+    for source, label in FIELD_LABEL_SUBSTITUTIONS:
+        text = text.replace(source, label)
+    return text
+
+
+def _is_compact_derivation(shorter: str, longer: str) -> bool:
+    """compact 结果 = 原文先做固定词表替换、再按序删除若干整段。"""
+    return _is_deletion_subsequence(shorter, _substitute_field_labels(longer))
+
+
 def _parens_balanced(text: str) -> bool:
     depth = 0
     for char in text:
@@ -410,6 +596,7 @@ COMPACT_SAFETY_WARNINGS = (
     "接口失败 https://example.com/a?b=1（RuntimeError: timeout）；已回退旧缓存（P0-3）",
     "状态未知：停牌/退市/代码无效无法区分",
     "统计证据不足（p_positive=0.42，n=12）",
+    "统计证据不足 p_positive=0.42",
     "两条独立事实。第二句不得被截断。",
     "括号不配对（issue #1 决策",
     "括号不配对 issue #1 决策）",
@@ -473,9 +660,9 @@ def test_compact_real_warning_keeps_unknown_status():
 
 
 @pytest.mark.parametrize("warning", COMPACT_SAFETY_WARNINGS)
-def test_compact_output_is_deletion_subsequence(warning):
-    """compact 结果必须是原文按序删除若干整段后的结果。"""
-    assert _is_deletion_subsequence(_compact_single(warning), warning)
+def test_compact_output_is_deletion_or_vocabulary_substitution(warning):
+    """compact 结果 = 固定词表替换 + 按序删除若干整段，不做其它改写。"""
+    assert _is_compact_derivation(_compact_single(warning), warning)
 
 
 @pytest.mark.parametrize("warning", COMPACT_SAFETY_WARNINGS)
@@ -500,6 +687,48 @@ def test_compact_leaves_unbalanced_parentheses_untouched():
 
 def test_compact_internal_parenthetical_is_deleted_whole():
     assert _compact_single("统计证据不足（p_positive=0.42，n=12）") == "统计证据不足"
+
+
+def test_compact_replaces_bare_internal_field_names():
+    """词表内的裸字段名换成用户可读表述（issue #92）。"""
+    warning = ("统计证据不足 p_positive=0.42；trigger.current 缺失；"
+               "is_st 仅按名称判断；上游抛 ProxyError")
+    compacted = _compact_single(warning)
+    for token in ("p_positive", "trigger.current", "is_st", "ProxyError"):
+        assert token not in compacted
+    assert "买侧期望胜率=0.42" in compacted
+    assert "触发参考价 缺失" in compacted
+    assert "ST 标记 仅按名称判断" in compacted
+    assert "上游抛 代理异常" in compacted
+
+
+def test_compact_field_vocabulary_does_not_touch_other_internal_names():
+    """词表之外的内部字段名仍只许删除，不做替换。"""
+    warning = "统计证据不足 confidence=0.7"
+    assert _compact_single(warning) == warning
+
+
+SAFETY_QUALIFIER_WARNINGS = (
+    "状态未知：停牌/退市/代码无效无法区分（issue #92 说明）",
+    "无法判断是否停牌（p_positive=0.2）",
+    "ST 标的：退市与流动性风险（is_st 由报价名称判断）",
+    "一字涨停（最高=最低=涨停价），买单无法成交（P0-3）",
+)
+
+
+@pytest.mark.parametrize("warning", SAFETY_QUALIFIER_WARNINGS)
+def test_compact_preserves_safety_qualifiers(warning):
+    """含停牌/退市/ST/一字的告警，压缩前后的限定词不得丢失。"""
+    compacted = _compact_single(warning)
+    assert compacted, warning
+    for token in ("停牌", "退市", "ST", "一字"):
+        if token in warning:
+            assert token in compacted, (token, compacted)
+    for token in ("无法区分", "无法判断", "无法成交"):
+        if token in warning:
+            assert token in compacted, (token, compacted)
+    # 不得把「无法判断」压成事实性结论。
+    assert not compacted.endswith("：停牌")
 
 
 def test_compact_does_not_change_default_output():

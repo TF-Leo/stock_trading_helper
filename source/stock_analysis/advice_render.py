@@ -4,7 +4,8 @@
 对应 ``docs/ASTOCK_GAP_INVENTORY.md`` 的 T1–T5（issue #1 的 R11 Top 5）：
 
 ========  ==========================================================
-T1        建议仓位 / 持有期 / 复审日（``recommendation.*``）
+T1        建议仓位 / 持有期 / 复审日（``recommendation.*``）+ 触发事实
+          （``evidence.triggers[]`` / ``recommendation.distance_to_trigger``）
 T2        可执行性闸门 + 数据新鲜度（``instrument.*`` / ``diagnostics.warnings``）
 T3        个股 regime 与指数 regime 的口径冲突（``market_regime.index``）
 T4        估值分位一句（``evidence.valuation``）
@@ -27,8 +28,13 @@ T5        资金流方向 + 口径标签（``evidence.flow``）
   金额；文案必须保留「建议仓位」四个字。
 * ``horizon_days`` 当前是 ``[20, 20]``（低/高），渲染取第一个正值。
 * ``instrument.limit_up`` / ``limit_down`` 是**价格**，不是布尔。一字板优先
-  读取 ``instrument.one_word_limit``（若上游未来补上），否则从
-  ``diagnostics.warnings`` 里识别 CLI 已写入的「一字涨停/一字跌停」事实。
+  读取显式字段 ``instrument.one_word_limit``（``"up"`` / ``"down"``），缺失时
+  才从 ``diagnostics.warnings`` 里识别 CLI 已写入的「一字涨停/一字跌停」事实。
+* ``evidence.triggers[]`` 只描述**已触发**的买卖信号（``state`` 为
+  ``buy_triggered`` / ``sell_triggered``）；触发价取 ``buy_price`` /
+  ``sell_price``，距触发百分比取 ``recommendation.distance_to_trigger`` 的
+  ``buy_pct`` / ``sell_pct``，**逐值照抄、不重算**。字段缺失或没有已触发
+  信号时整行消失。
 * ``instrument.is_suspended`` 为 ``None`` 表示**无法判断**（盘前集合竞价前
   的正常现象），绝不能当成「确认停牌」；只有 ``True`` 才进不可执行闸门。
 * 名称优先取 ``instrument.display_name`` / 顶层 ``display_name``，其次
@@ -41,10 +47,13 @@ T5        资金流方向 + 口径标签（``evidence.flow``）
   同时有值时视为「混源」，只输出方向、不输出净额。
 * ``evidence.valuation`` 的 ``percentile_samples`` 小于 3 年窗口（756）时，
   文案标注「样本 N 日」。
-* ``compact=True`` 只压缩 ``diagnostics.warnings``，且**只做整段删除**：结果
-  必为原文的删除子序列（不改写、不截句、不重排、不删斜杠枚举中的单项）。
+* ``compact=True`` 只处理 ``diagnostics.warnings``，默认**只做整段删除**（结果
+  必为原文的删除子序列：不改写、不截句、不重排、不删斜杠枚举中的单项）。
   可删片段仅三类：URL、堆栈/回溯段、**配对完整**的内部引用括号；括号不配对
-  时不删括号，删除后若括号失衡则退回原文。默认输出逐字节不变。
+  时不删括号，删除后若括号失衡则退回原文。删除之后，再对**少量裸内部字段名**
+  做固定词表替换（``p_positive`` → 「买侧期望胜率」等，见
+  :data:`_COMPACT_FIELD_LABELS`）；词表之外的内部引用仍只允许整段删除。
+  默认输出逐字节不变。
 """
 from __future__ import annotations
 
@@ -100,6 +109,17 @@ _COMPACT_INTERNAL_MARKERS_RE = re.compile(
     r"|During handling of"
     r"|\b(?:p_positive|trigger\.current|is_st|action|confidence)\b"
     r"|[A-Z]{1,2}\d{1,2}[a-z]?(?:-\d+)?"
+)
+
+#: ``--compact`` 允许的**固定词表替换**：只覆盖少量会直接漏到用户眼前的裸
+#: 内部字段名/噪声词。词表之外仍只允许整段删除（见 :func:`_compact_warning`）。
+#: 安全红线：这些 token 与「停牌/退市/ST/一字」告警的限定词（「无法区分」
+#: 「无法判断」）无关，替换不会删除或弱化任何限定词。
+_COMPACT_FIELD_LABELS = (
+    (re.compile(r"(?<![\w.])p_positive(?![\w.])"), "买侧期望胜率"),
+    (re.compile(r"(?<![\w.])trigger\.current(?![\w.])"), "触发参考价"),
+    (re.compile(r"(?<![\w.])is_st(?![\w.])"), "ST 标记"),
+    (re.compile(r"(?<![\w.])ProxyError(?![\w.])"), "代理异常"),
 )
 
 #: regime 标签的相对强弱（只用于判断「逆风/顺风」，不参与任何决策）。
@@ -290,13 +310,21 @@ def _apply_deletions(text: str, deletions: List[tuple]) -> str:
     return "".join(parts)
 
 
+def _replace_compact_fields(text: str) -> str:
+    """固定词表替换 ``--compact`` 下漏出的裸内部字段名（不做其它改写）。"""
+    for pattern, label in _COMPACT_FIELD_LABELS:
+        text = pattern.sub(label, text)
+    return text
+
+
 def _compact_warning(text: str) -> str:
-    """压缩单条 warning —— **只做整段删除**，结果必为原文的删除子序列。
+    """压缩单条 warning —— **只做整段删除**，再做固定词表替换。
 
     只允许三类删除：URL、堆栈/回溯段、配对完整的内部引用括号。不改写措辞、
     不截断句子、不删斜杠枚举中的单项、不做单侧去括号；括号不配对时不删。
-    删除后若括号失衡，整条退回原文。返回空字符串表示整条都是内部细节，
-    调用方应丢弃该行（空串仍是原文的子序列）。
+    删除后若括号失衡，整条退回原文。删除后仅对 :data:`_COMPACT_FIELD_LABELS`
+    里的少量裸内部字段名做固定替换；词表之外的内部引用仍只允许整段删除。
+    返回空字符串表示整条都是内部细节，调用方应丢弃该行。
     """
     original = text
     deletions: List[tuple] = []
@@ -317,7 +345,7 @@ def _compact_warning(text: str) -> str:
     text = _apply_deletions(original, deletions).strip()
     if not _parens_balanced(text):
         return original.strip()
-    return text
+    return _replace_compact_fields(text)
 
 
 def _horizon_value(rec: Dict[str, Any]) -> Optional[int]:
@@ -448,6 +476,46 @@ def _action_line(rec: Dict[str, Any]) -> Optional[str]:
     return "｜".join(parts) or None
 
 
+#: 已触发状态 → (用户可读方向, 触发价字段, 距触发字段)。
+_TRIGGER_STATES = {
+    "buy_triggered": ("买信号", "buy_price", "buy_pct"),
+    "sell_triggered": ("卖信号", "sell_price", "sell_pct"),
+}
+
+
+def _trigger_line(payload: Dict[str, Any]) -> Optional[str]:
+    """T1：已触发的买/卖信号一行事实；无已触发信号或字段缺失时整行消失。
+
+    触发价与「现价距触发」百分比**逐值取自 JSON**（``buy_price`` /
+    ``sell_price`` 与 ``recommendation.distance_to_trigger``），绝不重算。
+    """
+    triggers = _dict(payload.get("evidence")).get("triggers")
+    if not isinstance(triggers, (list, tuple)):
+        return None
+    distances = _dict(_dict(payload.get("recommendation")).get("distance_to_trigger"))
+    # 行情非当日时不得自称「现价」（与 _price_line 的口径一致）；距离值仍是
+    # JSON 里基于 last_close 的原值，这里只调整措辞，不重算。
+    stale = _freshness(payload)[0]
+    distance_label = "距触发" if stale else "现价距触发"
+
+    parts: List[str] = []
+    for item in triggers:
+        trigger = _dict(item)
+        state = _text(trigger.get("state"))
+        mapping = _TRIGGER_STATES.get(state or "")
+        if mapping is None:
+            continue
+        label, price_field, pct_field = mapping
+        indicator = _text(trigger.get("indicator"))
+        price = _fmt_num(trigger.get(price_field))
+        distance = _fmt_num(distances.get(pct_field))
+        if not indicator or price is None or distance is None:
+            continue
+        parts.append(f"{indicator} {label}已触发"
+                     f"（触发价 {price}，{distance_label} {distance}%）")
+    return "触发：" + "；".join(parts) if parts else None
+
+
 def _position_line(rec: Dict[str, Any]) -> Optional[str]:
     """T1：建议仓位 / 持有期 / 复审日；任一为 None 时该段整体消失。"""
     parts = []
@@ -484,15 +552,35 @@ def _levels_line(rec: Dict[str, Any]) -> Optional[str]:
     return "价位：" + "｜".join(parts) if parts else None
 
 
+#: ``status == "no_edge"`` 的白话解释（不写预测、不作保证）。
+_NO_EDGE_PLAIN = "历史样本不足以支持买入判断，建议观望"
+_NO_EDGE_PLAIN_SELL = "历史样本不足以支持趋势判断；本条为风控离场，不代表看空预测"
+
+
 def _reason_line(rec: Dict[str, Any]) -> Optional[str]:
+    """依据行；``status=no_edge`` 时追加一句不带术语的白话解释。
+
+    白话句只描述样本不足，不写成预测或保证；原有可核对理由保留在前。
+    """
     reasons = rec.get("action_reason")
-    if not isinstance(reasons, (list, tuple)):
-        return None
-    for reason in reasons:
-        text = _text(reason)
-        if text:
-            return f"依据：{text}"
-    return None
+    first = None
+    if isinstance(reasons, (list, tuple)):
+        for reason in reasons:
+            text = _text(reason)
+            if text:
+                first = text
+                break
+
+    if _text(rec.get("status")) == "no_edge":
+        plain = (_NO_EDGE_PLAIN_SELL if _text(rec.get("action")) == "sell"
+                 else _NO_EDGE_PLAIN)
+        if first is None:
+            return f"依据：{plain}"
+        if plain in first:
+            return f"依据：{first}"
+        return f"依据：{first}；{plain}"
+
+    return f"依据：{first}" if first else None
 
 
 # ---------------------------------------------------------------------------
@@ -625,9 +713,10 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     纯函数：不改入参、不读文件、不触网。缺失字段对应的句子/段落整体消失，
     输出中不会出现 ``None``。
 
-    ``compact=True`` 只压缩 ``diagnostics.warnings``，且只做整段删除（URL /
-    堆栈回溯段 / 配对完整的内部引用括号）；其余行与默认输出完全一致。
-    整条 warning 都是内部细节时该行整体消失，绝不改写原文措辞。
+    ``compact=True`` 只处理 ``diagnostics.warnings``：先整段删除（URL /
+    堆栈回溯段 / 配对完整的内部引用括号），再对少量裸内部字段名做固定词表
+    替换；其余行与默认输出完全一致。整条 warning 都是内部细节时该行整体
+    消失，绝不改写词表之外的原措辞。
     """
     document = _dict(payload)
     rec = _dict(document.get("recommendation"))
@@ -658,6 +747,11 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     position = _position_line(rec)
     if position:
         lines.append(position)
+
+    # T1：触发事实放在建议行之后、依据行之前；无已触发信号则整行消失。
+    trigger = _trigger_line(document)
+    if trigger:
+        lines.append(trigger)
 
     note = _status_note(inst)
     if note:
