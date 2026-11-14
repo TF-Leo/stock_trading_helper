@@ -13,6 +13,8 @@ from stock_analysis.data_loader.bars import (
     _attempt,
     EmptyDataError,
 )
+from stock_analysis.data_loader import gapfill as _gapfill
+from stock_analysis.data_sources import astock as _astock_source
 
 # 调用方 `source=` 入参 → 渠道池优先顺序。
 #   'akshare'（默认）/ 'astock' → 腾讯 K 线优先（固定快照，不封 IP）
@@ -58,6 +60,13 @@ _LAST_FETCH_INFO = {
     # P0-4（issue #7）：本轮渠道池的逐通道尝试明细（additive）。
     # 每条 {source, ok, error_class, error_text, cooldown, removed}；无触网时为空。
     'source_attempts': [],
+    # issue #11：冷启动缺口检测 / 跨源补齐的可观测字段（additive，schema_version 不变）。
+    #   gap_filled_dates : 本次补入的日期（ISO 升序）
+    #   gap_fill_sources : {日期: 实际补入来源}，与 gap_filled_dates 一一对应
+    #   gap_warnings     : 补齐成功/失败/口径不一致/日历不可用等显式告警
+    'gap_filled_dates': [],
+    'gap_fill_sources': {},
+    'gap_warnings': [],
 }
 
 # 最近一次 _expected_latest_trade_date() 的判定来源
@@ -69,6 +78,9 @@ def last_fetch_info():
     info = dict(_LAST_FETCH_INFO)
     info['source_attempts'] = [dict(item) for item in
                                (_LAST_FETCH_INFO.get('source_attempts') or [])]
+    info['gap_filled_dates'] = list(_LAST_FETCH_INFO.get('gap_filled_dates') or [])
+    info['gap_fill_sources'] = dict(_LAST_FETCH_INFO.get('gap_fill_sources') or {})
+    info['gap_warnings'] = list(_LAST_FETCH_INFO.get('gap_warnings') or [])
     return info
 
 
@@ -80,6 +92,9 @@ def _reset_fetch_info(requested_source=None):
     _LAST_FETCH_INFO['merged_from_cache'] = False
     _LAST_FETCH_INFO['cache_rows_kept'] = 0
     _LAST_FETCH_INFO['source_attempts'] = []
+    _LAST_FETCH_INFO['gap_filled_dates'] = []
+    _LAST_FETCH_INFO['gap_fill_sources'] = {}
+    _LAST_FETCH_INFO['gap_warnings'] = []
 
 
 def _capture_source_attempts():
@@ -254,7 +269,15 @@ FULL_HISTORY_START = '19900101'
 
 
 def _prepare_indexed_frame(raw):
-    """渠道原始 DataFrame → DatetimeIndex + 数值列（写盘与合并共用）。"""
+    """渠道原始 DataFrame → DatetimeIndex + 数值列（写盘与合并共用）。
+
+    issue #11（Hermes review 第 3 条）：**所有进入数据集的帧都在这里归一到
+    0.01 元报价精度**，不再只对冷启动写盘归一。这样冷启动、近端增量、全量
+    重取、参照源四条路径共用同一入口函数，避免「冷启动写 2 位、增量又写回
+    4 位」的精度反复。**缓存命中快路径**不经过本函数（帧已带 DatetimeIndex，
+    无需重建索引），但会直接调用同一个 `_canonicalize_price_tick`，口径一致。
+    适配器层（astock.fetch_daily）仍保留 4 位小数，归一化只发生在数据集组装层。
+    """
     full = raw
     if 'date' not in full.columns:
         full = _normalize_daily_df(full)
@@ -264,7 +287,117 @@ def _prepare_indexed_frame(raw):
     for col in ('open', 'high', 'low', 'close', 'volume'):
         if col in full.columns:
             full[col] = pd.to_numeric(full[col], errors='coerce')
-    return full[~full.index.duplicated(keep='last')]
+    out = full[~full.index.duplicated(keep='last')]
+    # `_canonicalize_price_tick` 在本模块稍后定义；函数体在调用时才解析名称，
+    # 因此这里可以直接引用（单一入口，杜绝各路径各写一份取整逻辑）。
+    return _canonicalize_price_tick(out)
+
+
+# ---------------------------------------------------------------------------
+# issue #11：报价精度归一（**所有数据集入口**共享，非冷启动专用）
+#
+# 事故（PR #9 之后的复验）：同一天、同一只票，冷启动选中 CMF(30,0.1/-0.1)，
+# 有新浪缓存时选中 唐奇安(30/20)。逐项隔离（详见 PR 证据表）证明：
+#   * 只补回腾讯缺的 2007-09-04       → 仍是 CMF；
+#   * 补根 + 12 个价格异常日全换成新浪 → 仍是 CMF；
+#   * 成交量全部换成新浪                → 仍是 CMF；
+#   * **只把腾讯复权价四舍五入到 0.01 元** → 变回 唐奇安(30/20)。
+# 根因（主因）：腾讯通道返回「原始价 × 新浪比例因子」的**未取整**结果
+# （4 位小数），而新浪/东财通道返回按 0.01 元报价单位取整后的价格。同一份
+# 底层数据在两条通道里精度不同，CMF 的 money-flow 乘数在临界日被亚分差改变，
+# 锦标赛 top-1 随之翻转（CMF 分 0.4897 vs 0.2988；唐奇安 0.3809 基本不变）。
+#
+# 次因（Hermes 复现）：即使数据已归一到 0.01 元，同一 vintage 下**删掉任意
+# 一根**，top-1 仍会从 0.3810 翻到 0.4133。所以缺根不是唯一触发点，但也不是
+# 「无关」——它属于同一类「数据集状态改变结论」的问题，由 gapfill 处理。
+#
+# Hermes review 第 3 条：归一化必须**一致**。旧实现只在冷启动写盘时归一，
+# 增量合并又把 4 位小数写回，同一路径反复切换精度。现在统一在
+# `_prepare_indexed_frame`（数据集唯一入口）归一，并在 `_merge_with_cache`
+# 的合并结果上再归一一次（旧缓存可能来自更早的 4 位版本）。
+#
+# 适配器 `astock.fetch_daily` 仍保留 4 位小数（其契约测试断言 956.4076），
+# 归一化只发生在数据集组装层。
+# ---------------------------------------------------------------------------
+PRICE_TICK = 0.01
+
+
+def _canonicalize_price_tick(df):
+    """把 OHLC 四舍五入到 0.01 元（幂等；已按报价单位取整的源无变化）。"""
+    out = df.copy()
+    for col in ('open', 'high', 'low', 'close'):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors='coerce').round(2)
+    return out
+
+
+def _gap_reference_loader(symbol, start_date, adjust, primary_source):
+    """冷启动缺口参照源：从**非主源**通道再取一次同区间数据。
+
+    返回 ``(DataFrame|None, source|None)``。优先新浪（一次请求即全历史），
+    其次东财，最后腾讯；主源本身不参与（它刚才是缺根的一方）。渠道池会按
+    ``preferred`` 排序，冷却/剔除的通道自动跳过。
+    """
+    order = [name for name in ('sina_stock', 'eastmoney', 'astock_tencent')
+             if name != primary_source]
+    if not order:
+        return None, None
+    try:
+        raw, used = _STOCK_DATA_SOURCE_POOL.fetch(
+            symbol, start_date, adjust, preferred=order)
+    except Exception as exc:
+        print(f"[WARN] {symbol} 缺口参照源取数异常：{exc}", file=sys.stderr)
+        raw, used = None, None
+    _capture_source_attempts()
+    if raw is None or raw.empty or not used or used == primary_source:
+        return None, None
+    return _prepare_indexed_frame(raw), used
+
+
+def _reconcile_cold_start_gaps(full, symbol, fetch_start, adjust, used_source):
+    """冷启动数据集缺口检测/补齐；返回 ``(full, gap_info)``。
+
+    仅冷启动调用：有缓存时的旧历史是既成基准，保留旧值/取并集由
+    `_merge_with_cache` 负责（见 issue #11 的范围说明）。
+    """
+    # `_prepare_indexed_frame` 已归一（这里再调一次是幂等的，显式表达冷启动
+    # 路径与增量路径共用同一精度口径）。
+    frame = _canonicalize_price_tick(full)
+
+    def _reference():
+        return _gap_reference_loader(symbol, fetch_start, adjust, used_source)
+
+    def _refetch_from(day):
+        # **近端重抓，不是精确窄区间**：渠道池 `fetch()` 只有 start_date，
+        # 没有 end_date，实际请求是「缺口日前 5 天 → 最新交易日」。对 2007 年
+        # 的缺口这就是一次全历史请求（腾讯分页约 19 次 HTTP）。PR 与 gapfill
+        # 文档都如实记录了这一代价，未伪装成窄区间。
+        start = (day - pd.Timedelta(days=5)).strftime('%Y%m%d')
+        order = [name for name in ('sina_stock', 'eastmoney', 'astock_tencent')
+                 if name != used_source]
+        raw, used = _STOCK_DATA_SOURCE_POOL.fetch(
+            symbol, start, adjust, preferred=order)
+        _capture_source_attempts()
+        if raw is None or raw.empty or not used or used == used_source:
+            return None, None
+        return _prepare_indexed_frame(raw), used
+
+    try:
+        frame, gap_info = _gapfill.reconcile_gaps(
+            frame,
+            symbol=symbol,
+            reference_loader=_reference,
+            calendar_lookup=_astock_source.get_month_calendar,
+            refetch_fetcher=_refetch_from,
+            calendar_fallback=True,
+        )
+    except Exception as exc:
+        # 缺口核验是**增强**而非主数据通路：任何异常都不得让本来已经拿到的行情失败。
+        gap_info = _gapfill.empty_info()
+        gap_info['gap_warnings'].append(f"{symbol} 缺口核验异常，已跳过：{exc}")
+    for line in gap_info.get('gap_warnings') or []:
+        print(f"[WARN] {line}", file=sys.stderr)
+    return frame, gap_info
 
 
 def _overlap_stats(cached, fresh):
@@ -454,6 +587,10 @@ def _merge_with_cache(cached, fresh, label, cls='consistent'):
     new_tail = fresh[fresh.index > cached.index[-1]]
     merged = pd.concat([cached, new_tail])
     merged = merged[~merged.index.duplicated(keep='first')].sort_index()
+    # 旧缓存可能由更早版本写入（4 位小数）。合并结果在写盘/返回前再归一一
+    # 次，保证「冷启动路径」与「增量路径」对同一天产出逐值相等的序列
+    # （Hermes review 第 3 条验收口径）。
+    merged = _canonicalize_price_tick(merged)
     kept = int(len(cached.index.difference(fresh.index)))
     print(f"[WARN] {label} 增量合并：保留旧缓存 {kept} 行"
           f"（本次源端 {len(fresh)} 行，合并后 {len(merged)} 行；重叠分类={cls}）",
@@ -495,7 +632,14 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
                                   cache_last_date=last_date.isoformat(),
                                   lag_days=0,
                                   expected_date=expected.isoformat())
-                    return _apply_start(df, start_date)
+                    # issue #11（Hermes 复验遗留）：缓存命中是**快路径**，但同样
+                    # 必须过报价精度归一。旧实现直接返回 CSV 原样，导致更早版本
+                    # 写下的 4 位小数缓存一直保持 4 位（实测 480/480 单元），
+                    # 与「所有进入数据集的帧都在 _prepare_indexed_frame 归一」的
+                    # 契约不符，同一份数据在缓存命中/冷启动两条路径上精度不一致。
+                    # 归一幂等且只动 OHLC 列，DatetimeIndex、volume、turnover
+                    # 与 `_apply_start` 的 start_date 截取语义均不受影响。
+                    return _apply_start(_canonicalize_price_tick(df), start_date)
                 # 缓存过旧 → 需要触网；若触网失败仍要能回退到这份可用缓存
                 _stale_cache = df
             else:
@@ -533,6 +677,14 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
             full = _prepare_indexed_frame(raw)
             merged_from_cache = False
             cache_rows_kept = 0
+            # issue #11：报价精度归一只在 `_prepare_indexed_frame` 这一入口做，
+            # 冷启动 / 增量 / 全量重取 / 参照源四条路径共用（见该函数注释）。
+            # 缺口检测只在冷启动做：有缓存时旧历史是既成基准，不重新核验
+            # （避免把源间噪声混进旧序列，见 _merge_with_cache）。
+            gap_info = _gapfill.empty_info()
+            if not incremental:
+                full, gap_info = _reconcile_cold_start_gaps(
+                    full, symbol, fetch_start, adjust, used_source)
             if incremental:
                 cls_stats = {}
                 cls = _classify_overlap(_stale_cache, full, cls_stats)
@@ -619,7 +771,8 @@ def get_stock_daily(symbol, start_date='20200101', adjust='qfq', source='akshare
                           expected_date=expected.isoformat(),
                           requested_source=source,
                           merged_from_cache=merged_from_cache,
-                          cache_rows_kept=cache_rows_kept)
+                          cache_rows_kept=cache_rows_kept,
+                          **gap_info)
             return _apply_start(full, start_date)
         except Exception as e:
             print(f"渠道池数据规范化失败（source={used_source}）：{e}", file=sys.stderr)

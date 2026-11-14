@@ -253,6 +253,11 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
         if line not in warnings:
             warnings.append(line)
 
+    # issue #11：冷启动缺口补齐/口径不一致必须显式进 diagnostics，不得静默漂移。
+    for line in fetch_info.get('gap_warnings') or []:
+        if line not in warnings:
+            warnings.append(f"数据完整性：{line}")
+
     # 标的信息
     board, price_limit_pct, is_st = classify_board(code)
     name = get_stock_name(code) if data_type == 'stock' else code
