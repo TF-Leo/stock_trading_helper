@@ -34,8 +34,10 @@ GOLDEN = FIXTURES / "cli_json_structure.golden.json"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from stock_analysis import advice_render as advice_render_module  # noqa: E402
 from stock_analysis.advice_render import (  # noqa: E402
     COMPACT_GLOSSARY,
+    COMPACT_PHRASES,
     render_advice,
 )
 
@@ -625,6 +627,8 @@ def _compact_single(warning: str) -> str:
 
 #: ``--compact`` 的词表是**封闭集合**：条目的增删必须同时改这条测试与 README
 #: 的契约说明（issue #92 裁定）。这里刻意不复制实现的正则，只锁定集合内容。
+#: N4 的整句短语不在词表里：它由独立的短语集合 :data:`COMPACT_PHRASES` 匹配
+#: （语序/标点变体），见 ``test_compact_phrase_set_is_closed``。
 CLOSED_GLOSSARY = {
     "p_positive": "买侧期望胜率",
     "trigger.current": "触发参考价",
@@ -632,9 +636,10 @@ CLOSED_GLOSSARY = {
     "ProxyError": "代理异常",
     "no_edge": "无统计优势",
     "95% CI": "置信区间",
-    # N4：整句短语优先于 ``no_edge``，避免「统计上无优势，判无统计优势」重复。
-    "统计上无优势，判 no_edge": "统计上无优势",
 }
+
+#: 短语集合（N4）是封闭的两条模式：事实在前 / 判定在前；都捕获 ``claim``。
+CLOSED_PHRASE_COUNT = 2
 
 
 def _is_deletion_subsequence(shorter: str, longer: str) -> bool:
@@ -656,8 +661,17 @@ def _parens_balanced(text: str) -> bool:
 
 
 #: 不含词表 token 的告警：compact 结果必须是原文的删除子序列。
+#: fixture 中不含任何词表/短语 token 的告警：compact 结果必须是纯删除子序列。
+#: 含 token 但落在删除区间内的（如 ProxyError）由
+#: ``test_compact_real_fixture_has_both_paths`` 单独覆盖。
+DELETION_ONLY_REAL_WARNINGS = tuple(
+    warning for warning in REAL_WARNINGS
+    if not any(token in warning for token in COMPACT_GLOSSARY)
+    and not any(pattern.search(warning) for pattern, _ in COMPACT_PHRASES)
+)
+
 DELETION_ONLY_WARNINGS = (
-    *REAL_WARNINGS,
+    *DELETION_ONLY_REAL_WARNINGS,
     "接口失败 https://example.com/a?b=1（RuntimeError: timeout）；已回退旧缓存（P0-3）",
     # N1：删除后残留的连续空格也必须在输出里折叠。
     "接口失败（issue #1 决策）  已回退旧缓存",
@@ -690,6 +704,24 @@ GLOSSARY_CASES = (
      "状态 ST 标记买侧期望胜率只能依据名称判断"),
 )
 
+#: N4（issue #104-3）：短语按「短语集合」匹配，语序/标点变体不得退化成
+#: 字面量精确匹配。期望值显式写出，不用裸 ``str.replace`` 复算。
+PHRASE_VARIANT_CASES = (
+    # 事实在前：中文逗号 / ASCII 逗号 / 分号 / 冒号 / 无标点。
+    ("统计上无优势，判 no_edge", "统计上无优势"),
+    ("统计上无优势, 判 no_edge", "统计上无优势"),
+    ("统计上无优势;判定 no_edge", "统计上无优势"),
+    ("统计上无优势：判为 no_edge", "统计上无优势"),
+    ("统计上无优势判定为 no_edge", "统计上无优势"),
+    # 判定在前。
+    ("判 no_edge：统计上无优势", "统计上无优势"),
+    ("判定为 no_edge, 统计上无优势", "统计上无优势"),
+    ("判为 no_edge 统计上并无优势", "统计上并无优势"),
+    # 完整真实告警（95% CI 也是词表项；括号里的 B8 走删除）。
+    ("超额收益 95% CI 上界 ≤ 0：统计上无优势，判定 no_edge（B8）",
+     "超额收益置信区间上界 ≤ 0：统计上无优势"),
+)
+
 #: N2：删除段把两侧文本拼成词表 token 时，不得在删除结果上二次替换。
 #: 期望值里保留拼接出的 token 原文，证明命中判定只发生在原文位置。
 SEAM_CONCATENATION_CASES = (
@@ -698,7 +730,7 @@ SEAM_CONCATENATION_CASES = (
     ("trigger.（issue #1 决策）current 缺失", "trigger.current 缺失"),
 )
 
-#: N3：真实告警 fixture 至少覆盖的 6 类语义（标记取自真实告警措辞）。
+#: 真实告警 fixture 覆盖的 8 类语义（标记取自真实告警措辞）。
 REAL_WARNING_CATEGORY_MARKERS = {
     "停牌": "判定停牌/无成交",
     "ST 名单失败": "ST 名单接口失败（RuntimeError",
@@ -706,7 +738,33 @@ REAL_WARNING_CATEGORY_MARKERS = {
     "一字板": "一字涨停（最高=最低=涨停价）",
     "代理异常": "ProxyError",
     "日历不可用": "未做缺口核验（日历不可用）",
+    "策略指标缺失": "trigger.current 为 null",
+    "无统计优势": "统计上无优势，判 no_edge",
 }
+
+
+def _real_warning(prefix: str) -> str:
+    return next(warning for warning in REAL_WARNINGS
+                if warning.startswith(prefix))
+
+
+#: issue #104-1：fixture 中真正走替换路径的告警（原文, 逐字期望）。
+#: ST 末句的 ``is_st`` 是真实告警的完整尾部，匿名化时不得用省略号截掉；
+#: 它落在括号删除区间之外，因此走词表替换而非纯删除。
+REAL_REPLACEMENT_CASES = (
+    (_real_warning("ST 名单接口失败"),
+     "ST 名单接口失败，且无本地缓存：ST 标记只能依据实时报价名称判断"),
+    (_real_warning("策略族 'CMF'"),
+     "策略族 'CMF' 未提供可复算的指标值：触发参考价为 null（不以收盘价顶替）"),
+    (_real_warning("超额收益 95% CI"),
+     "超额收益置信区间上界 ≤ 0：统计上无优势"),
+)
+
+#: 短语/词边界负例：``no_edge_count`` 不得命中；「不判」不得被短语吃掉。
+PHRASE_BOUNDARY_WARNINGS = (
+    "字段 no_edge_count 未知",
+    "字段 xno_edge 未知",
+)
 
 #: token 前后粘连字母/数字/下划线/中文/dot 时不得替换（词边界）。
 GLOSSARY_BOUNDARY_WARNINGS = (
@@ -726,13 +784,148 @@ def test_compact_glossary_is_closed_set():
     assert COMPACT_GLOSSARY == CLOSED_GLOSSARY
 
 
-def test_compact_real_warnings_fixture_covers_six_categories():
-    """N3：fixture 名实相符，至少覆盖 6 类真实告警。"""
+def test_compact_phrase_set_is_closed():
+    """N4（#104-3）：短语替换是封闭的两条模式，且都捕获事实分句 ``claim``。"""
+    assert len(COMPACT_PHRASES) == CLOSED_PHRASE_COUNT
+    for pattern, group in COMPACT_PHRASES:
+        assert isinstance(pattern, re.Pattern)
+        assert group == "claim"
+        assert "claim" in pattern.groupindex
+
+
+def test_compact_real_warnings_fixture_covers_real_categories():
+    """N3 + #104-1：fixture 名实相符，覆盖真实告警语义类别。"""
     assert REAL_WARNINGS_FIXTURE.name == "compact_real_warnings.json"
     assert len(REAL_WARNINGS) >= len(REAL_WARNING_CATEGORY_MARKERS)
     joined = "\n".join(REAL_WARNINGS)
     for category, marker in REAL_WARNING_CATEGORY_MARKERS.items():
         assert marker in joined, (category, marker)
+
+
+def test_compact_real_fixture_is_structure_preserving():
+    """#104-1：fixture 用保持结构的匿名化，不得用省略号截断真实尾部。
+
+    ST 告警的真实尾部是 ``is_st 只能依据实时报价名称判断``；旧 fixture 把它
+    写成 ``：…``，导致这条告警永远走不到替换路径。这里锁住完整尾部与嵌套
+    括号结构（公开基准代码 600000）。
+    """
+    joined = "\n".join(REAL_WARNINGS)
+    assert "…" not in joined
+    assert "..." not in joined
+    st_warning = _real_warning("ST 名单接口失败")
+    assert st_warning.endswith("is_st 只能依据实时报价名称判断")
+    assert "东财 ST 名单不可达（ConnectionError）" in st_warning
+    payload = json.loads(REAL_WARNINGS_FIXTURE.read_text(encoding="utf-8"))
+    assert payload["request"]["code"] == "600000"
+
+
+def test_compact_real_fixture_has_both_paths():
+    """#104-1：替换路径与删除路径至少各有一条真实 fixture 用例。"""
+    st_warning, st_expected = REAL_REPLACEMENT_CASES[0]
+    assert _compact_single(st_warning) == st_expected
+    assert "ST 标记" in st_expected
+    # 替换引入了原文字符串里没有的新字符 → 不再是纯删除子序列。
+    assert not _is_deletion_subsequence(st_expected, st_warning)
+
+    proxy_warning = _real_warning("无法获取实时交易状态")
+    proxy_compacted = _compact_single(proxy_warning)
+    assert "tunnel connection failed" not in proxy_compacted
+    assert "停牌/退市/代码无效无法区分" in proxy_compacted
+    assert _is_deletion_subsequence(proxy_compacted, proxy_warning)
+
+
+@pytest.mark.parametrize("warning,expected", REAL_REPLACEMENT_CASES)
+def test_compact_real_fixture_replacement_is_exact(warning, expected):
+    """#104-1：fixture 里的替换路径逐字锁定。"""
+    assert _compact_single(warning) == expected
+
+
+#: issue #104 验收：≥60 条真实告警语料（结构保持副本，仅公开基准代码）。
+CORPUS_FIXTURE = FIXTURES / "compact_corpus.json"
+CORPUS_WARNINGS = json.loads(
+    CORPUS_FIXTURE.read_text(encoding="utf-8"))["warnings"]
+
+#: 不得漏到用户眼前的内部 token（替换后应消失）。
+CORPUS_RAW_INTERNALS = (
+    "https://", "Traceback", "issue #", "p_positive", "trigger.current",
+    "ProxyError", "no_edge", "95% CI", "is_st",
+)
+
+_CJK_SPACE_RE = re.compile(
+    r"[㐀-䶿一-鿿豈-﫿] "
+    r"[㐀-䶿一-鿿豈-﫿]")
+
+
+def _has_compact_token(warning: str) -> bool:
+    return (any(token in warning for token in COMPACT_GLOSSARY)
+            or any(pattern.search(warning) for pattern, _ in COMPACT_PHRASES))
+
+
+def test_compact_real_corpus_sixty_plus_no_violations():
+    """#104 验收：≥60 条真实语料重跑，compact 安全红线 0 违反。"""
+    assert len(CORPUS_WARNINGS) >= 60
+    violations = []
+    for index, warning in enumerate(CORPUS_WARNINGS):
+        compacted = _compact_single(warning)
+        if not compacted:
+            violations.append((index, "整行消失", warning))
+            continue
+        for token in CORPUS_RAW_INTERNALS:
+            if token in compacted:
+                violations.append((index, f"内部 token 漏出：{token}", compacted))
+        for token in ("停牌", "退市", "一字", "ST"):
+            if token in warning and token not in compacted:
+                violations.append((index, f"安全 token 丢失：{token}", compacted))
+        for qualifier in ("无法区分", "无法判断", "无法成交"):
+            if qualifier in warning and qualifier not in compacted:
+                violations.append((index, f"限定词丢失：{qualifier}", compacted))
+        if compacted.endswith("：停牌"):
+            violations.append((index, "未知状态被压成事实「停牌」", compacted))
+        if "  " in compacted:
+            violations.append((index, "出现连续空格", compacted))
+        if len(_CJK_SPACE_RE.findall(compacted)) > len(_CJK_SPACE_RE.findall(warning)):
+            violations.append((index, "新增中文夹空格", compacted))
+        if _parens_balanced(warning) and not _parens_balanced(compacted):
+            violations.append((index, "括号被破坏", compacted))
+        if (not _has_compact_token(warning)
+                and not _is_deletion_subsequence(compacted, warning)):
+            violations.append((index, "非纯删除子序列", compacted))
+    assert not violations, violations
+    # 约束：测试语料只用公开基准代码，不得出现任何真实持仓代码。
+    codes = set(re.findall(r"(?<!\d)(\d{6})(?!\d)",
+                           "\n".join(CORPUS_WARNINGS)))
+    assert codes <= {"600000", "600519"}, codes
+    assert "600000" in codes
+
+
+def test_compact_rule_comment_matches_implementation():
+    """#104-5：规则段注释不得再声称「没有空白归一化」，实现确实有。"""
+    source = Path(advice_render_module.__file__).read_text(encoding="utf-8")
+    assert "空格归一不在此处" in source
+    assert "没有**路径/空白/标点" not in source
+    assert "_normalize_compact_spaces" in source
+
+
+@pytest.mark.parametrize("warning,expected", PHRASE_VARIANT_CASES)
+def test_compact_phrase_variants(warning, expected):
+    """N4（#104-3）：语序/标点变体由短语集合统一收敛为一个事实分句。"""
+    compacted = _compact_single(warning)
+    assert compacted == expected
+    assert compacted.count("无优势") == 1
+    assert "判无统计优势" not in compacted
+
+
+@pytest.mark.parametrize("warning", PHRASE_BOUNDARY_WARNINGS)
+def test_compact_phrase_respects_boundaries(warning):
+    """N4：``no_edge`` 的短语/词表命中都要求词边界。"""
+    assert _compact_single(warning) == warning
+
+
+def test_compact_phrase_does_not_swallow_the_negation():
+    """N4：「不判 no_edge」是明确的否定，不得被短语收敛成肯定事实。"""
+    compacted = _compact_single("统计上无优势，不判 no_edge")
+    assert "不判" in compacted
+    assert "no_edge" not in compacted
 
 
 @pytest.mark.parametrize("warning,expected", SEAM_CONCATENATION_CASES)
@@ -753,6 +946,24 @@ def test_compact_collapses_spaces_left_by_deletion():
     """N1：删除段残留的多余空格也必须折叠。"""
     assert (_compact_single("接口失败（issue #1 决策）  已回退旧缓存")
             == "接口失败已回退旧缓存")
+
+
+def test_compact_preserves_original_name_spaces():
+    """#104-4：原文已有的空格（例如标的名内空格）不得被空格归一吸收。"""
+    name = "示例 银行"
+    warning = "示例 银行 未做缺口核验（日历不可用）：3 个候选缺口日全部未校验"
+    payload = _payload("minimal_missing")
+    payload["instrument"]["name"] = name
+    payload["diagnostics"] = {"warnings": [warning]}
+    compacted = _compact_warning_lines(render_advice(payload, compact=True))[0]
+    assert compacted == warning
+    assert "示例 银行" in compacted
+
+
+def test_compact_still_absorbs_seam_next_to_protected_name_space():
+    """#104-4：名称空格受保护，但删除括号引入的接缝空格仍要折叠/吸收。"""
+    warning = "示例 银行（issue #1 决策）  已回退旧缓存"
+    assert _compact_single(warning) == "示例 银行已回退旧缓存"
 
 
 def test_compact_no_edge_synonym_is_not_duplicated():
@@ -901,6 +1112,24 @@ def test_compact_does_not_truncate_or_rewrite():
 def test_compact_leaves_unbalanced_parentheses_untouched():
     warning = "状态无法判断（issue #1 决策"
     assert _compact_single(warning) == warning
+
+
+def test_compact_unbalanced_fallback_uses_same_space_normalization():
+    """#104-2：括号失衡退回原文内容时，仍走统一出口做空格归一与替换。"""
+    warning = "状态无法判断（is_st  只能依据名称判断（issue #1"
+    compacted = _compact_single(warning)
+    assert compacted == "状态无法判断（ST 标记只能依据名称判断（issue #1"
+    # 旧实现直接 return 原文：``is_st`` 与两个空格都会残留。
+    assert "is_st" not in compacted
+    assert "  " not in compacted
+
+
+def test_compact_unbalanced_fallback_drops_all_deletions():
+    """#104-2：括号失衡时放弃全部删除（URL 也不删），结果仍是删除子序列。"""
+    warning = "状态无法判断 https://example.com/a?b=1（issue #1"
+    compacted = _compact_single(warning)
+    assert "https://example.com/a?b=1" in compacted
+    assert _is_deletion_subsequence(compacted, warning)
 
 
 def test_compact_internal_parenthetical_is_deleted_whole():
