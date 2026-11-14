@@ -15,6 +15,8 @@ from stock_analysis.data_loader.meta import last_fetch_info
 from stock_analysis.data_loader.bars import format_attempt_warnings
 from stock_analysis.data_loader.status import resolve_trading_status
 from decision.context import evidence_context
+from stock_analysis.data_sources.market_watch import (  # T6 重点监控池
+    market_watch_evidence as _market_watch_evidence, with_market_watch_block)
 from stock_analysis.backtest.analyzer import run_strategy_tournament, calc_buy_hold_baseline
 from stock_analysis.backtest.engine import BacktestConfig
 from stock_analysis.strategy.registry import (
@@ -111,9 +113,12 @@ def parse_pct(s):
 # 保留同名绑定，避免本文件其余调用点与自检逻辑改签名。
 from decision.schema import (  # noqa: E402
     METRIC_KEYS,
-    create_error_response,
+    create_error_response as _create_error_response,
 )
 from decision.schema import empty_metrics as _empty_metrics  # noqa: E402
+
+# T6：错误路径也必须带键同构的 ``evidence.market_watch``（G35），不改 decision/*。
+create_error_response = with_market_watch_block(_create_error_response)
 
 
 def _stability_score(consensus):
@@ -516,6 +521,9 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
 
     flow_block, valuation_block, context_notes = evidence_context(code, data_type, as_of)
     warnings.extend(context_notes)
+    # T6：重点监控池（一次请求服务全池）；只展示/只告警，不改 action。
+    market_watch_block, mw_notes = _market_watch_evidence(code, data_type, as_of=as_of)
+    warnings.extend(mw_notes)
 
     # 构建响应
     response = {
@@ -618,6 +626,8 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             },
             'triggers': triggers[:5],
             'flow': flow_block, 'valuation': valuation_block,  # P1-2/P1-1 只展示，不改 action
+            # T6 additive：交易所重点监控池（只展示 / 只告警，不改 action）
+            'market_watch': market_watch_block,
         },
         'candidates': final_candidates,
         'diagnostics': {

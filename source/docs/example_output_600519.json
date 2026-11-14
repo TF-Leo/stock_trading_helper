@@ -353,6 +353,12 @@
       "expected_date": "2026-11-12",
       "expected_source": "calendar_cache",
       "reason": "cache_missing"
+    },
+    "market_watch": {
+      "available": true,
+      "stale": false,
+      "as_of": "2026-11-14",
+      "hit": null
     }
   },
   "candidates": [

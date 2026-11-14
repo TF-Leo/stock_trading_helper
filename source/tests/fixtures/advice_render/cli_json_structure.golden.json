@@ -83,6 +83,7 @@
     "edge",
     "excess_vs_buy_hold",
     "flow",
+    "market_watch",
     "metrics",
     "n_survivors",
     "n_trials",
@@ -147,5 +148,11 @@
     "unaffordable_lot_events",
     "warnings",
     "zero_trade_configs"
+  ],
+  "evidence.market_watch": [
+    "as_of",
+    "available",
+    "hit",
+    "stale"
   ]
 }
