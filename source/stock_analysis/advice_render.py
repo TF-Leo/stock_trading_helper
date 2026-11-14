@@ -73,11 +73,14 @@ T7        事件风险（``evidence.events``）：解禁 / 股东增减持 / 业
   整段删除** 两部分组成：
 
   - 删除只允许三类：URL、堆栈/回溯段、**配对完整**的内部引用括号；括号不配对
-    时不删括号，删除后若括号失衡则退回原文。删除不改写、不截句、不重排、不删
-    斜杠枚举中的单项。
+    时不删括号，删除后若括号失衡则放弃全部删除、退回原文内容（但仍走同一出口
+    做空格归一与词表替换）。删除不改写、不截句、不重排、不删斜杠枚举中的单项。
   - 替换只允许 :data:`COMPACT_GLOSSARY`（模块级封闭集合）里的项。命中必须满足
     词边界：前后不能粘连字母/数字/下划线/中文（例如 ``is_st`` 不得命中
-    ``is_status``，也不得命中 ``仅is_st推断``）。
+    ``is_status``，也不得命中 ``仅is_st推断``）。另有一组短语级替换
+    :data:`COMPACT_PHRASES`（N4）：按**短语集合**匹配「统计上无优势」与
+    ``no_edge`` 的判定分句，语序（事实在前/判定在前）与标点（中文/ASCII
+    逗号、分号、冒号）变体都命中，整段收敛为一个事实分句，避免同义重复。
 
   不变量（issue #92 的裁定口径）：
 
@@ -85,8 +88,10 @@ T7        事件风险（``evidence.events``）：解禁 / 股东增减持 / 业
   2. 告警**含**词表 token 时，把每个命中 token（必要时连同紧邻的一个 ASCII
      空格）替换为词表标签后，结果必须是该序列的删除子序列——除被替换 token
      外逐字保持原序；
-  3. 替换/删除不得在中文与中文之间顶出空格，也不得留下连续两个空格
-     （连续空格折叠、中文夹空格吸收）；
+  3. 替换/删除不得在中文与中文之间**顶出**空格，也不得留下压缩**引入**的
+     连续空格（相邻 token 接缝 / 删除残留折叠、中文夹空格吸收）；原文本身
+     已有的**名称内单个空格**原样保留，不得被归一吸收。原文中冗余的连续
+     空格仍折叠（它们是排版噪声，不是名称内容）；
   4. 词表命中只对**原文位置**判定：删除段拼接出的 token（``is_（…）st`` →
      ``is_st``）不触发替换。
 
@@ -103,6 +108,7 @@ __all__ = [
     "render_advice",
     "CALIBER_LABELS",
     "COMPACT_GLOSSARY",
+    "COMPACT_PHRASES",
     "EVENT_STALE_MARK",
     "EVENT_THRESHOLDS",
     "EVENT_WINDOW_DAYS",
@@ -160,10 +166,12 @@ _ONE_WORD_MARKERS = {
 }
 
 #: --compact 的告警压缩规则（只作用 ``diagnostics.warnings``）。
-#: 硬约束：只删整段，不做任何句内改写 —— 因此这里**没有**路径/空白/标点
-#: 归一化规则，也**不**截断句子。历史上的 ``(?:/[\w.\-]+){2,}`` 会把中文
-#: 斜杠枚举「停牌/退市/代码无效无法区分」当成路径删掉，把「无法判断」写成
-#: 事实「停牌」，已删除该类规则。
+#: 删除只删整段，不做任何句内改写 —— 这里**没有**路径/标点归一化规则，也
+#: **不**截断句子。空格归一不在此处：由输出端 :func:`_normalize_compact_spaces`
+#: 统一处理（删除/替换引入的接缝与原文冗余连续空格折叠；原文自带的名称内
+#: 单个空格受保护）。
+#: 历史上的 ``(?:/[\w.\-]+){2,}`` 会把中文斜杠枚举「停牌/退市/代码无效无法区分」
+#: 当成路径删掉，把「无法判断」写成事实「停牌」，已删除该类规则。
 _COMPACT_URL_RE = re.compile(r"https?://[^\s，。；、（）()<>\"']+")
 
 #: 堆栈/回溯中的独立片段（``File "…", line N`` / ``During handling of…``）。
@@ -199,11 +207,33 @@ COMPACT_GLOSSARY: Dict[str, str] = {
     "ProxyError": "代理异常",
     "no_edge": "无统计优势",
     "95% CI": "置信区间",
-    # N4：``cli.py`` 的 no_edge 告警原句是「统计上无优势，判 no_edge」，
-    # 逐 token 替换会得到「统计上无优势，判无统计优势」的同义重复。短语优先
-    # 匹配整段，保留前半句事实、删掉重复的判定分句（语义不变）。
-    "统计上无优势，判 no_edge": "统计上无优势",
 }
+
+#: N4：短语级替换（模块级封闭集合，语序/标点变体见模式本身）。
+#: ``cli.py`` 的 no_edge 告警原句是「统计上无优势，判 no_edge」，逐 token
+#: 替换会得到「统计上无优势，判无统计优势」的同义重复。短语集合把「事实分句
+#: + 判定分句」整段收敛为事实分句：命中后替换为命名组 ``claim`` 捕获的
+#: 「统计上（并）无优势」，保留前面的数值事实（例如「95% CI 上界 ≤ 0」）。
+#: 变体覆盖：事实在前 / 判定在前，中文与 ASCII 逗号、分号、冒号，以及
+#: 「判 / 判定 / 判为 / 判定为」和可选空白。``no_edge`` 仍要求词边界。
+_NO_EDGE_CLAIM = r"统计上(?:并)?无优势"
+_NO_EDGE_TOKEN = r"(?<![\w.])no_edge(?![\w.])"
+_NO_EDGE_SEP = r"\s*[，,、；;：:]?\s*"
+_NO_EDGE_JUDGE = r"判(?:定为|定|为)?"
+COMPACT_PHRASES = (
+    (
+        re.compile(
+            r"(?P<claim>" + _NO_EDGE_CLAIM + r")" + _NO_EDGE_SEP
+            + _NO_EDGE_JUDGE + r"\s*" + _NO_EDGE_TOKEN),
+        "claim",
+    ),
+    (
+        re.compile(
+            r"(?<![\w])" + _NO_EDGE_JUDGE + r"\s*" + _NO_EDGE_TOKEN
+            + _NO_EDGE_SEP + r"(?P<claim>" + _NO_EDGE_CLAIM + r")"),
+        "claim",
+    ),
+)
 
 
 def _glossary_matcher(glossary: Dict[str, str]) -> re.Pattern:
@@ -225,10 +255,9 @@ _COMPACT_GLOSSARY_RE = _glossary_matcher(COMPACT_GLOSSARY)
 #: 判断「中文夹空格」用的 CJK 统一表意文字范围（URO / 扩展 A / 兼容表意）。
 _CJK_CHAR_CLASS = r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
 
-#: N1：compact 输出不得出现连续两个空格，也不得在中文之间夹空格。
-_COMPACT_SPACE_RUN_RE = re.compile(r" {2,}")
-_COMPACT_CJK_SPACE_RE = re.compile(
-    r"(?<=" + _CJK_CHAR_CLASS + r") (?=" + _CJK_CHAR_CLASS + r")")
+#: N1：compact 输出不得出现压缩**引入**的连续空格或中文夹空格；原文自带的
+#: 空格由 :func:`_normalize_compact_spaces` 依据原文位置保护（issue #104-4）。
+_CJK_CHAR_RE = re.compile(_CJK_CHAR_CLASS)
 
 
 #: regime 标签的相对强弱（只用于判断「逆风/顺风」，不参与任何决策）。
@@ -425,48 +454,114 @@ def _apply_deletions(text: str, deletions: List[tuple]) -> str:
     return "".join(parts)
 
 
-def _normalize_compact_spaces(text: str) -> str:
-    """折叠连续 ASCII 空格，并吸收两个中文字符之间的单个空格（N1）。
+def _normalize_compact_spaces(text: str, origins: List[Optional[int]],
+                              original: str) -> str:
+    """只折叠/吸收**压缩过程引入**的空格，原文自带的空格保持不动。
 
-    契约：compact 输出不得出现连续两个空格，也不得出现中文夹空格。删除
-    空格仍是原文的删除子序列，不引入新字符。
+    ``origins[i]`` 记录输出第 ``i`` 个字符在原文里的下标；词表/短语替换产生
+    的字符记 ``None``。判断规则（issue #104-4）：
+
+    * 原文里本来就是「中文 空格 中文」且只有**一个**空格的，是标的名等原文
+      自带空格 → 一律保留；
+    * 删除段拼接出的接缝、替换后新产生的接缝、以及原文里本来就冗余的连续
+      空格 → 折叠为一个；若折叠后空格两侧都是中文则直接吸收；
+    * 删除/吸收空格仍属于原文的删除子序列，不引入新字符。
     """
-    text = _COMPACT_SPACE_RUN_RE.sub(" ", text)
-    return _COMPACT_CJK_SPACE_RE.sub("", text)
+    count = len(text)
+    protected = [False] * count
+    for index, origin in enumerate(origins):
+        if text[index] != " " or origin is None:
+            continue
+        left = original[origin - 1] if origin > 0 else ""
+        right = original[origin + 1] if origin + 1 < len(original) else ""
+        if _CJK_CHAR_RE.match(left) and _CJK_CHAR_RE.match(right):
+            protected[index] = True
+
+    # 第一步：折叠连续空格。受保护的单空格是原文自带的名称空格，保留。
+    collapsed: List[tuple] = []  # [(char, protected)]，已折叠
+    index = 0
+    while index < count:
+        if text[index] != " ":
+            collapsed.append((text[index], protected[index]))
+            index += 1
+            continue
+        run_end = index
+        while run_end < count and text[run_end] == " ":
+            run_end += 1
+        if run_end - index == 1 and protected[index]:
+            collapsed.append((" ", True))
+        else:
+            collapsed.append((" ", False))
+        index = run_end
+
+    # 第二步：吸收中文之间的空格（只对非保护空格）。
+    out: List[str] = []
+    for position, (char, is_protected) in enumerate(collapsed):
+        if (char == " " and not is_protected and out and position > 0
+                and position + 1 < len(collapsed)):
+            prev_char = out[-1]
+            next_char = collapsed[position + 1][0]
+            if _CJK_CHAR_RE.match(prev_char) and _CJK_CHAR_RE.match(next_char):
+                continue
+        out.append(char)
+    return "".join(out)
 
 
 def _apply_compact_edits(original: str, deletions: List[tuple]) -> str:
-    """在**原文位置**上同时应用整段删除与封闭词表替换。
+    """在**原文位置**上同时应用整段删除、短语替换与封闭词表替换。
 
-    N2：词表匹配只对原文做，且落进删除区间的命中由删除优先。若删除段把
-    两侧文本拼成一个词表 token（例如 ``is_（…）st`` → ``is_st``），这个拼接
+    N2：词表/短语匹配只对原文做，且落进删除区间的命中由删除优先。若删除段
+    把两侧文本拼成一个词表 token（例如 ``is_（…）st`` → ``is_st``），这个拼接
     产物不在原文里，因而不会触发替换 —— 避免「不含 token 的告警」被二次替换。
     词表是封闭集合：不在词表内的内部字段名一律不替换（只允许整段删除）。
+    N4：短语优先于词表 token，命中整段替换为 ``claim`` 分组捕获的事实分句。
     """
     merged = _merge_spans(deletions)
     operations: List[tuple] = [
         (start, end, "") for start, end in merged]
 
-    span_index = 0
+    phrase_spans: List[tuple] = []
+    for pattern, group in COMPACT_PHRASES:
+        for match in pattern.finditer(original):
+            start, end = match.span()
+            if any(left < end and start < right for left, right in merged):
+                continue  # 短语落在删除区间内：删除优先。
+            phrase_spans.append((start, end))
+            operations.append((start, end, match.group(group)))
+
     for match in _COMPACT_GLOSSARY_RE.finditer(original):
         start, end = match.span()
-        while span_index < len(merged) and merged[span_index][1] <= start:
-            span_index += 1
-        if span_index < len(merged) and merged[span_index][0] < end:
+        if any(left < end and start < right
+               for left, right in phrase_spans):
+            continue  # 短语已经覆盖，避免同义重复。
+        if any(left < end and start < right for left, right in merged):
             continue  # 命中落在删除区间内：删除优先，不参与替换。
         operations.append((start, end, COMPACT_GLOSSARY[match.group(1)]))
 
     operations.sort(key=lambda item: item[0])
     pieces: List[str] = []
+    origins: List[Optional[int]] = []
     cursor = 0
     for start, end, replacement in operations:
         if start < cursor:  # 区间已被合并/覆盖，跳过。
             continue
         pieces.append(original[cursor:start])
+        origins.extend(range(cursor, start))
         pieces.append(replacement)
+        origins.extend([None] * len(replacement))
         cursor = end
     pieces.append(original[cursor:])
-    return _normalize_compact_spaces("".join(pieces).strip())
+    origins.extend(range(cursor, len(original)))
+
+    text = "".join(pieces)
+    # 与旧实现一致：去掉首尾空白（``_warnings`` 已 strip，删除段可能留下）。
+    left_trim = len(text) - len(text.lstrip())
+    right_trim = len(text) - len(text.rstrip())
+    if left_trim or right_trim:
+        end_index = len(text) - right_trim if right_trim else len(text)
+        text = text[left_trim:end_index]
+        origins = origins[left_trim:end_index]
+    return _normalize_compact_spaces(text, origins, original)
 
 
 def _compact_warning(text: str) -> str:
@@ -474,10 +569,11 @@ def _compact_warning(text: str) -> str:
 
     删除只允许三类：URL、堆栈/回溯段、配对完整的内部引用括号。不改写措辞、
     不截断句子、不删斜杠枚举中的单项、不做单侧去括号；括号不配对时不删。
-    删除后若括号失衡，整条退回原文。替换与删除在**原文位置**上一次完成：
-    删除拼接出的 token 不会被再次替换（N2）。输出折叠连续空格并吸收中文
-    夹空格（N1）；词表之外的内部引用仍只允许整段删除。返回空字符串表示
-    整条都是内部细节，调用方应丢弃该行。
+    删除后若括号失衡，放弃全部删除、退回原文内容，但仍走同一出口做空格归一
+    与替换。替换与删除在**原文位置**上一次完成：删除拼接出的 token 不会被
+    再次替换（N2）。输出折叠/吸收压缩引入的空格与原文冗余连续空格（N1），
+    原文自带的名称内单个空格保留（issue #104-4）；词表之外的内部引用仍只
+    允许整段删除。返回空字符串表示整条都是内部细节，调用方应丢弃该行。
     """
     original = text
     deletions: List[tuple] = []
@@ -495,9 +591,11 @@ def _compact_warning(text: str) -> str:
 
     deletions.extend(_internal_paren_deletions(original))
 
-    text = _apply_deletions(original, deletions).strip()
-    if not _parens_balanced(text):
-        return original.strip()
+    candidate = _apply_deletions(original, deletions).strip()
+    if not _parens_balanced(candidate):
+        # 删除会让括号失衡：放弃全部删除、退回原文内容，但**仍走同一出口**
+        # 做空格归一与词表/短语替换（旧实现直接 return 原文，绕过了归一）。
+        deletions = []
     return _apply_compact_edits(original, deletions)
 
 
@@ -1240,9 +1338,10 @@ def render_advice(payload: dict, compact: bool = False) -> str:
 
     ``compact=True`` 只处理 ``diagnostics.warnings``：先整段删除（URL /
     堆栈回溯段 / 配对完整的内部引用括号），再按封闭词表
-    :data:`COMPACT_GLOSSARY` 做固定替换（词边界匹配、必要时吸收中文间的
-    空格）；其余行与默认输出完全一致。整条 warning 都是内部细节时该行整体
-    消失，绝不改写词表之外的原措辞。不变量见模块 docstring。
+    :data:`COMPACT_GLOSSARY` 与短语集合 :data:`COMPACT_PHRASES` 做固定替换
+    （词边界匹配、语序/标点变体、只吸收压缩引入的空格）；其余行与默认输出
+    完全一致。整条 warning 都是内部细节时该行整体消失，绝不改写词表之外的
+    原措辞。不变量见模块 docstring。
     """
     document = _dict(payload)
     rec = _dict(document.get("recommendation"))
