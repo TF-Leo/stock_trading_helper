@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-11-13T09:12:00",
+  "request": {"code": "600000", "type": "stock", "fast": true},
+  "instrument": {
+    "code": "600000",
+    "name": "示例银行",
+    "board": "sh_main",
+    "is_st": false,
+    "is_suspended": null,
+    "quote_stale": true,
+    "status_source": "tencent_quote"
+  },
+  "data": {
+    "bars": 500,
+    "start": "2024-09-02",
+    "end": "2026-11-13",
+    "last_close": 12.0,
+    "source": "cache",
+    "from_cache": true,
+    "stale": false,
+    "lag_days": 0,
+    "expected_date": "2026-11-13"
+  },
+  "recommendation": {
+    "action": "hold",
+    "confidence": 0.6,
+    "position_fraction": 0.15,
+    "horizon_days": [20, 20],
+    "review_date": "2026-12-11",
+    "entry_zone": null,
+    "stop_loss": null,
+    "take_profit": null,
+    "action_reason": ["持有中；未触发风控"]
+  },
+  "evidence": {},
+  "diagnostics": {
+    "warnings": [
+      "ST 名单接口失败（RuntimeError: …（…）；baostock 兜底已禁用：本项目不引入 baostock（issue #1 决策）），且无本地缓存：…",
+      "无法获取实时交易状态（腾讯报价不可用：AstockError: 拉取失败）：停牌/退市/代码无效无法区分"
+    ],
+    "elapsed_seconds": 3.2
+  },
+  "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
+}

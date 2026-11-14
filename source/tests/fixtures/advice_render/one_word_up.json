@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-11-13T09:12:00",
+  "request": {"code": "300999", "type": "stock", "fast": true},
+  "instrument": {
+    "code": "300999",
+    "name": "示例创业",
+    "board": "sz_gem",
+    "price_limit_pct": 0.2,
+    "is_st": false,
+    "is_suspended": false,
+    "limit_up": 12.0,
+    "limit_down": 8.0,
+    "quote_stale": false,
+    "status_source": "eastmoney_st_list+tencent_quote"
+  },
+  "data": {
+    "bars": 500,
+    "start": "2024-09-02",
+    "end": "2026-11-13",
+    "last_close": 12.0,
+    "source": "cache",
+    "from_cache": true,
+    "stale": false,
+    "lag_days": 0,
+    "expected_date": "2026-11-13"
+  },
+  "market_regime": {
+    "label": "Shock",
+    "confidence": 0.5,
+    "as_of": "2026-11-13",
+    "definition": "ma20_ma60_return_volatility",
+    "index": {
+      "label": "Shock",
+      "confidence": 0.5,
+      "as_of": "2026-11-13",
+      "definition": "ma20_ma60_return_volatility",
+      "source": "tencent_index:sh000300",
+      "bars": 500
+    }
+  },
+  "recommendation": {
+    "status": "untradeable",
+    "action": "avoid",
+    "action_reason": ["不可交易或结果不可信，建议不参与"],
+    "target_position": 0.0,
+    "review_date": "2026-12-11",
+    "confidence": 0.0,
+    "position_fraction": 0.0,
+    "horizon_days": [20, 20],
+    "entry_zone": null,
+    "stop_loss": null,
+    "take_profit": null,
+    "no_edge": false
+  },
+  "evidence": {},
+  "diagnostics": {
+    "warnings": ["一字涨停（最高=最低=涨停价），买单无法成交，判定不可交易（P0-3）"],
+    "elapsed_seconds": 24.0
+  },
+  "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
+}
