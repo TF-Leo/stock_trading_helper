@@ -1,5 +1,25 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-15 · PR #111 rebase 至 main + `settled_value_drift` P3 用例
+
+- **分支**：`TF-Leo/rebase-pr111`（原 PR 头 `ce693ab` rebase 到 `origin/main`
+  `f2eb8ea`）。冲突仅 `PROGRESS.md`：**两侧记录都保留**（#112 复验段在前、
+  #105 台账段紧随），未删除任何一侧内容；`README.md` 自动合并。
+- **新增测试**：`test_forward_ledger.py::test_settled_value_drift_is_preserved_
+  and_warned` —— 已结算记录在**同路径、同价源**下缓存数值被改写（exit 开盘
+  12.00→13.00）时，断言原 `settled` 块逐键不变、`settle_status=pending`、
+  `settle_reason=settled_value_drift`、`pending`/`reasons` 计数正确、
+  `rejudged=[]`、告警含代码与「保留原结算值」；恢复缓存后回到 `settled` 且
+  数值仍是第一次的。仅用 600519。
+- **证据（本机 Linux，`~/.venv` Python 3.12）**：
+  - `~/.venv/bin/python -m pytest tests/ -q` → **1039 passed, 1 failed**；
+    唯一失败 `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    在 `origin/main` 基线同样失败（解释器/依赖版本不符），与本改动无关。
+    rebase 前基线 1032 passed + main 合入的 7 项 = 1039，数量对得上。
+  - `~/.venv/bin/python -m pytest tests/test_forward_ledger.py -q` →
+    **68 passed**。
+- **未验证**：本机无 `pwsh`，`tools/check_gates.ps1` 未执行。
+
 ## 2026-11-15 · issue #109：ST 名单六项复验残留
 
 - **分支**：`task/st-p2-cleanup`（父 = `origin/main` `aeb1d04`）；未改

@@ -429,6 +429,55 @@ def test_settled_record_survives_temporary_source_unavailable(
     assert stats["settled"] == 1 and stats["pending"] == 0
 
 
+def test_settled_value_drift_is_preserved_and_warned(
+        ledger_tmp, tmp_path, monkeypatch):
+    """已结算记录重算出**不同值** → 保留原 settled 块、pending + 专用 reason。
+
+    issue #105 复验 P3：``settled_value_drift`` 与「钉住源暂时不可读」是两条
+    独立分支（复验指出漂移路径无用例）。旧的「源不可读」用例只证明缓存坏掉时
+    不清空结算块；这里**不动路径、不动价源、只改缓存数值**，验证数值漂移同样
+    不会覆写历史结算：settled 逐键不变、状态 pending、告警可见；缓存恢复后
+    状态回到 settled，数值仍是第一次结算的那份。
+    """
+    data_dir = tmp_path / "settled_value_drift"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(as_of="2026-11-02")))
+    assert fl.settle_all(ledger_dir=ledger_tmp)["settled"] == 1
+    before = dict(fl.load_day("2026-11-02", ledger_tmp)["records"][
+        "600519"]["settled"])
+    assert before["ret_20d"] == 0.2
+
+    # 同一文件、同一价源，内容被改写：exit 开盘 12.00 → 13.00（ret 变 0.3）
+    drifted_opens = list(opens)
+    drifted_opens[-1] = 13.0
+    _write_bars(data_dir, "600519", days, drifted_opens)
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["settled"] == before  # 逐键不变，绝不覆写成 0.3
+    assert record["settle_status"] == "pending"
+    assert record["settle_reason"] == fl.SETTLE_REASON_SETTLED_VALUE_DRIFT
+    assert stats["settled"] == 0 and stats["pending"] == 1
+    assert stats["failed"] == 0
+    assert stats["reasons"] == {fl.SETTLE_REASON_SETTLED_VALUE_DRIFT: 1}
+    assert stats["rejudged"] == []
+    assert any("600519" in note and "保留原结算值" in note
+               for note in stats["warnings"])
+
+    # 恢复原缓存：重算与原值逐值相同，状态回到 settled，数值仍是第一次的
+    _write_bars(data_dir, "600519", days, opens)
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["settled"] == before
+    assert record["settle_status"] == "settled"
+    assert record["settle_reason"] is None
+    assert stats["settled"] == 1 and stats["pending"] == 0
+
+
 def test_settled_legacy_record_pins_price_source_across_outage(
         ledger_tmp, tmp_path, monkeypatch):
     """老记录的结算块价源会落盘到记录级；钉住源缺失时不得换源重判。
