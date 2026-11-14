@@ -288,6 +288,64 @@ class _BaostockFallbackDisabled(ast.NodeTransformer):
         return node
 
 
+class _DuplicateCheckRelaxed(ast.NodeTransformer):
+    """Let a retried §6.8 ``st_stock_list`` return duplicate rows (issue #109).
+
+    Upstream raises ``RuntimeError("ST 名单为空或代码重复，不能当成完整快照")``
+    as soon as any code is duplicated, **before** the caller can inspect the
+    frame.  That made the status layer's duplicate-cleaning branch unreachable
+    in production (only test stubs could exercise it).  This override keeps the
+    default behaviour identical — duplicates still raise — but adds an
+    ``allow_duplicates`` keyword: a retry passes ``True`` and gets the raw frame
+    back, so the caller can drop *identical* duplicate rows.  Empty lists and
+    conflicting rows still raise, and the caller distinguishes the two.
+    """
+
+    def __init__(self):
+        self.signatures = 0
+        self.checks = 0
+        self._inside = False
+
+    def visit_FunctionDef(self, node):
+        if node.name != "st_stock_list":
+            return node
+        self._inside = True
+        node = self.generic_visit(node)
+        self._inside = False
+        node.args.args.append(ast.arg(arg="allow_duplicates", annotation=None))
+        node.args.defaults.append(ast.Constant(value=False))
+        self.signatures += 1
+        return node
+
+    def visit_If(self, node):
+        self.generic_visit(node)
+        if not self._inside:
+            return node
+        test = node.test
+        if not (isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or)
+                and len(test.values) == 2):
+            return node
+        duplicate_check = test.values[1]
+        if not (isinstance(duplicate_check, ast.Call)
+                and isinstance(duplicate_check.func, ast.Attribute)
+                and duplicate_check.func.attr == "any"):
+            return node
+        node.test = ast.BoolOp(
+            op=ast.Or(),
+            values=[
+                test.values[0],  # frame.empty —— 空表永远报错
+                ast.BoolOp(op=ast.And(), values=[
+                    ast.UnaryOp(op=ast.Not(),
+                                operand=ast.Name(id="allow_duplicates",
+                                                 ctx=ast.Load())),
+                    duplicate_check,
+                ]),
+            ],
+        )
+        self.checks += 1
+        return node
+
+
 # Eastmoney's session UA is set upstream by a bare module-level expression
 # (``EM_SESSION.headers.update(...)``), which carries no symbol for the
 # extractor to select.  Re-apply it after the generated body when the session
@@ -314,6 +372,7 @@ def build():
     selections = []
     injections = 0
     baostock_disabled = 0
+    duplicate_relaxed = 0
     selected_names = set()
     for label, kind, needle, names in SELECTION:
         chunks = _marked_block(text, label) if kind == "marker" else _section_block(text, needle)
@@ -329,6 +388,15 @@ def build():
             disabled = _BaostockFallbackDisabled()
             node = disabled.visit(ast.fix_missing_locations(node))
             baostock_disabled += disabled.count
+            relaxed = _DuplicateCheckRelaxed()
+            node = relaxed.visit(ast.fix_missing_locations(node))
+            if name == "st_stock_list":
+                if relaxed.signatures != 1 or relaxed.checks != 1:
+                    raise SystemExit(
+                        "st_stock_list 的重复检查放行注入次数异常："
+                        f"signatures={relaxed.signatures} checks={relaxed.checks} —— "
+                        "上游代码可能已变化，请检查 §6.8 的空表/重复代码判定")
+                duplicate_relaxed += 1
             generated_src = _render_node(node)
             rendered.append(generated_src)
             selected_names.add(name)
@@ -376,6 +444,14 @@ def build():
             "detail": "§6.8 st_stock_list's baostock fallback return replaced by "
                       "an explicit RuntimeError; no baostock dependency is added.",
             "injections": baostock_disabled,
+        })
+    if duplicate_relaxed:
+        modifications.append({
+            "kind": "st_duplicate_check_relaxable",
+            "detail": "§6.8 st_stock_list accepts allow_duplicates=False: a retry "
+                      "can request the raw frame so identical duplicate rows are "
+                      "cleaned by the caller; empty/conflicting rows still raise.",
+            "injections": duplicate_relaxed,
         })
     if "EM_SESSION" in selected_names:
         modifications.append({

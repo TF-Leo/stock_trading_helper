@@ -119,6 +119,26 @@ def test_example_flow_code_is_six_digits(example):
     assert code is None or re.fullmatch(r"\d{6}", str(code)), code
 
 
+def test_readme_instrument_examples_agree_on_is_st_source(readme_text, example):
+    """issue #109：README 两处 ``instrument`` 示例的 ``is_st_source`` 必须一致。
+
+    「完整字段表」与「真实样例」各写一份 600519，曾分别标
+    ``exchange_list`` 与 ``quote_name``，消费方无法判断哪个是实际值。
+    这里以已提交的真实样例为准，要求所有可解析的 README 示例取值相同。
+    """
+    values = set()
+    for raw in re.findall(r"```json\s*(.*?)```", readme_text, re.S):
+        try:
+            doc = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        inst = doc.get("instrument") if isinstance(doc, dict) else None
+        if isinstance(inst, dict) and "is_st_source" in inst:
+            values.add(inst["is_st_source"])
+    assert values, "README 没有带 is_st_source 的 instrument 示例"
+    assert values == {example["instrument"]["is_st_source"]}, values
+
+
 # ---------------------------------------------------------------------------
 # 4) WAF 措辞标注观测时点
 # ---------------------------------------------------------------------------
