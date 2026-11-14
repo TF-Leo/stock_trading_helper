@@ -147,12 +147,30 @@ SETTLE_STATUS_FAILED = "failed"
 SETTLE_STATUSES = (SETTLE_STATUS_SETTLED, SETTLE_STATUS_NOT_MATURED,
                    SETTLE_STATUS_PENDING, SETTLE_STATUS_FAILED)
 
+#: 已结算记录的钉住源本次读不到（缓存暂时缺失 / 瞬时 IO 失败）时的结算原因。
+#: 这类记录**保留原 ``settled`` 块逐键不变**，本次只记 ``pending``：一次读失败
+#: 绝不能把历史结算清成 ``null``，否则下一轮会被当成未结算记录重新判定价源
+#: （已结算数值 0 漂移）。恢复可读后重算与原值逐值相同，状态自动回到 ``settled``。
+SETTLE_REASON_SETTLED_SOURCE_UNAVAILABLE = "settled_source_unavailable"
+#: 已结算记录本次重算得到**不同的**数值（缓存被改写 / 价源被换）时的结算原因。
+#: 同样保留原 ``settled`` 块，只记 ``pending`` + 告警，交由人工核实缓存。
+SETTLE_REASON_SETTLED_VALUE_DRIFT = "settled_value_drift"
+
+#: 真正拿不到价的原因：`settled` 已存在时统一归 ``settled_source_unavailable``。
+#: ``no_bars_after_as_of`` / ``not_matured`` 是数据回退（缓存变短），保留原
+#: 结算块的同时沿用它们自己的 reason，状态按其原有语义（pending / not_matured）。
+_PRICE_UNAVAILABLE_REASONS = ("no_price_data", "price_parse_error",
+                              "open_missing")
+
 #: ``settle_reason`` → ``settle_status`` 的**非失败**映射。未列出的
 #: （``no_price_data`` / ``open_missing`` / ``price_parse_error``）一律 ``failed``。
 #: ``not_matured``（未攒够 20 根）与 ``no_bars_after_as_of``（数据未到）都不算失败。
+#: 已结算记录保留历史结算块时的两个原因都是「本次无法验证」，归 ``pending``。
 _NON_FAILURE_STATUS = {
     "not_matured": SETTLE_STATUS_NOT_MATURED,
     "no_bars_after_as_of": SETTLE_STATUS_PENDING,
+    SETTLE_REASON_SETTLED_SOURCE_UNAVAILABLE: SETTLE_STATUS_PENDING,
+    SETTLE_REASON_SETTLED_VALUE_DRIFT: SETTLE_STATUS_PENDING,
 }
 
 #: 一个 ``settled`` 块要算「已结算」必须带的字段（issue #105）。
@@ -972,6 +990,12 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
     issue #99：``basis_uncertain=true`` 的记录（记录时无可用缓存）在**首次
     结算成功前**重判一次口径，重判成功会把记录字段改写成确认值并写盘，code
     列进返回的 ``rejudged``。已确认 / 已结算记录永不重判。
+
+    issue #105 复验 P2：**已结算数值永不变化**。已结算记录本轮重算拿不到价
+    （钉住源暂时不可读）或算出不同的值时，保留原 ``settled`` 块逐键不变，只把
+    本次状态记成 ``pending`` + ``settled_source_unavailable`` /
+    ``settled_value_drift``；恢复可读后重算与原值逐值相同，状态回到 ``settled``。
+    只有从未结算过的记录才会进入首次结算 / 重判路径。
     """
     price_loader = price_loader or load_price_bars
     wanted = None if not codes else {_normalize_code(c) for c in codes}
@@ -992,6 +1016,10 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
                 continue
             if not isinstance(record, dict):
                 continue
+            # 本次运行前是否**已经结算过**。已结算记录的数值是历史事实，本轮
+            # 只允许验证，不允许覆写（见下面 preserved 处理）。
+            settled_before = (record.get("settled")
+                              if has_settlement(record) else None)
             # issue #105：老记录没有 price_source → 一次性补标显式
             # ``basis_uncertain``，让首次能确认口径的结算把它钉住。
             migrated = _migrate_legacy_record(record)
@@ -1013,14 +1041,52 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
                 cache[cache_key] = _call_price_loader(
                     price_loader, code, inst_type, price_source=source)
             bars = cache[cache_key]
-            settled, reason = compute_settlement(record, bars,
-                                                 horizon=horizon,
-                                                 price_source=source)
-            if reason == "no_price_data":
+            computed, compute_reason = compute_settlement(
+                record, bars, horizon=horizon, price_source=source)
+            if compute_reason == "no_price_data":
                 note = _no_price_data_warning(code, source)
                 if note and note not in stats["warnings"]:
                     stats["warnings"].append(note)
-            status = settle_status_for(reason)
+            # issue #105 复验 P2：已结算数值永不变化。本次重算拿不到价（缓存
+            # 暂时不可读）或算出不同的值（缓存被改写 / 价源被换）时，**保留原
+            # ``settled`` 块逐键不变**，只把本次状态记成 pending + 专用 reason。
+            # 旧实现无条件覆写 ``record["settled"] = settled``，一次瞬时 IO
+            # 失败就把历史结算清成 null，随后迁移逻辑把它当成未结算重判换源
+            # （实测净值 0.089109 → qfq 0.2）。
+            preserved_reason = None
+            if settled_before is not None and computed != settled_before:
+                if computed is None:
+                    preserved_reason = (
+                        SETTLE_REASON_SETTLED_SOURCE_UNAVAILABLE
+                        if compute_reason in _PRICE_UNAVAILABLE_REASONS
+                        else compute_reason)
+                else:
+                    preserved_reason = SETTLE_REASON_SETTLED_VALUE_DRIFT
+                if preserved_reason == SETTLE_REASON_SETTLED_VALUE_DRIFT:
+                    note = (f"{code}: 已结算数值与本次重算不一致，保留原结算值"
+                            f"（settled 块不变）；请检查价源缓存是否被改写")
+                    if note not in stats["warnings"]:
+                        stats["warnings"].append(note)
+            if preserved_reason is not None:
+                settled = settled_before
+                reason = preserved_reason
+                status = settle_status_for(reason)
+            else:
+                settled = computed
+                reason = compute_reason
+                status = settle_status_for(reason)
+            # issue #105 复验 P2：结算时**实际使用的**价源落盘到记录级，不再
+            # 只靠 ``settled`` 块推断。已结算老记录优先沿用结算块里当时用的
+            # 那个来源；本次真结算成功时写入本次解析出的来源。
+            if (record.get("price_source") not in PRICE_SOURCES
+                    and settled_before is not None
+                    and settled_before.get("price_source") in PRICE_SOURCES):
+                record["price_source"] = settled_before["price_source"]
+                changed = True
+            if (preserved_reason is None and computed is not None
+                    and record.get("price_source") not in PRICE_SOURCES):
+                record["price_source"] = source
+                changed = True
             if (record.get("settled") != settled
                     or record.get("settle_reason") != reason
                     or record.get("settle_status") != status):
@@ -1028,7 +1094,7 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
             record["settled"] = settled
             record["settle_reason"] = reason
             record["settle_status"] = status
-            if settled is not None:
+            if status == SETTLE_STATUS_SETTLED:
                 stats["settled"] += 1
             elif status == SETTLE_STATUS_NOT_MATURED:
                 stats["not_matured"] += 1

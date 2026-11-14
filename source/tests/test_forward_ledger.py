@@ -388,6 +388,91 @@ def test_settle_all_skips_not_matured(ledger_tmp):
     assert stats["failed"] == 0
 
 
+def test_settled_record_survives_temporary_source_unavailable(
+        ledger_tmp, tmp_path, monkeypatch):
+    """已结算记录 + 钉住源临时不可读 → 结算块逐键不变、pending、reason 明确。
+
+    复验实测的缺陷：``settle_all`` 无条件覆写 ``settled``，一次瞬时 IO 失败
+    就把已结算块清成 ``null``，下一轮迁移逻辑把它当成未结算并重新判定价源
+    （净值 0.089109 → qfq 0.2）。已结算数值是历史事实，**永不被一次读失败改掉**。
+    """
+    data_dir = tmp_path / "settled_source_flaky"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(as_of="2026-11-02")))
+    assert fl.settle_all(ledger_dir=ledger_tmp)["settled"] == 1
+    before = dict(fl.load_day("2026-11-02", ledger_tmp)["records"][
+        "600519"]["settled"])
+    assert before["ret_20d"] == 0.2
+
+    # 钉住源瞬时不可读：缓存损坏 → load_price_bars 返回 None
+    (data_dir / "stock_600519_qfq.csv").write_bytes(b"\x00\xff\xfe broken\n")
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["settled"] == before  # 逐键不变，绝不清空
+    assert record["settle_status"] == "pending"
+    assert record["settle_reason"] == fl.SETTLE_REASON_SETTLED_SOURCE_UNAVAILABLE
+    assert stats["settled"] == 0 and stats["pending"] == 1
+    assert stats["failed"] == 0
+    assert stats["reasons"] == {fl.SETTLE_REASON_SETTLED_SOURCE_UNAVAILABLE: 1}
+
+    # 恢复可读：再次结算与首次结果逐值相同，状态回到 settled
+    _write_bars(data_dir, "600519", days, opens)
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["settled"] == before
+    assert record["settle_status"] == "settled"
+    assert record["settle_reason"] is None
+    assert stats["settled"] == 1 and stats["pending"] == 0
+
+
+def test_settled_legacy_record_pins_price_source_across_outage(
+        ledger_tmp, tmp_path, monkeypatch):
+    """老记录的结算块价源会落盘到记录级；钉住源缺失时不得换源重判。
+
+    issue #105 复验 P2：``price_source`` 必须持久化到记录里，不能只靠
+    ``settled`` 块推断 —— 否则结算块一旦被清空，下一轮就会按当时缓存重新分类。
+    """
+    data_dir = tmp_path / "settled_legacy_pin"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(as_of="2026-11-02")))
+    fl.settle_all(ledger_dir=ledger_tmp)
+    payload = fl.load_day("2026-11-02", ledger_tmp)
+    before = dict(payload["records"]["600519"]["settled"])
+    # 模拟老台账：只有 settled 块里的价源，记录级字段缺失
+    payload["records"]["600519"].pop("price_source")
+    fl._atomic_write(fl.day_path("2026-11-02", ledger_tmp), payload)
+
+    # 钉住源消失、旁边出现净值缓存：不得换源，也不得改动已结算数值
+    (data_dir / "stock_600519_qfq.csv").unlink()
+    _write_nav(data_dir, "600519", days, [p / 10.0 for p in opens])
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["price_source"] == "local_qfq_cache"  # 从结算块落盘，不再推断
+    assert record["settled"] == before
+    assert record["settle_status"] == "pending"
+    assert record["settle_reason"] == fl.SETTLE_REASON_SETTLED_SOURCE_UNAVAILABLE
+    assert stats["rejudged"] == []
+    assert stats["settled"] == 0 and stats["pending"] == 1
+
+    # 恢复原缓存：数值与首次逐值相同，价源仍是钉住的 local_qfq_cache
+    _write_bars(data_dir, "600519", days, opens)
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["settled"] == before
+    assert record["price_source"] == "local_qfq_cache"
+    assert record["settle_status"] == "settled"
+    assert stats["settled"] == 1 and stats["rejudged"] == []
+
+
 # ---------------------------------------------------------------------------
 # 基金结算（issue #95 / PR #96 复验）
 #
@@ -1507,14 +1592,19 @@ def test_legacy_without_price_source_is_migrated_and_pinned_once(
     assert record["basis_rejudged_at"] == marker
     assert record["settled"] == settled_first
 
-    # 缓存换成只有净值形态的 fund_*.csv：已钉住的口径不得被改成 fund_nav
+    # 缓存换成只有净值形态的 fund_*.csv：已钉住的口径不得被改成 fund_nav。
+    # issue #105 复验 P2：这条记录**已结算**，钉住源这次不可读时只记 pending，
+    # 原结算块逐键保留（旧实现会清成 null，并让下一轮把它当成未结算重判换源，
+    # 那正是本次修掉的缺陷；旧断言 ``no_price_data`` 编码的正是坏行为）。
     (data_dir / "stock_600519_qfq.csv").unlink()
     _write_nav(data_dir, "600519", days, opens)
     fl.settle_all(ledger_dir=ledger_tmp)
     record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
     assert record["price_source"] == "local_qfq_cache"
     assert record["price_caliber"] == "qfq_open_to_open"
-    assert record["settle_reason"] == "no_price_data"
+    assert record["settled"] == settled_first
+    assert record["settle_status"] == "pending"
+    assert record["settle_reason"] == fl.SETTLE_REASON_SETTLED_SOURCE_UNAVAILABLE
 
 
 def test_settled_legacy_record_keeps_the_source_used_at_settlement(tmp_path):
