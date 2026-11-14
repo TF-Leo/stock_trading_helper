@@ -90,4 +90,4 @@ pwsh -File tools/check_gates.ps1        # 退出码必须是 0
 - 行情缓存：`source/stock_analysis/data/stock_{code}_qfq.csv`（600519 / 688981 等 10 只）。
 - 基金回测执行层：`source/fund_analysis/fund_backtest.py`（`cli` 保留同名 re-export 供测试）。
 - 假期/断网：`pytest` 必须离线全绿，数据一律走缓存，禁止在测试里触网。
-- 退出码契约：0=ok，10=no_edge，20=insufficient_data，30=data_source_error，40=untradeable。
+- 退出码契约：0=ok，10=no_edge，20=insufficient_data，30=data_source_error，40=untradeable，50=market_closed（非交易日，issue #117）。

@@ -49,7 +49,10 @@ REQUIRED_DATA_KEYS = [
 ]
 
 EXIT_CODES = {"ok": 0, "no_edge": 10, "insufficient_data": 20,
-              "data_source_error": 30, "untradeable": 40}
+              "data_source_error": 30, "untradeable": 40,
+              # issue #117：非交易日（休市）独立退出码；decision/* 未改动，
+              # 映射由 cli.py::exit_code_for_status 提供，README 已登记。
+              "market_closed": 50}
 
 _CLI_CACHE = {}
 
@@ -124,7 +127,11 @@ def sh(args, timeout=300):
 
 
 def run_cli_json(args, cache=True, timeout=300):
-    """真跑 CLI 并要求 stdout 是纯 JSON（C1 契约）。退出码必须是契约五码之一。"""
+    """真跑 CLI 并要求 stdout 是纯 JSON（C1 契约）。退出码必须是契约集合之一。
+
+    2026-11-15（issue #117）：契约新增 ``market_closed``=50。非交易日所有
+    股票运行都会走该状态；这不是失败，而是「今日休市」的明确结论。
+    """
     key = tuple(args)
     if cache and key in _CLI_CACHE:
         # 必须返回深拷贝：各 check 会往 rec 里写 status/reason，
@@ -135,7 +142,7 @@ def run_cli_json(args, cache=True, timeout=300):
     rec = {"cmd": "python cli.py " + " ".join(args), "exit": r["exit"], "sec": r["sec"]}
     if r["exit"] not in EXIT_CODES.values():
         rec["status"] = "FAIL"
-        rec["reason"] = f"退出码 {r['exit']} 不在契约集合 {{0,10,20,30,40}}: {r['err'].strip()[:300]}"
+        rec["reason"] = f"退出码 {r['exit']} 不在契约集合 {sorted(set(EXIT_CODES.values()))}: {r['err'].strip()[:300]}"
         rec["data"] = None
     else:
         try:
@@ -571,7 +578,7 @@ def check_type_hint():
 def check_old_args():
     """G29：D6 旧参数**端到端真跑**（subprocess，非进程内 parse_args）。
 
-    契约 D6 要求"真跑并断言 returncode ∈ {0,10,20,30,40}"。旧实现只做进程内
+    契约 D6 要求"真跑并断言 returncode ∈ 契约集合"。旧实现只做进程内
     `build_parser().parse_args()` —— 只能证明 argparse **认识**该参数，不能证明参数
     被接线到行为（argparse 收下却无人使用也照样 PASS），是判定强度的实质弱化。
 
@@ -588,7 +595,7 @@ def check_old_args():
     base = ["600519", "--start", "20260701"]
     cases = [["--detail"], ["--no-regime"], ["--opt-iters", "8"], ["--jobs", "2"],
              ["--opt", "grid"], ["-t", "stock"], ["--json"], ["--fast"]]
-    allowed = {0, 10, 20, 30, 40}
+    allowed = set(EXIT_CODES.values())
     problems, rc_map, stdout_map = [], {}, {}
     for extra in cases:
         key = " ".join(extra)
@@ -1679,8 +1686,13 @@ def check_as_of(code="002415"):
             problems.append(f"{day}: request.as_of 未回显")
         if not str(dd.get("window_note") or "").startswith("--as-of"):
             problems.append(f"{day}: window_note={dd.get('window_note')!r} 未说明 as-of")
-        if rec.get("exit") not in (0, 10):
-            problems.append(f"{day}: 退出码 {rec.get('exit')}（期望 0 或 10）")
+        # issue #117：非交易日股票运行会返回 market_closed=50（今日休市），
+        # 与数据截断语义无关；这里只允许「50 且 status=market_closed」，
+        # 其余非 0/10 仍然判失败。
+        status = ((d.get("recommendation") or {}).get("status"))
+        if rec.get("exit") not in (0, 10) and not (
+                rec.get("exit") == 50 and status == "market_closed"):
+            problems.append(f"{day}: 退出码 {rec.get('exit')}（期望 0 或 10，非交易日允许 50=market_closed）")
     return {"status": "PASS" if not problems else "FAIL",
             "reason": "; ".join(problems), "observed": obs}
 

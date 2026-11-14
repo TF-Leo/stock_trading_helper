@@ -50,13 +50,18 @@ def _snapshot(available=True, codes=(), warning=None):
 
 
 def _resolve(quote, board="sh_main", now=None, snapshot=None, **kwargs):
+    """issue #117：本文件的既有用例描述的是**交易日**行为（盘前/盘中/停牌），
+    因此显式注入 ``trading_day=True``；否则离线测试环境里日历不可用，会被
+    正确地判成「无法判定」，旧断言测的就不是交易日语义了。休市/日历不可用
+    语义见 ``test_market_closed.py``。
+    """
     from stock_analysis.data_loader import status
 
     return status.resolve_trading_status(
         kwargs.pop("code", "600519"), board, name=kwargs.pop("name", "示例"),
         now=now or dt.datetime(2026, 11, 12, 14, 0),
         st_snapshot=snapshot if snapshot is not None else _snapshot(),
-        quote=quote, **kwargs)
+        quote=quote, trading_day=kwargs.pop("trading_day", True), **kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,13 @@ v1.0 解决的是"数字可不可信"——数据泄漏、资金基准、多重�
 - v1.0 B6 验证一"三窗口 `recommendation.action` 必须完全一致" → 由 §8 的新不变式替换（原判据正是 15 根过滤器的成因）。
 - v1.0 输出规格中 `trigger.current` 的语义（未写明是价格还是指标值）→ 由 §6.1 明确为**指标值**，价格另设 `last_close`。
 
+> **issue #117 增补（2026-11-15）**：在既有五个退出码 / 五档 `status` 之外**新增**
+> `market_closed`（退出码 **50**），仅表示「官方交易日历确认今天不是交易日」。
+> 原五码/五档语义不变，`decision/*` 未改动；映射见
+> `source/cli.py::exit_code_for_status`，字段与消费方影响见 README「退出码」与
+> 「非交易日与停牌分开」两节。新增字段 `instrument.market_closed` /
+> `instrument.market_state_source` 均为 additive，`schema_version` 仍为 `1.0`。
+
 ---
 
 ## 2. 事故陈述（已复现，非推测）

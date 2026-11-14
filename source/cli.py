@@ -67,6 +67,17 @@ from fund_analysis.fund_backtest import (  # noqa: F401
 # 所有评价、复审日、失效条件都以它为准；1–5 日尺度不给方向。
 HORIZON = 20
 
+# issue #117：非交易日（休市）的独立状态/退出码/错误响应键补齐。
+# 本次约束不改 decision/*，故 market_closed（退出码 50）的契约出口在
+# source/market_state.py；README「退出码」表与 GOAL_CONTRACT 已同步登记。
+from market_state import (  # noqa: E402
+    MARKET_CLOSED_STATUS,
+    exit_code_for_status,
+    market_closed_override,
+    market_closed_warning,
+    with_market_state_error_keys,
+)
+
 # 兼容旧调用点/测试：指标组装已迁至 decision.evaluate，这里保留同名入口。
 _build_metrics = ev_mod.build_metrics
 
@@ -94,9 +105,10 @@ from decision.schema import (  # noqa: E402
 from decision.schema import empty_metrics as _empty_metrics  # noqa: E402
 
 # T6/T7：错误路径也必须带键同构的 ``evidence.market_watch`` /
-# ``evidence.events``（G35），不改 decision/*。
-create_error_response = with_events_block(
-    with_market_watch_block(_create_error_response))
+# ``evidence.events``（G35），不改 decision/*。issue #117 的
+# ``with_market_state_error_keys`` 同样在这里叠加。
+create_error_response = with_events_block(with_market_watch_block(
+    with_market_state_error_keys(_create_error_response)))
 
 
 def _stability_score(consensus):
@@ -458,14 +470,29 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             status = 'untradeable'
             warnings.append(_block)
 
+    # issue #117：非交易日（官方交易日历确认休市）不得被判成停牌/不可交易。
+    # 数据问题（insufficient_data / data_source_error）优先保留；其余状态在
+    # 休市日统一改为 market_closed（退出码 50，与停牌 40 区分）。
+    _market_status = market_closed_override(trading, status)
+    if _market_status != status:
+        status = _market_status
+        warnings.append(market_closed_warning())
+
     # v3.0 决策表：买入看条件期望，卖出只看风控；no_edge 不再阻断交易
     action = act_mod.decide(status, policy_block['pending'], bool(exp_buy['ok']),
                             bool(policy_block['holding']))
+    if status == MARKET_CLOSED_STATUS:
+        # decision/actions.py 本次不改（任务约束）：休市日动作固定 avoid。
+        action = 'avoid'
     target_position = act_mod.target_position_for(action, bool(policy_block['holding']))
     review_date = schema_review_date(df.index[-1], HORIZON)
     action_reason = rnd_mod.build_reasons(
         action, signal_block, exp_buy, policy_block, status=status,
         review_date=review_date, horizon=HORIZON)
+    if status == MARKET_CLOSED_STATUS:
+        # decision/render.build_reasons 只认识既有五态；休市日不能沿用
+        # avoid 的「不可交易或结果不可信」措辞（结果并非不可信，是今天休市）。
+        action_reason = ["今日休市（非交易日）：本结论仅基于历史数据，不产生可执行建议"]
     replay_block = pol_mod.public_view(policy_block)
 
     # F12: 止损/止盈/入场区/仓位/horizon 全部由 decision.sizing 推导（cli 不再写字面量）
@@ -550,6 +577,11 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             # issue #92 additive：一字板显式字段（'up'/'down'/null）。
             # 渲染层优先读它，diagnostics.warnings 文案匹配只作兜底。
             'one_word_limit': None if trading is None else trading.one_word_limit,
+            # issue #117 additive：今日是否休市（官方交易日历）。
+            # True=非交易日（is_suspended 恒 null），False=交易日，null=日历不可用。
+            'market_closed': None if trading is None else trading.market_closed,
+            'market_state_source': ('fund_static' if trading is None
+                                    else trading.market_state_source),
             'status_source': 'fund_static' if trading is None else trading.status_source,
             # T8 additive：腾讯报价的量比 / 换手 / 市值 —— 与 P0-3 的报价
             # **同一次** ``fetch_quote``，不新增任何请求。单位写进字段名：
@@ -700,8 +732,8 @@ def main():
                 rnd_mod.print_detail(response)
             print(f"\n免责声明：本结果不构成投资建议。")
 
-        # F05/C5: status -> 退出码一一对应（0/10/20/30/40）
-        sys.exit(exit_code_for(rec['status']))
+        # F05/C5: status -> 退出码一一对应（0/10/20/30/40 + issue #117 的 50）
+        sys.exit(exit_code_for_status(rec['status']))
 
     except SystemExit:
         raise
