@@ -43,9 +43,11 @@ push2/push2delay 的请求数为 **0**。
 --------
 取数经 :class:`status.StListFetchGuard` 包一层 ``em_get``：命中 HTTP 444 或
 零字节 FIN 时**立即中止**（不换域、不重试），写
-``data/state/st_list_cooldown.json``，默认冷却 1800 秒。冷却期内再次运行直接
-跳过（退出码 3），不会产生任何请求。人工确认封锁解除后可用 ``--force``
-或 ``--clear-cooldown``。
+``data/state/eastmoney_cooldown.json``（issue #108 起与资金流预计算**共用
+同一份冷却文件**），默认冷却 1800 秒（``EASTMONEY_COOLDOWN_SECONDS`` 可覆盖）。
+冷却期内再次运行直接跳过（退出码 3），不会产生任何请求。每轮对同一域名的
+请求数有硬上限（默认 60，``--budget`` / ``EASTMONEY_REQUEST_BUDGET`` 可覆盖），
+超限提前退出并告警。人工确认封锁解除后可用 ``--force`` 或 ``--clear-cooldown``。
 
 cron（实际接线由协调者安排）
 ----------------------------
@@ -88,6 +90,7 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from stock_analysis.data_loader import status as st  # noqa: E402
+from stock_analysis.data_sources import eastmoney_guard as em_guard  # noqa: E402
 
 EXIT_OK = 0
 EXIT_ARGS = 2
@@ -104,10 +107,11 @@ def _parse_now(value) -> _dt.datetime:
         raise ValueError(f"--now 需要 ISO 时间（如 2026-11-15T18:35:00）：{exc}")
 
 
-def precompute(now=None, force=False, dry_run=False) -> dict:
+def precompute(now=None, force=False, dry_run=False, budget=None) -> dict:
     """执行一次预计算，返回统计字典（不抛异常；由 main 映射退出码）。
 
-    ``force=True`` 忽略冷却；``dry_run=True`` 完全不触网（也不写冷却）。
+    ``force=True`` 忽略冷却；``dry_run=True`` 完全不触网（也不写冷却）；
+    ``budget`` 为本轮单域名请求硬上限（默认 60）。
     """
     now = _parse_now(now) if now is not None else _dt.datetime.now()
     stats = {
@@ -121,6 +125,8 @@ def precompute(now=None, force=False, dry_run=False) -> dict:
         "blocked": False,
         "block_reason": None,
         "cooldown": None,
+        "budget_exceeded": False,
+        "request_limits": None,
         "reason": None,
         "now": now.isoformat(),
     }
@@ -140,12 +146,27 @@ def precompute(now=None, force=False, dry_run=False) -> dict:
                            "（一次全市场名单；冷却期内不发请求）")
         return stats
 
-    guard = st.StListFetchGuard()
-    with guard:
-        snapshot = st.fetch_st_list()
+    guard = st.StListFetchGuard(budget=budget,
+                                now_fn=lambda: now.timestamp(),
+                                respect_cooling=not force)
+    try:
+        with guard:
+            snapshot = st.fetch_st_list()
+    except em_guard.EastmoneyCooling as exc:
+        # 预检查与进入闸门之间，另一进程可能刚写下冷却：本轮 0 请求。
+        stats["skipped_cooldown"] = True
+        stats["reason"] = str(exc)
+        stats["request_limits"] = guard.budget.snapshot()
+        return stats
     stats["requests"] = guard.requests
+    stats["request_limits"] = guard.budget.snapshot()
     stats["state"] = snapshot.state
     stats["blocked"] = bool(guard.block_reason)
+    if guard.budget.exceeded:
+        stats["budget_exceeded"] = True
+        stats["reason"] = guard.budget.last_error
+        print(f"BUDGET {guard.budget.last_error}", file=sys.stderr)
+        return stats
 
     if guard.block_reason:
         # 444 / 零字节 FIN：记失败 + 冷却；即使本轮侥幸拼出了名单也不落盘，
@@ -194,6 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="只删除冷却文件后退出（不触网）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只说明将做什么，不发任何请求")
+    parser.add_argument("--budget", type=int, default=None,
+                        help="单域名单轮请求硬上限（默认 60）")
     parser.add_argument("--json", action="store_true", help="输出 JSON 统计")
     return parser
 
@@ -212,7 +235,8 @@ def main(argv=None) -> int:
         return EXIT_OK
 
     try:
-        stats = precompute(now=args.now, force=args.force, dry_run=args.dry_run)
+        stats = precompute(now=args.now, force=args.force, dry_run=args.dry_run,
+                       budget=args.budget)
     except ValueError as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         return EXIT_ARGS
@@ -226,7 +250,8 @@ def main(argv=None) -> int:
               f"state={stats['state']} -> {stats['path']}")
     else:
         print(f"FAIL requests={stats['requests']} state={stats['state']} "
-              f"blocked={stats['block_reason'] or '-'}", file=sys.stderr)
+              f"blocked={stats['block_reason'] or '-'} "
+              f"budget_exceeded={stats.get('budget_exceeded')}", file=sys.stderr)
         if stats["reason"]:
             print(f"  {stats['reason']}", file=sys.stderr)
         if stats["cooldown"]:

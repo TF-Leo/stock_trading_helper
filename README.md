@@ -507,6 +507,14 @@ python cli.py 600519 --start 20200101 --json
 不是同一个量，不能直接相减、排序或跨票比较，调用方必须先看 `caliber`。
 没有 `caliber` 的 P1-2 旧缓存按东财口径读取（向后兼容）。
 
+**反爬熔断与请求预算（issue #108）**：东财 `push2` 家族对出口 IP 触发
+nginx 444 / 零字节 FIN 时，预计算立即熔断并写
+`source/stock_analysis/data/state/eastmoney_cooldown.json`（默认 1800s，
+`EASTMONEY_COOLDOWN_SECONDS` 可覆盖；与 ST 名单的预计算**共用同一份文件**）。
+冷却期内资金流 / ST 名单 / 监控池**一个请求都不发**，预计算直接跳过
+（资金流退出码 3）。每轮预计算对同一域名的请求数有硬上限（默认 60，
+`EASTMONEY_REQUEST_BUDGET` 可覆盖）；超限提前退出并告警，不落半截缓存。
+
 **只展示、不改决策**：`evidence.flow` 不参与 `action`、`status`、`position_fraction`、
 `entry_zone`、`target_position` 的任何计算；A/B 对照中 `recommendation` 逐键一致。
 
@@ -528,6 +536,7 @@ python cli.py 600519 --start 20200101 --json
 | `direction_basis` | `main_net_5d_sign` / `main_net_20d_sign` / `net_5d_sign` / `net_20d_sign` |
 | `stale` | 缓存末日早于「期望最新交易日」；判定只读本地磁盘交易日历，缺失时退回周末推算 |
 | `expected_date` / `expected_source` | 期望交易日及其口径（`calendar_cache` / `estimate`） |
+| `degraded_reason` | **issue #108 additive**：预计算从东财降级到新浪口径的原因（如 `东财反爬阻断（http_444）：HTTP 444（nginx 反爬）`）。成功走东财或旧缓存时恒为 `null`；非空时 `diagnostics.warnings` 必有一条带 `caliber` 的可读告警，**不再静默换源** |
 | `reason` | 不可用原因：`cache_missing` / `cache_invalid` / `no_rows_as_of` / `fund_not_supported` / `data_source_error` |
 
 > 基金（含 ETF）没有个股资金流（上游 §4.5 不覆盖），固定返回

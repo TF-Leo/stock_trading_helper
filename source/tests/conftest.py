@@ -34,6 +34,11 @@ def _astock_offline(monkeypatch, tmp_path):
     # 并让后续用例「整域冷却中」而跳过所有请求（实测 10 个用例因此误红）。
     monkeypatch.setenv("TENCENT_COOLDOWN_PATH",
                        str(tmp_path / "tencent_cooldown.json"))
+    # issue #108：东财反爬冷却（资金流 / ST 名单 / 监控池共用）同样必须落在
+    # 临时目录，否则一个用例触发的熔断会让后续用例「冷却中」而跳过请求，
+    # 甚至写进开发者本机状态文件。
+    monkeypatch.setenv("EASTMONEY_COOLDOWN_PATH",
+                       str(tmp_path / "eastmoney_cooldown.json"))
     # T6（issue #1）：监控池默认离线 + 独立状态目录。离线时 load_pool 不触网；
     # 状态目录指向临时目录，避免用例写进开发者本机的 market_watch.json 缓存。
     monkeypatch.setenv("ASTOCK_MARKET_WATCH_OFFLINE", "1")

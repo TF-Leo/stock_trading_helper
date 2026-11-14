@@ -66,6 +66,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from . import eastmoney_guard as _em_guard
+
 __all__ = [
     "DEFAULT_TIMEOUT",
     "HIT_KEYS",
@@ -201,8 +203,15 @@ def fetch_pool(timeout: float = DEFAULT_TIMEOUT) -> List[dict]:
     这里不跟随。
     """
     try:
-        response = _http_get(MONITOR_URL,
-                             {"Referer": MONITOR_REFERER}, timeout)
+        # issue #108：东财 IP 级反爬冷却期内一个请求都不发；命中 444 / 零字节
+        # FIN 时由闸门写持久冷却（与资金流 / ST 名单共用同一份状态文件）。
+        with _em_guard.EmFetchGuard(block_exc=MarketWatchError):
+            response = _http_get(MONITOR_URL,
+                                 {"Referer": MONITOR_REFERER}, timeout)
+    except _em_guard.EastmoneyCooling as exc:
+        raise MarketWatchError(f"监控池暂缓请求：{exc}") from exc
+    except MarketWatchError:
+        raise
     except Exception as exc:  # 网络层异常统一收敛成明确异常
         raise MarketWatchError(
             f"监控池请求失败（{type(exc).__name__}: {exc}）") from exc

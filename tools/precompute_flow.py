@@ -26,6 +26,7 @@ CLI 只读这份缓存（``stock_analysis/data_loader/flow.py``），**绝不触
     python tools/precompute_flow.py 600519 002415       # 指定票池
     python tools/precompute_flow.py --codes 600519,002415 --json
     python tools/precompute_flow.py --interval 1.2 --retries 3
+    python tools/precompute_flow.py --budget 60        # 单域名单轮请求硬上限
 
 行为
 ----
@@ -37,10 +38,22 @@ CLI 只读这份缓存（``stock_analysis/data_loader/flow.py``），**绝不触
 * 单票在某一源上失败后重试 ``--retries`` 次（默认 2），东财仍失败则改走
   新浪备胎；两者都失败才记失败并继续下一票。
 * 只有 ≥ ``MIN_ROWS``（20）行且字段完整的响应才写缓存；失败**不覆盖**旧缓存。
-* 缓存 JSON 记录 ``source`` / ``caliber`` / ``attempts``（各源实际请求次数）。
+* 缓存 JSON 记录 ``source`` / ``caliber`` / ``attempts``（各源实际请求次数）；
+  降级到新浪时另写 ``degraded_reason``（issue #108，CLI 据此出声告警）。
 * 输出成功/失败票、总请求数、墙钟；``--json`` 同时给出机读统计。
 
-退出码：0 = 全部成功；1 = 有票失败；2 = 参数/配置错误。
+反爬熔断与请求预算（issue #108）
+-------------------------------
+* 进入本轮先读 ``data/state/eastmoney_cooldown.json``（与 ST 名单共用）；
+  冷却未到期 → **0 请求**，``skipped_cooldown=True``，退出码 3；
+* ``em_get`` 命中 HTTP 444 / 零字节 FIN → 立即熔断并写冷却，本轮剩余东财
+  请求一个都不发，改走新浪，并在 stderr 打印 ``DEGRADED 已降级到
+  sina_total_net，原因 …``；
+* 每个域名本轮请求数硬上限 ``--budget``（默认 60），超限在发请求前抛出，
+  提前退出并打印 ``BUDGET …``，剩余票不写缓存。
+
+退出码：0 = 全部成功；1 = 有票失败 / 请求预算超限；2 = 参数/配置错误；
+3 = 东财反爬冷却中（未发请求）。
 """
 from __future__ import annotations
 
@@ -58,6 +71,8 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 OUT_DIR = os.path.join(SRC, "stock_analysis", "data", "flow")
+
+from stock_analysis.data_sources import eastmoney_guard as em_guard  # noqa: E402
 
 # 与 tools/forward_log.py 的 14 只自选保持一致（同一批标的，便于交叉核对）。
 DEFAULT_CODES = [
@@ -80,6 +95,10 @@ UPSTREAM_EASTMONEY = "a-stock-data v3.10.4 §4.5 stock_fund_flow_120d"
 UPSTREAM_SINA = "a-stock-data v3.10.4 备用源速查 fund_flow_backup"
 SINA_DAYS = 120
 SINA_ROW_FIELDS = ("date", "net_amount")
+
+# issue #108：预计算 run 级别的请求预算按域名分桶（不实际解 URL，只做计数键）。
+DOMAIN_EASTMONEY = "push2his.eastmoney.com"
+DOMAIN_SINA = "vip.stock.finance.sina.com.cn"
 
 
 def normalize_code(code) -> str:
@@ -171,11 +190,12 @@ def validate_sina_rows(rows):
 
 
 def write_cache(code, rows, out_dir=None, limit=120, source=SOURCE_EASTMONEY,
-                caliber=CALIBER_EASTMONEY, attempts=None):
+                caliber=CALIBER_EASTMONEY, attempts=None, degraded_reason=None):
     """原子写入 ``<out_dir>/<code>.json``；返回落盘路径。
 
     ``source`` / ``caliber`` / ``attempts`` 必须显式落盘 —— CLI 侧据此分支
-    摘要口径，绝不能靠猜或靠字段名是否恰好存在。
+    摘要口径，绝不能靠猜或靠字段名是否恰好存在。issue #108 additive：
+    降级到新浪口径时把 ``degraded_reason`` 一并落盘，CLI 据此出声告警。
     """
     out_dir = out_dir or OUT_DIR
     os.makedirs(out_dir, exist_ok=True)
@@ -195,6 +215,9 @@ def write_cache(code, rows, out_dir=None, limit=120, source=SOURCE_EASTMONEY,
         "attempts": dict(attempts or {}),
         "rows": rows[-int(limit):],
     }
+    if degraded_reason:
+        # 只在真的降级时写；东财口径 / 旧缓存读取方看到的是缺省（按 None）。
+        payload["degraded_reason"] = str(degraded_reason)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=1, sort_keys=True)
@@ -206,13 +229,21 @@ def write_cache(code, rows, out_dir=None, limit=120, source=SOURCE_EASTMONEY,
 def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
                retries=DEFAULT_RETRIES, retry_wait=DEFAULT_RETRY_WAIT,
                fetch_fn=None, sina_fetch_fn=None, sleep_fn=time.sleep,
-               now_fn=datetime.now):
+               now_fn=datetime.now, budget=None, force=False):
     """逐票串行预计算；返回统计字典（不抛异常，失败逐票记录）。
 
     东财优先。**首票单次探测**：第一次东财请求失败即把本轮标记为东财不可用
     （``eastmoney_down=True``），后续票不再请求东财，直接走新浪备胎 ——
     整域 TLS RST 时不能逐票重试轰炸（issue #39）。探测成功后，单票的东财
     失败仍按 ``retries`` 重试，再降级新浪。
+
+    issue #108：
+    * 进入本轮先查 ``eastmoney_cooldown.json``；冷却未到期 → **0 请求**，
+      ``skipped_cooldown=True``（``force=True`` 可人工跳过，仅供确认封锁解除）；
+    * ``em_get`` 命中 HTTP 444 / 零字节 FIN → 立即熔断、写持久冷却，剩余东财
+      请求一次也不发，降级新浪并在日志 / 缓存 / ``stats`` 里写明原因；
+    * 每个域名本轮请求数有硬上限（默认 60），超限**提前退出并告警**，
+      剩余票不再请求，也不会落半截缓存。
     """
     if interval < 1.0:
         raise ValueError("interval 不得小于 1.0 秒（东财防封铁律）")
@@ -220,6 +251,28 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
         raise ValueError("retries 不得为负")
     fetch_fn = fetch_fn or fetch_fund_flow
     sina_fetch_fn = sina_fetch_fn or fetch_sina_fund_flow
+    request_budget = em_guard.RequestBudget(budget)
+    guard = em_guard.EmFetchGuard(
+        budget=request_budget, enforce_budget=False, mark=True,
+        now_fn=lambda: now_fn().timestamp(), respect_cooling=not force)
+
+    stats = {"out_dir": out_dir or OUT_DIR, "interval_seconds": float(interval),
+             "retries": int(retries), "requests": 0, "ok": [], "failed": [],
+             "eastmoney_down": False, "eastmoney_probe": None,
+             "blocked": False, "block_reason": None,
+             "skipped_cooldown": False, "budget_exceeded": False,
+             "request_limits": request_budget.snapshot(),
+             "degraded_reason": None, "degraded": False,
+             "skipped": [], "reason": None, "wall_seconds": 0.0,
+             "ok_sources": {SOURCE_EASTMONEY: 0, SOURCE_SINA: 0}}
+
+    cooling = guard.cooling()
+    if cooling and not force:
+        stats["skipped_cooldown"] = True
+        stats["request_limits"] = request_budget.snapshot()
+        stats["reason"] = guard.cooling_message(cooling)
+        print(f"SKIP {stats['reason']}", file=sys.stderr)
+        return stats
 
     seen, ordered = set(), []
     for raw in codes:
@@ -232,15 +285,16 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
             seen.add(code)
             ordered.append((str(raw), code, None))
 
-    stats = {"out_dir": out_dir or OUT_DIR, "interval_seconds": float(interval),
-             "retries": int(retries), "requests": 0, "ok": [], "failed": [],
-             "eastmoney_down": False, "eastmoney_probe": None,
-             "ok_sources": {SOURCE_EASTMONEY: 0, SOURCE_SINA: 0}}
     started = now_fn()
     last_request_at = [None]
 
-    def _request(fn, code):
-        """发一次请求：强制相邻请求 ≥interval（含重试/备胎），并计数。"""
+    def _request(fn, code, domain):
+        """发一次请求：先扣预算，再强制相邻请求 ≥interval（含重试/备胎）。
+
+        预算在**发请求之前**扣减：超限抛 :class:`EastmoneyBudgetExceeded`，
+        调用方据此外层捕获并提前退出，绝不静默继续。
+        """
+        request_budget.reserve(domain)
         if last_request_at[0] is not None:
             due = last_request_at[0] + interval
             wait = due - now_fn().timestamp()
@@ -251,85 +305,151 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
         return fn(code)
 
     probe_pending = True
-    for raw, code, parse_error in ordered:
-        if code is None:
-            stats["failed"].append({"code": raw,
-                                    "attempts": {"eastmoney": 0, "sina": 0},
-                                    "reason": parse_error})
-            continue
+    current_code = None
 
-        em_attempts = sina_attempts = 0
-        em_reason = sina_reason = None
-        rows = None
-        source = caliber = None
+    def _restore_tail():
+        """预算/阻断提前退出时，把尚未处理的票如实记入 ``skipped``。"""
+        seen_current = False
+        for raw, code, _err in ordered:
+            if code == current_code and not seen_current:
+                seen_current = True
+                continue
+            if seen_current:
+                stats["skipped"].append(code or raw)
 
-        if not stats["eastmoney_down"]:
-            # 探测票只打一次；探测成功后恢复 --retries。
-            max_retries = 0 if probe_pending else int(retries)
-            for attempt in range(max_retries + 1):
-                em_attempts += 1
-                try:
-                    rows = validate_rows(_request(fetch_fn, code))
-                    em_reason = None
-                    break
-                except Exception as exc:
-                    em_reason = f"{type(exc).__name__}: {exc}"
-                    if attempt < max_retries:
-                        sleep_fn(retry_wait)
-            if probe_pending:
-                probe_pending = False
-                stats["eastmoney_probe"] = {
-                    "code": code, "ok": rows is not None,
-                    "attempts": em_attempts, "reason": em_reason,
-                }
-                if rows is None:
+    guard_entered = False
+    try:
+        guard.__enter__()
+        guard_entered = True
+        for raw, code, parse_error in ordered:
+            if code is None:
+                stats["failed"].append({"code": raw,
+                                        "attempts": {"eastmoney": 0, "sina": 0},
+                                        "reason": parse_error})
+                continue
+            current_code = code
+            em_attempts = sina_attempts = 0
+            em_reason = sina_reason = None
+            rows = None
+            source = caliber = None
+            degraded_reason = None
+
+            if not stats["eastmoney_down"] and not guard.blocked:
+                # 探测票只打一次；探测成功后恢复 --retries。
+                max_retries = 0 if probe_pending else int(retries)
+                for attempt in range(max_retries + 1):
+                    em_attempts += 1
+                    try:
+                        rows = validate_rows(_request(
+                            fetch_fn, code, DOMAIN_EASTMONEY))
+                        em_reason = None
+                        break
+                    except em_guard.EastmoneyBudgetExceeded:
+                        raise
+                    except Exception as exc:
+                        em_reason = f"{type(exc).__name__}: {exc}"
+                        if attempt < max_retries:
+                            sleep_fn(retry_wait)
+                    # 生成物可能把闸门的异常吞成空列表；以闸门记录为准。
+                    if guard.block_reason:
+                        em_reason = (f"东财反爬阻断（{guard.block_reason}）："
+                                     f"{guard.block_detail}")
+                        rows = None
+                        break
+                if probe_pending:
+                    probe_pending = False
+                    stats["eastmoney_probe"] = {
+                        "code": code, "ok": rows is not None,
+                        "attempts": em_attempts, "reason": em_reason,
+                    }
+                    if rows is None:
+                        stats["eastmoney_down"] = True
+                        print(f"PROBE 东财不可达，本轮改走新浪备胎："
+                              f"attempts={em_attempts} reason={em_reason}",
+                              file=sys.stderr)
+                if guard.block_reason and not stats["blocked"]:
+                    stats["blocked"] = True
+                    stats["block_reason"] = guard.block_reason
                     stats["eastmoney_down"] = True
-                    print(f"PROBE 东财不可达，本轮改走新浪备胎："
-                          f"attempts={em_attempts} reason={em_reason}",
+                    print(f"BLOCKED 东财反爬命中 {guard.block_reason}："
+                          f"{guard.block_detail}；已写持久冷却，"
+                          "本轮剩余东财请求一个都不发",
                           file=sys.stderr)
 
-        if rows is not None:
-            source, caliber = SOURCE_EASTMONEY, CALIBER_EASTMONEY
-        else:
-            for attempt in range(int(retries) + 1):
-                sina_attempts += 1
-                try:
-                    rows = validate_sina_rows(_request(sina_fetch_fn, code))
-                    sina_reason = None
-                    break
-                except Exception as exc:
-                    sina_reason = f"{type(exc).__name__}: {exc}"
-                    if attempt < int(retries):
-                        sleep_fn(retry_wait)
-            if rows is not None:
-                source, caliber = SOURCE_SINA, CALIBER_SINA
+            if rows is not None and not guard.block_reason:
+                source, caliber = SOURCE_EASTMONEY, CALIBER_EASTMONEY
+            else:
+                rows = None
+                em_display = em_reason or ("本轮已标记不可用（跳过）"
+                                           if em_attempts == 0 else "未知")
+                degraded_reason = (
+                    f"东财反爬阻断（{guard.block_reason}）：{guard.block_detail}"
+                    if guard.block_reason else f"东财不可达：{em_display}")
+                for attempt in range(int(retries) + 1):
+                    sina_attempts += 1
+                    try:
+                        rows = validate_sina_rows(_request(
+                            sina_fetch_fn, code, DOMAIN_SINA))
+                        sina_reason = None
+                        break
+                    except em_guard.EastmoneyBudgetExceeded:
+                        raise
+                    except Exception as exc:
+                        sina_reason = f"{type(exc).__name__}: {exc}"
+                        if attempt < int(retries):
+                            sleep_fn(retry_wait)
+                if rows is not None:
+                    source, caliber = SOURCE_SINA, CALIBER_SINA
 
-        attempts = {"eastmoney": em_attempts, "sina": sina_attempts}
-        if rows is None:
-            em_display = em_reason or ("本轮已标记不可用（跳过）"
-                                       if em_attempts == 0 else "未知")
-            reason = f"eastmoney: {em_display}; sina: {sina_reason}"
-            stats["failed"].append({"code": code, "attempts": attempts,
-                                    "reason": reason})
-            print(f"FAIL {code}: attempts={attempts} reason={reason}",
-                  file=sys.stderr)
-            continue
-        try:
-            path = write_cache(code, rows, out_dir=out_dir, source=source,
-                               caliber=caliber, attempts=attempts)
-        except Exception as exc:
-            stats["failed"].append({"code": code, "attempts": attempts,
-                                    "reason": f"写缓存失败: {exc}"})
-            print(f"FAIL {code}: 写缓存失败 {exc}", file=sys.stderr)
-            continue
-        stats["ok"].append({"code": code, "rows": min(len(rows), 120),
-                            "as_of": rows[-1]["date"], "path": path,
-                            "source": source, "caliber": caliber,
-                            "attempts": attempts})
-        stats["ok_sources"][source] += 1
-        print(f"OK   {code}: {min(len(rows), 120)} 行 source={source} "
-              f"caliber={caliber} attempts={attempts} "
-              f"as_of={rows[-1]['date']} -> {path}")
+            attempts = {"eastmoney": em_attempts, "sina": sina_attempts}
+            if rows is None:
+                reason = f"eastmoney: {em_display}; sina: {sina_reason}"
+                stats["failed"].append({"code": code, "attempts": attempts,
+                                        "reason": reason})
+                print(f"FAIL {code}: attempts={attempts} reason={reason}",
+                      file=sys.stderr)
+                continue
+            if source == SOURCE_SINA and stats["degraded_reason"] is None:
+                stats["degraded_reason"] = degraded_reason
+                stats["degraded"] = True
+                print(f"DEGRADED 已降级到 {CALIBER_SINA}，原因 {degraded_reason}",
+                      file=sys.stderr)
+            try:
+                path = write_cache(code, rows, out_dir=out_dir, source=source,
+                                   caliber=caliber, attempts=attempts,
+                                   degraded_reason=degraded_reason)
+            except Exception as exc:
+                stats["failed"].append({"code": code, "attempts": attempts,
+                                        "reason": f"写缓存失败: {exc}"})
+                print(f"FAIL {code}: 写缓存失败 {exc}", file=sys.stderr)
+                continue
+            stats["ok"].append({"code": code, "rows": min(len(rows), 120),
+                                "as_of": rows[-1]["date"], "path": path,
+                                "source": source, "caliber": caliber,
+                                "attempts": attempts,
+                                "degraded_reason": degraded_reason})
+            stats["ok_sources"][source] += 1
+            print(f"OK   {code}: {min(len(rows), 120)} 行 source={source} "
+                  f"caliber={caliber} attempts={attempts} "
+                  f"as_of={rows[-1]['date']} -> {path}")
+
+    except em_guard.EastmoneyCooling as exc:
+        stats["skipped_cooldown"] = True
+        stats["reason"] = str(exc)
+        print(f"SKIP {exc}", file=sys.stderr)
+        _restore_tail()
+    except em_guard.EastmoneyBudgetExceeded as exc:
+        stats["budget_exceeded"] = True
+        stats["reason"] = str(exc)
+        stats["failed"].append({"code": current_code,
+                                "attempts": {"eastmoney": None, "sina": None},
+                                "reason": str(exc)})
+        _restore_tail()
+        print(f"BUDGET {exc}", file=sys.stderr)
+    finally:
+        if guard_entered:
+            guard.__exit__(None, None, None)
+        stats["request_limits"] = request_budget.snapshot()
 
     stats["wall_seconds"] = round(now_fn().timestamp() - started.timestamp(), 2)
     return stats
@@ -349,6 +469,11 @@ def build_parser():
                         help="单票失败重试次数（默认 2）")
     parser.add_argument("--retry-wait", type=float, default=DEFAULT_RETRY_WAIT,
                         help="重试前的额外等待秒数（默认 2.0）")
+    parser.add_argument("--budget", type=int, default=None,
+                        help="单域名单轮请求硬上限（默认 60，环境变量 "
+                             "EASTMONEY_REQUEST_BUDGET 可覆盖）")
+    parser.add_argument("--force", action="store_true",
+                        help="忽略东财反爬冷却（仅人工确认封锁解除后使用）")
     parser.add_argument("--json", action="store_true", help="输出机读统计 JSON")
     return parser
 
@@ -362,23 +487,33 @@ def main(argv=None):
         codes = list(DEFAULT_CODES)
     try:
         stats = precompute(codes, out_dir=args.out_dir, interval=args.interval,
-                           retries=args.retries, retry_wait=args.retry_wait)
+                           retries=args.retries, retry_wait=args.retry_wait,
+                           budget=args.budget, force=args.force)
     except ValueError as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         return 2
 
     sources = stats.get("ok_sources") or {}
+    limits = stats.get("request_limits") or {}
     print(f"requests={stats['requests']} ok={len(stats['ok'])} "
           f"failed={len(stats['failed'])} wall={stats['wall_seconds']}s "
           f"interval={stats['interval_seconds']}s "
           f"eastmoney_down={stats.get('eastmoney_down')} "
           f"eastmoney_ok={sources.get(SOURCE_EASTMONEY, 0)} "
-          f"sina_ok={sources.get(SOURCE_SINA, 0)}")
+          f"sina_ok={sources.get(SOURCE_SINA, 0)} "
+          f"degraded={stats.get('degraded')} "
+          f"budget={limits.get('counts') or {}}/{limits.get('limit_per_domain')}")
+    if stats.get("skipped_cooldown"):
+        print(f"SKIP {stats.get('reason')}", file=sys.stderr)
+    if stats.get("budget_exceeded"):
+        print(f"BUDGET {stats.get('reason')}", file=sys.stderr)
     if stats["failed"]:
         for item in stats["failed"]:
             print(f"  - {item['code']}: {item['reason']}", file=sys.stderr)
     if args.json:
         print(json.dumps(stats, ensure_ascii=False, indent=2))
+    if stats.get("skipped_cooldown"):
+        return 3
     return 0 if not stats["failed"] else 1
 
 
