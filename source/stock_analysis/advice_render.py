@@ -73,7 +73,10 @@ T6        交易所重点监控池命中（``evidence.market_watch``）—— �
   2. 告警**含**词表 token 时，把每个命中 token（必要时连同紧邻的一个 ASCII
      空格）替换为词表标签后，结果必须是该序列的删除子序列——除被替换 token
      外逐字保持原序；
-  3. 替换不得在中文与中文之间顶出空格（标签与相邻中文之间的原空格会被吸收）。
+  3. 替换/删除不得在中文与中文之间顶出空格，也不得留下连续两个空格
+     （连续空格折叠、中文夹空格吸收）；
+  4. 词表命中只对**原文位置**判定：删除段拼接出的 token（``is_（…）st`` →
+     ``is_st``）不触发替换。
 
   默认输出逐字节不变。
 """
@@ -151,6 +154,10 @@ COMPACT_GLOSSARY: Dict[str, str] = {
     "ProxyError": "代理异常",
     "no_edge": "无统计优势",
     "95% CI": "置信区间",
+    # N4：``cli.py`` 的 no_edge 告警原句是「统计上无优势，判 no_edge」，
+    # 逐 token 替换会得到「统计上无优势，判无统计优势」的同义重复。短语优先
+    # 匹配整段，保留前半句事实、删掉重复的判定分句（语义不变）。
+    "统计上无优势，判 no_edge": "统计上无优势",
 }
 
 
@@ -170,17 +177,13 @@ def _glossary_matcher(glossary: Dict[str, str]) -> re.Pattern:
 
 _COMPACT_GLOSSARY_RE = _glossary_matcher(COMPACT_GLOSSARY)
 
-#: 判断「中文夹空格」用的 CJK 统一表意文字范围。
-_CJK_RANGES = (
-    (0x3400, 0x4DBF),
-    (0x4E00, 0x9FFF),
-    (0xF900, 0xFAFF),
-)
+#: 判断「中文夹空格」用的 CJK 统一表意文字范围（URO / 扩展 A / 兼容表意）。
+_CJK_CHAR_CLASS = r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"
 
-
-def _is_cjk(char: str) -> bool:
-    code = ord(char)
-    return any(start <= code <= end for start, end in _CJK_RANGES)
+#: N1：compact 输出不得出现连续两个空格，也不得在中文之间夹空格。
+_COMPACT_SPACE_RUN_RE = re.compile(r" {2,}")
+_COMPACT_CJK_SPACE_RE = re.compile(
+    r"(?<=" + _CJK_CHAR_CLASS + r") (?=" + _CJK_CHAR_CLASS + r")")
 
 
 #: regime 标签的相对强弱（只用于判断「逆风/顺风」，不参与任何决策）。
@@ -352,16 +355,22 @@ def _internal_paren_deletions(text: str) -> List[tuple]:
             if _COMPACT_INTERNAL_MARKERS_RE.search(text[start + 1:end - 1])]
 
 
-def _apply_deletions(text: str, deletions: List[tuple]) -> str:
-    """按区间删除后拼接；区间可重叠/相邻。"""
-    if not deletions:
-        return text
-    merged: List[list] = []
-    for start, end in sorted(deletions):
+def _merge_spans(spans: List[tuple]) -> List[List[int]]:
+    """合并重叠/相邻的半开区间 ``[start, end)``。"""
+    merged: List[List[int]] = []
+    for start, end in sorted(spans):
         if merged and start <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], end)
         else:
             merged.append([start, end])
+    return merged
+
+
+def _apply_deletions(text: str, deletions: List[tuple]) -> str:
+    """按区间删除后拼接；区间可重叠/相邻。"""
+    merged = _merge_spans(deletions)
+    if not merged:
+        return text
     parts: List[str] = []
     cursor = 0
     for start, end in merged:
@@ -371,42 +380,48 @@ def _apply_deletions(text: str, deletions: List[tuple]) -> str:
     return "".join(parts)
 
 
-def _replace_compact_fields(text: str) -> str:
-    """按 :data:`COMPACT_GLOSSARY` 做固定词表替换（词边界 + 中文空格吸收）。
+def _normalize_compact_spaces(text: str) -> str:
+    """折叠连续 ASCII 空格，并吸收两个中文字符之间的单个空格（N1）。
 
-    词表是封闭集合：不在词表内的内部字段名一律不替换（只允许整段删除）。
-    替换保持原文顺序，不重排、不跨 token 改写。
-
-    空格处理：替换后若标签与**已输出内容**（或原文后续字符）在接缝两侧都是
-    中文，则吸收接缝里的一个 ASCII 空格。这样 ``is_st 只能`` →
-    ``ST 标记只能``，两个相邻词表 token 之间的空格（``is_st p_positive``）
-    也不会在输出里留下「中文 空格 中文」。
+    契约：compact 输出不得出现连续两个空格，也不得出现中文夹空格。删除
+    空格仍是原文的删除子序列，不引入新字符。
     """
-    if not COMPACT_GLOSSARY:
-        return text
+    text = _COMPACT_SPACE_RUN_RE.sub(" ", text)
+    return _COMPACT_CJK_SPACE_RE.sub("", text)
+
+
+def _apply_compact_edits(original: str, deletions: List[tuple]) -> str:
+    """在**原文位置**上同时应用整段删除与封闭词表替换。
+
+    N2：词表匹配只对原文做，且落进删除区间的命中由删除优先。若删除段把
+    两侧文本拼成一个词表 token（例如 ``is_（…）st`` → ``is_st``），这个拼接
+    产物不在原文里，因而不会触发替换 —— 避免「不含 token 的告警」被二次替换。
+    词表是封闭集合：不在词表内的内部字段名一律不替换（只允许整段删除）。
+    """
+    merged = _merge_spans(deletions)
+    operations: List[tuple] = [
+        (start, end, "") for start, end in merged]
+
+    span_index = 0
+    for match in _COMPACT_GLOSSARY_RE.finditer(original):
+        start, end = match.span()
+        while span_index < len(merged) and merged[span_index][1] <= start:
+            span_index += 1
+        if span_index < len(merged) and merged[span_index][0] < end:
+            continue  # 命中落在删除区间内：删除优先，不参与替换。
+        operations.append((start, end, COMPACT_GLOSSARY[match.group(1)]))
+
+    operations.sort(key=lambda item: item[0])
     pieces: List[str] = []
     cursor = 0
-    for match in _COMPACT_GLOSSARY_RE.finditer(text):
-        start, end = match.span()
-        label = COMPACT_GLOSSARY[match.group(1)]
-        start = max(start, cursor)
-        gap = text[cursor:start]
-        # 前接缝：已输出内容的末字符是中文，且标签以中文开头 → 吃掉一个空格。
-        if gap.endswith(" ") and _is_cjk(label[0]):
-            before = gap[:-1]
-            prev_char = before[-1] if before else (
-                pieces[-1][-1] if pieces and pieces[-1] else "")
-            if prev_char and _is_cjk(prev_char):
-                gap = before
-        # 后接缝：标签以中文结尾，且原文空格之后仍是中文 → 吃掉一个空格。
-        if (end < len(text) and text[end] == " " and _is_cjk(label[-1])
-                and end + 1 < len(text) and _is_cjk(text[end + 1])):
-            end += 1
-        pieces.append(gap)
-        pieces.append(label)
+    for start, end, replacement in operations:
+        if start < cursor:  # 区间已被合并/覆盖，跳过。
+            continue
+        pieces.append(original[cursor:start])
+        pieces.append(replacement)
         cursor = end
-    pieces.append(text[cursor:])
-    return "".join(pieces)
+    pieces.append(original[cursor:])
+    return _normalize_compact_spaces("".join(pieces).strip())
 
 
 def _compact_warning(text: str) -> str:
@@ -414,9 +429,10 @@ def _compact_warning(text: str) -> str:
 
     删除只允许三类：URL、堆栈/回溯段、配对完整的内部引用括号。不改写措辞、
     不截断句子、不删斜杠枚举中的单项、不做单侧去括号；括号不配对时不删。
-    删除后若括号失衡，整条退回原文。删除后再按 :data:`COMPACT_GLOSSARY`
-    做固定词表替换（词边界匹配、必要时吸收中文间的空格）；词表之外的内部
-    引用仍只允许整段删除。返回空字符串表示整条都是内部细节，调用方应丢弃该行。
+    删除后若括号失衡，整条退回原文。替换与删除在**原文位置**上一次完成：
+    删除拼接出的 token 不会被再次替换（N2）。输出折叠连续空格并吸收中文
+    夹空格（N1）；词表之外的内部引用仍只允许整段删除。返回空字符串表示
+    整条都是内部细节，调用方应丢弃该行。
     """
     original = text
     deletions: List[tuple] = []
@@ -437,7 +453,7 @@ def _compact_warning(text: str) -> str:
     text = _apply_deletions(original, deletions).strip()
     if not _parens_balanced(text):
         return original.strip()
-    return _replace_compact_fields(text)
+    return _apply_compact_edits(original, deletions)
 
 
 def _horizon_value(rec: Dict[str, Any]) -> Optional[int]:
