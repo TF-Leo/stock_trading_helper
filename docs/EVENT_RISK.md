@@ -102,6 +102,15 @@ additive 字段。
 重复行 d）`。重复行按「解析后的完整事件对象」去重。CLI 会把这些 warning
 转成 `diagnostics.warnings`，因此库外的行**不会**被当成该标的的事件。
 
+**可选日期缺失不丢行**：`START_DATE`、`END_DATE`（增减持）与 `REPORT_DATE`
+（预告）不是窗口判定所必需，缺失或不可解析时**保留该行**、字段置 `null`，
+并单独计数成一条 warning
+`可选日期缺失 N 处（START_DATE a、END_DATE b、REPORT_DATE c），已保留该行并置 null`。
+实测东财增减持存在 `START_DATE=None` 的合法行（员工持股计划尚未开始），
+严格解析会让整只票的「股东增减持」子项失败。窗口判定所必需的
+`FREE_DATE` / `NOTICE_DATE` / `TRADE_DATE` 以及代码仍按上表校验，缺失时
+丢弃该行并计入 warning。
+
 > 选「丢弃 + 告警」而不是整批报错：东财偶尔回混合页，整批抛错会让一个子项
 > 全天不可用；而把别的标的的行入库是**更坏**的错误。两者都不接受，但丢弃
 > 能把影响限制在坏行本身，且 warning 让运维可见。
@@ -194,9 +203,10 @@ warning `未知 PREDICT_TYPE：…（未按负面类型处理，请核对上游�
 - 所有东财请求走 `em_get()`（≥1s、会话复用）。
 - 预计算侧再加一层「相邻请求（含重试）≥ `--interval`」节流，默认 1.0s，
   不得 <1.0。两层时间戳都取「上一次请求返回之后」，不会叠加成 2s。
-- 默认每票 4 请求 + **每轮 4 个对照探针**：`10 只 × 4 + 4 = 44`。串行下限
-  `(44-1)×1.0 = 43s`；含网络时延接近 44s。探针与票池大小无关，4 次实测
-  （本机，公开代码）见下。
+- 默认每票 4 请求 + **每轮 4 个对照探针**：`14 只 × 4 + 4 = 60`。串行下限
+  `(60-1)×1.0 = 59s`；2026-11-14 本机实测默认票池 60 请求
+  `wall=64.83s`（`--retries 0`，56 个子项成功 / 0 失败）。探针与票池大小无关，
+  4 次实测（本机，公开代码）见下。
 - `python tools/precompute_events.py --estimate` 不触网，直接打印估算（已含
   4 个探针）。
 - `python tools/precompute_events.py --probes-only` 只跑 4 个探针、不写缓存，
@@ -255,11 +265,17 @@ cron 命令（路径按部署机调整；实际接线由运维/Hermes 安排，�
 `~/.hermes/`）：
 
 ```cron
-# 周一至周五 18:35 跑事件风险预计算；串行 ~44s（10 只）+ 重试余量
-35 18 * * 1-5 cd /path/to/stock_trading_helper && \
-  /usr/bin/python3 tools/precompute_events.py \
-  >> logs/precompute_events.log 2>&1
+# 周一至周五 18:35 跑事件风险预计算；串行 ~60s（14 只 / 60 请求）+ 重试余量
+35 18 * * 1-5 cd /path/to/stock_trading_helper && mkdir -p logs && /path/to/stock_trading_helper/source/.venv/bin/python tools/precompute_events.py >> logs/precompute_events.log 2>&1
 ```
+
+- crontab 每条命令必须写成**单行**：`\` 续行不被支持（`/bin/sh` 会把反斜杠
+  和换行原样传给 shell，行为不可预期）。
+- 首次部署先建日志目录：`mkdir -p logs`（已并入上面的 cron 命令，重复执行
+  无副作用）。
+- 解释器用仓库 venv 的**绝对路径**（`source/.venv/bin/python`），不用
+  `/usr/bin/python3`：系统 Python 缺 `requests` 等依赖，任务会静默失败。
+  路径按部署机调整。
 
 - 遇法定节假日可照跑（东财返回上一交易日数据），但**不要**在 09:00–15:00
   之间跑：既挤盘前，又拿到未收盘数据。
@@ -282,10 +298,10 @@ cron 命令（路径按部署机调整；实际接线由运维/Hermes 安排，�
 ```
 cd source
 /home/samc/.venv/bin/python -m pytest tests/test_events_context.py -q
-# 63 passed
+# 69 passed
 
 /home/samc/.venv/bin/python -m pytest tests/ -q
-# 924 passed, 1 failed
+# 930 passed, 1 failed
 # 唯一失败 test_probe_requirements.py::test_current_environment_passes_via_probe
 # 是基线就存在的解释器版本不符（缺口盘点 U7），与本改动无关。
 ```
@@ -294,6 +310,9 @@ cd source
 
 - P2-1：他票行 / 窗口外行 / 重复行（解禁、增减持、预告、质押）逐类丢弃
   + warning；端到端断言坏行不入缓存且 CLI notes 可见。
+- P2（本轮新增）：`START_DATE=None`、`END_DATE=None`、两者均 `None` 三种行
+  → 子项整体不失败、行保留且字段为 `null`、其他行不受影响；关键日期
+  （`NOTICE_DATE=None`）仍只丢该行；预告 `REPORT_DATE=None` 同规则。
 - P2-2：探针 0 行 / 探针抛错 → `interface_suspected`；探针正常 + 票池空 →
   `available=true, items=[]`（真空）；上一轮有数据 → `empty_pool_suspected`。
 - P3：北交所 `not_supported` 渲染「未覆盖」；缓存未生成渲染「未生成」；
@@ -304,6 +323,17 @@ cd source
 ```
 python tools/precompute_events.py --probes-only --interval 1.0
 # probe_requests=4 suspected=- wall=3.86s
+
+# 2026-11-14 复验：300476 的增减持存在 START_DATE=None 的员工持股计划行
+# 修复前：FAILED EventsFetchError: START_DATE 不是 YYYY-MM-DD：None（整子项失败）
+# 修复后：OK 1 条，start_date=null，warnings=可选日期缺失 1 处
+python tools/precompute_events.py 300476 \
+  --out-dir /tmp/events_300476 --interval 1.0 --retries 0
+# requests=8 (probe=4) ok_sections=4 failed_sections=0 wall=8.82s
+
+python tools/precompute_events.py --out-dir /tmp/events_full \
+  --interval 1.0 --retries 0
+# requests=60 (probe=4) ok_sections=56 failed_sections=0 wall=64.83s
 
 python tools/precompute_events.py 600000 002475 300750 \
   --out-dir /tmp/events_verify2 --interval 1.0 --retries 0

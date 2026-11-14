@@ -840,6 +840,65 @@ def test_holder_trades_drops_foreign_out_of_window_and_duplicate_rows(monkeypatc
     assert "窗口外行 1" in text and "重复行 1" in text
 
 
+def _holder_row(code="600519", notice="2026-11-10", holder="示例股东",
+                direction="减持", shares=-100.0, start="2026-11-05",
+                end="2026-11-09"):
+    return {"SECURITY_CODE": code, "NOTICE_DATE": notice,
+            "HOLDER_NAME": holder, "DIRECTION": direction,
+            "CHANGE_NUM_SYMBOL": shares, "AFTER_CHANGE_RATE": 0.2,
+            "CHANGE_FREE_RATIO": 0.3, "TRADE_AVERAGE_PRICE": 10.0,
+            "MARKET": "二级市场", "START_DATE": start, "END_DATE": end}
+
+
+@pytest.mark.parametrize("start,end,needle", [
+    (None, "2026-11-09", "START_DATE 1"),
+    ("2026-11-05", None, "END_DATE 1"),
+    (None, None, "START_DATE 1、END_DATE 1"),
+])
+def test_holder_trades_keeps_rows_with_missing_optional_dates(
+        monkeypatch, start, end, needle):
+    """P2：``START_DATE=None`` 是合法行，不得让整只票的增减持子项失败。"""
+    _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 1, "data": [
+        _holder_row(holder="空日期股东", start=start, end=end),
+        _holder_row(holder="完整日期股东"),
+    ]}})
+    result = pe.fetch_holder_trades("600519", REF_DAY)
+    assert {item["holder"] for item in result} == {"空日期股东", "完整日期股东"}
+    null_row = next(item for item in result if item["holder"] == "空日期股东")
+    if start is None:
+        assert null_row["start_date"] is None
+    if end is None:
+        assert null_row["end_date"] is None
+    text = " ".join(result.warnings)
+    assert "可选日期缺失" in text and needle in text
+    assert "保留该行并置 null" in text
+
+
+def test_holder_trades_missing_notice_date_drops_only_that_row(monkeypatch):
+    """窗口判定所必需的关键日期缺失 → 只丢该行，好行照常入库。"""
+    _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 1, "data": [
+        _holder_row(notice=None),
+        _holder_row(notice="2026-11-11", holder="好行股东"),
+    ]}})
+    result = pe.fetch_holder_trades("600519", REF_DAY)
+    assert [item["holder"] for item in result] == ["好行股东"]
+    text = " ".join(result.warnings)
+    assert "丢弃 1 行" in text and "日期不可解析 1" in text
+
+
+def test_forecast_keeps_row_with_missing_report_date(monkeypatch):
+    """其他可选日期（REPORT_DATE）同规则：置 null、保留行、计数告警。"""
+    _patch_datacenter(monkeypatch, {"code": 0, "result": {"pages": 1, "data": [{
+        "SECURITY_CODE": "600519", "NOTICE_DATE": "2026-11-10",
+        "REPORT_DATE": None, "PREDICT_FINANCE": "归属于上市公司股东的净利润",
+        "PREDICT_TYPE": "预减", "PREDICT_AMT_LOWER": -1e8,
+        "PREDICT_AMT_UPPER": -0.8e8, "ADD_AMP_LOWER": -50, "ADD_AMP_UPPER": -30,
+    }]}})
+    result = pe.fetch_forecast("600519", REF_DAY)
+    assert len(result) == 1 and result[0]["report_date"] is None
+    assert "可选日期缺失 1 处（REPORT_DATE 1）" in " ".join(result.warnings)
+
+
 def test_forecast_drops_foreign_rows_and_warns_unknown_type(monkeypatch):
     def row(code, notice, ptype):
         return {"SECURITY_CODE": code, "NOTICE_DATE": notice,
@@ -896,6 +955,27 @@ def test_precompute_keeps_bad_rows_out_of_cache_and_warns(monkeypatch, tmp_path)
                                       events_dir=str(tmp_path), now=NOW)
     assert any("丢弃 3 行" in note for note in notes)
     assert len(block["lockup"]["items"]) == 1
+
+
+def test_precompute_keeps_row_with_missing_optional_date(monkeypatch, tmp_path):
+    """端到端：``START_DATE=None`` 的行保留，holder_trades 子项整体不失败。"""
+    def fake_datacenter(report, filter_str="", **kwargs):
+        if report == "RPT_SHARE_HOLDER_INCREASE":
+            return [_holder_row(holder="空日期股东", start=None),
+                    _holder_row(holder="完整日期股东")]
+        return []
+
+    monkeypatch.setattr(pe, "_datacenter", fake_datacenter)
+    stats = pe.precompute(["600519"], out_dir=str(tmp_path),
+                          fetchers=pe.FETCHERS, probes=_fake_probes(),
+                          sleep_fn=lambda _s: None, now_fn=_Clock().now)
+    assert stats["failed_sections"] == 0
+    payload = json.loads(Path(str(tmp_path), "events.json").read_text(encoding="utf-8"))
+    section = payload["600519"]["holder_trades"]
+    assert section["available"] is True
+    assert {item["holder"] for item in section["items"]} == {
+        "空日期股东", "完整日期股东"}
+    assert any("可选日期缺失" in warning for warning in section["warnings"])
 
 
 # ===========================================================================

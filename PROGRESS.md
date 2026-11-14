@@ -41,6 +41,40 @@
     写进 README）。
 - **跳过项**：无。
 
+## 2026-11-14 · PR #101 最后一轮：1×P2（可选日期）+ 2×P3（文档）
+
+- **基线**：`origin/task/event-risk` = `90d24c2`；工作区
+  `fix-pr101-2`，未合并。
+- **P2 真实数据崩溃（已修）**：东财增减持 `RPT_SHARE_HOLDER_INCREASE` 存在
+  `START_DATE=None` 的合法行（员工持股计划尚未开始）。修前整只票的
+  `holder_trades` 子项抛 `EventsFetchError: START_DATE 不是 YYYY-MM-DD：None`。
+  修法：新增 `_optional_day()`，`START_DATE` / `END_DATE` / 预告 `REPORT_DATE`
+  缺失或不可解析时**保留该行**、字段置 `null`，并在子项 warnings 计数
+  `可选日期缺失 N 处（…），已保留该行并置 null`；窗口判定所必需的
+  `FREE_DATE` / `NOTICE_DATE` / `TRADE_DATE` 与代码仍丢弃坏行并告警。
+- **真机复验（公开代码，非持仓）**：全 14 只默认票池逐票扫描，唯一命中
+  `300476` 的 1 行员工持股计划（`START_DATE=None`，`END_DATE=2026-10-30`）。
+  - 修前（`90d24c2` 原文件，真实端点）：`FAILED EventsFetchError:
+    START_DATE 不是 YYYY-MM-DD：None`。
+  - 修后：`fetch_holder_trades("300476")` → `OK 1 条`，`start_date=null`；
+    端到端 `precompute 300476` → `requests=8 ok_sections=4 failed=0 wall=8.82s`；
+    缓存 `holder_trades.available=true, items=1` + 上述 warning。
+  - 默认 14 只全量：`requests=60 ok_sections=56 failed_sections=0 wall=64.83s`。
+- **P3 文档**：
+  - `docs/EVENT_RISK.md` §7 cron 改为**单行**（crontab 不支持 `\` 续行），
+    加 `mkdir -p logs`，解释器改仓库 venv 绝对路径
+    `/path/to/stock_trading_helper/source/.venv/bin/python`；票池/请求改为
+    实测 `14 只 / 60 请求`（§5 同步，实测 wall=64.83s）。
+  - `README.md`：`600000,000001` 位置参数实测报
+    `代码无法解析：'600000,000001'`（EXIT=1），改为
+    `--codes 600000,000001 --json`，实测 `EXIT=0, requests=12,
+    ok_sections=8, failed_sections=0`。
+  - 测试数量：`test_events_context` **69 passed**；全量 **930 passed,
+    1 failed**（唯一失败仍是基线既存的 `test_probe_requirements` 解释器
+    版本断言）。
+- **约束**：未改 `source/decision/*`；盘前仍零联网（本次真机请求只在预计算
+  侧）；未引入依赖；隐私口径不变（只用公开代码）。
+
 ## 2026-11-14 · PR #101 复验修复（2×P2 + 5×P3）
 
 - **基线**：`origin/task/event-risk` = `3e23874`（PR 头），Hermes 复验结论

@@ -658,9 +658,9 @@ a-stock-data v3.10.4 §3.6、§14.1、§14.3、§14.5（东财 `datacenter-web`�
 **只在收盘后预计算，盘前零联网**：
 
 ```bash
-# 18:30–18:50 时段；默认 14 只自选，10 只 × 4 端点 + 4 探针 = 44 请求，串行 ≥43s
+# 18:30–18:50 时段；默认 14 只自选，14 只 × 4 端点 + 4 探针 = 60 请求，串行 ≥59s
 python tools/precompute_events.py
-python tools/precompute_events.py 600000,000001 --json
+python tools/precompute_events.py --codes 600000,000001 --json
 python tools/precompute_events.py --estimate        # 不触网，只算串行耗时
 python tools/precompute_events.py --probes-only     # 4 个对照探针，~4s，不写缓存
 
@@ -1128,7 +1128,7 @@ ERROR 预热失败：
 ### 冷克隆自检（**不需要网络**）
 
 ```bash
-cd source && python -m pytest tests/ -q     # 无缓存也必须是 47 passed
+cd source && python -m pytest tests/ -q     # 无缓存实测 930 passed, 1 failed（唯一失败为环境版本断言）
 ```
 
 测试**不依赖** `stock_analysis/data/*.csv`（只用合成序列）。若在空缓存下出现

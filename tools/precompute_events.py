@@ -4,8 +4,8 @@
 
 为什么必须预计算
 ----------------
-东财 ``datacenter-web`` 与 ``push2`` 同属东财风控面（IP 级封禁史）。10 只标的
-× 4 个端点 + 4 个对照探针 = 44 次请求，串行 ≥1s 即 ≥43s，**绝不可**放进
+东财 ``datacenter-web`` 与 ``push2`` 同属东财风控面（IP 级封禁史）。14 只标的
+× 4 个端点 + 4 个对照探针 = 60 次请求，串行 ≥1s 即 ≥59s，**绝不可**放进
 09:15 盘前窗口。本工具只在收盘后（18:30–18:50 时段）运行一次，把结果落到
 
     source/stock_analysis/data/state/events/events.json   （``data/`` 已 gitignore）
@@ -137,10 +137,15 @@ class _RowCheck:
 
     def __init__(self):
         self.counts = {}
+        self.nulls = {}
         self.seen = set()
 
     def reject(self, reason: str) -> None:
         self.counts[reason] = self.counts.get(reason, 0) + 1
+
+    def null(self, field: str) -> None:
+        """可选字段缺失/不可解析：该行**保留**，只把字段置 null 并计数。"""
+        self.nulls[field] = self.nulls.get(field, 0) + 1
 
     def duplicate(self, key: str) -> bool:
         if key in self.seen:
@@ -150,12 +155,19 @@ class _RowCheck:
         return False
 
     def warnings(self):
-        if not self.counts:
-            return []
-        total = sum(self.counts.values())
-        detail = "、".join(f"{_DROP_LABELS[key]} {value}"
-                          for key, value in self.counts.items() if value)
-        return [f"丢弃 {total} 行（{detail}）"]
+        warnings = []
+        if self.counts:
+            total = sum(self.counts.values())
+            detail = "、".join(f"{_DROP_LABELS[key]} {value}"
+                              for key, value in self.counts.items() if value)
+            warnings.append(f"丢弃 {total} 行（{detail}）")
+        if self.nulls:
+            total = sum(self.nulls.values())
+            detail = "、".join(f"{field} {value}"
+                              for field, value in self.nulls.items() if value)
+            warnings.append(f"可选日期缺失 {total} 处（{detail}），"
+                            "已保留该行并置 null")
+        return warnings
 
 
 def _row_key(item: dict) -> str:
@@ -228,6 +240,20 @@ def _day(value, field: str) -> str:
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         raise EventsFetchError(f"{field} 不是 YYYY-MM-DD：{value!r}")
     return text
+
+
+def _optional_day(value, field: str, check: _RowCheck) -> Optional[str]:
+    """可选日期字段 → ``YYYY-MM-DD`` / None（缺失或不可解析都不丢行）。
+
+    实测东财增减持报表存在 ``START_DATE=None`` 的合法行（如员工持股计划
+    尚未开始），严格 ``_day()`` 会让整只票的「股东增减持」子项失败。可选
+    日期缺失时保留该行、字段置 null，并在子项 warnings 里计数。
+    """
+    try:
+        return _day(value, field)
+    except EventsFetchError:
+        check.null(field)
+        return None
 
 
 def _shift(day: str, days: int) -> str:
@@ -415,8 +441,8 @@ def fetch_holder_trades(code: str, as_of: str):
             "change_pct_float": _num(row.get("CHANGE_FREE_RATIO"), "CHANGE_FREE_RATIO"),
             "avg_price": _num(row.get("TRADE_AVERAGE_PRICE"), "TRADE_AVERAGE_PRICE"),
             "channel": str(row.get("MARKET") or "").strip(),
-            "start_date": _day(row.get("START_DATE"), "START_DATE"),
-            "end_date": _day(row.get("END_DATE"), "END_DATE"),
+            "start_date": _optional_day(row.get("START_DATE"), "START_DATE", check),
+            "end_date": _optional_day(row.get("END_DATE"), "END_DATE", check),
         }
         if check.duplicate(_row_key(item)):
             continue
@@ -457,7 +483,8 @@ def fetch_forecast(code: str, as_of: str):
             unknown_types.add(forecast_type)
         item = {
             "notice_date": notice,
-            "report_date": _day(row.get("REPORT_DATE"), "REPORT_DATE"),
+            "report_date": _optional_day(
+                row.get("REPORT_DATE"), "REPORT_DATE", check),
             "indicator": str(row.get("PREDICT_FINANCE") or "").strip(),
             "forecast_type": forecast_type,
             "amount_lower": _num(row.get("PREDICT_AMT_LOWER"), "PREDICT_AMT_LOWER"),
