@@ -975,6 +975,8 @@ def test_cli_json_structure_golden(cli_response):
         "evidence.flow": sorted(cli_response["evidence"]["flow"]),
         "evidence.valuation": sorted(cli_response["evidence"]["valuation"]),
         "evidence.market_watch": sorted(cli_response["evidence"]["market_watch"]),
+        # T7 additive：事件风险块（错误/成功路径键同构）
+        "evidence.events": sorted(cli_response["evidence"]["events"]),
         "diagnostics": sorted(cli_response["diagnostics"]),
     }
     assert actual == golden, "cli.py --json 的键结构被改动；渲染层不得改变既有 JSON"

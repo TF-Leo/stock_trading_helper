@@ -38,6 +38,9 @@ def _astock_offline(monkeypatch, tmp_path):
     # 状态目录指向临时目录，避免用例写进开发者本机的 market_watch.json 缓存。
     monkeypatch.setenv("ASTOCK_MARKET_WATCH_OFFLINE", "1")
     monkeypatch.setenv("MARKET_WATCH_STATE_DIR", str(tmp_path / "market_watch_state"))
+    # T7（issue #1）：事件风险缓存默认指向临时目录，避免用例读/写开发者本机
+    # 的 events.json，也避免本机缓存改变测试结果。
+    monkeypatch.setenv("EVENTS_STATE_DIR", str(tmp_path / "events_state"))
     try:
         from stock_analysis.data_sources import astock, _astock_generated
         from stock_analysis.data_sources import market_watch
