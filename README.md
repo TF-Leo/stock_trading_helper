@@ -677,7 +677,7 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 | 资金面 | `flow.{available,source,caliber,net_5d,net_20d,as_of,main_net_5d,main_net_20d}` |
 | 估值 | `valuation.{available,pe_percentile_3y,pb_percentile_3y,ps_percentile_3y,as_of}` |
 | 市况 | `market_regime.{label,confidence}` / `index_regime.{label,confidence}` |
-| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` `instrument_type` `price_source` `price_caliber` `instrument_basis` |
+| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` `instrument_type` `price_source` `price_caliber` `instrument_basis` `basis_uncertain` |
 | 结算 | `settled.{ret_20d,hit,settle_date,entry_date,entry_open,exit_open,horizon_days,price_source}` 或 `null` + `settle_reason`，外加 `settle_status` |
 
 结算口径：`open_{d+1+20} / open_{d+1} − 1`。**个股与场内 ETF** 用前复权开盘价
@@ -699,8 +699,30 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 `instrument_type` 在**记录时**判定，依据是数据文件类型 + 代码段静态信息
 （判定依据写进 `instrument_basis`），**不取 CLI 的 `request.type`** —— 那是取数
 通道，`auto` 失败会回落到另一侧，按它结算会把个股/ETF 永久钉在错误口径上。
-记录里指定的文件缺失、损坏、为空或没有 `open` 列时，直接 `no_price_data`
-（`failed`），**不会滑到另一个口径的缓存**。
+**口径记录时确定、结算时不再更改**：`instrument_basis` 的固定措辞就是
+「口径已确认：记录时确定，结算时不再更改」。记录里指定的文件缺失、损坏、为空
+或没有 `open` 列时，直接 `no_price_data`（`failed`），**不会滑到另一个口径的缓存**。
+
+#### 口径未确认与一次重判（issue #99）
+
+记录当日**没有任何可用缓存**（`stock_*_qfq.csv` 与 `fund_*.csv` 都不存在）、
+`fund_*.csv` 读不出、或只有未复权交易所 OHLC 因而无法确定 qfq 口径时，口径
+只能按代码段静态兜底。这类记录写 `basis_uncertain=true`，并在 `instrument_basis`
+里写明「口径未确认：首次结算成功前允许一次重判」。
+
+重判规则（`settle_all()` 执行，返回的 `rejudged` 列出本次重判的 code）：
+
+- **只在首次结算成功前**发生（`settled` 仍为 `null`），且**只允许
+  uncertain → 确认**：缓存出现且能确定口径时，四个口径字段改成确认值、
+  `basis_uncertain` 置 `false`，`instrument_basis` 前缀「首次结算前重判：」；
+- 仍无法确认（缓存仍是未复权 OHLC）→ 记录原样保留，下次结算再试；
+- **已确认记录永不重判**（`basis_uncertain=false`），**已结算记录永不重判**
+  （`settled` 非 null），引入该字段之前的老记录（缺键）同样不重判 ——
+  反向改动已确认口径正是这条规则要防的事。
+
+例：记录当日无缓存（按代码段判 stock/qfq，`basis_uncertain=true`）→ 之后
+`fund_*.csv` 净值到位 → 首次 `evaluate` 重判为 `fund` / `fund_nav` /
+`nav_to_nav` 并正常结算，`ret_20d` 来自净值序列。
 
 老记录没有 `price_source` 时按 brief 默认 **stock/qfq**；只有当 `fund_*.csv`
 存在、内容确认为**单位净值**（`open == close`、无交易所 `amount`/`postVol` 列）
@@ -724,7 +746,7 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 
 `report` 给出：已到期条数、方向命中率、按 `confidence` 分箱的校准（含 Brier）、
 按 `action` / `price.caliber` / `price.source` / `flow.caliber` / `flow.available` /
-`valuation.pb` 分位的分层命中率 ——
+`valuation.pb` 分位的分层命中率，以及口径未确认（`basis_uncertain`）的条数 ——
 供 `docs/P1_EVIDENCE_PLAN.md` §3.6.3 的 C 路径（Brier 改善 ≥0.02，需 ≥200 条已到期记录）使用。
 `confidence` 在这里的操作性定义是「该方向判断正确的概率」。
 

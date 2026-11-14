@@ -392,8 +392,16 @@ def test_settle_all_skips_not_matured(ledger_tmp):
 # 基金结算（issue #95 / PR #96 复验）
 #
 # 基金净值不在 ``stock_*_qfq.csv``，而在 ``fund_*.csv``。夹具
-# ``tests/fixtures/fund/fund_999901.csv`` 是**真实公开 ETF 日线**的 140 个交易日
-# 切片，代码已匿名化为 999901 —— 仓库里不出现任何真实基金/持仓代码。
+# ``tests/fixtures/fund/fund_999901.csv`` 是一段**匿名化**的场内 ETF 日线切片：
+# 140 个交易日（2026-04-17 ~ 2026-11-12），列集合与 ``get_fund_daily`` 的
+# 交易所路径一致（``date,open,high,low,close,volume,amount,postVol,postAmt``）。
+#
+# 匿名化范围：文件本身**没有代码列**，文件名里的 ``999901`` 是虚构代码，仓库
+# 与测试里不出现真实标的代码。**数值保留原样**（公开行情），所以「它是 ETF
+# 形态」这条断言可以独立复核 —— ``open != close``、带 ``amount``/``postVol``、
+# ``amount ≈ volume × close``；夹具不含任何持仓、成本、股数或权重信息。
+# 形态与来源说明的一致性由 ``test_fund_fixture_shape_matches_its_documented_
+# provenance`` 逐项核对，说明一旦与文件脱节该用例即红。
 #
 # ⚠️ 它带 ``amount``/``postVol`` 且 ``open != close``，是**场内交易所 OHLC**，
 # 不是场外净值（复验 P2-3）。所以它只用来验证「按来源选文件」这一层；场外
@@ -409,10 +417,32 @@ def _fund_fixture_frame():
     return frame.sort_index()
 
 
+def test_fund_fixture_shape_matches_its_documented_provenance():
+    """夹具的来源说明必须与文件实际形态一致（issue #99 P3）。
+
+    说明里写着「交易所 OHLC 切片、140 个交易日、带 ``amount``/``postVol``」，
+    这里逐项核对 —— 来源描述一旦与文件脱节，下一个人就没法判断这个夹具到底
+    在验证哪条路径。
+    """
+    frame = _fund_fixture_frame()
+    assert len(frame) == 140
+    assert str(frame.index[0].date()) == "2026-04-17"
+    assert str(frame.index[-1].date()) == "2026-11-12"
+    assert {"open", "high", "low", "close", "volume", "amount",
+            "postVol", "postAmt"} <= set(frame.columns)
+    # 交易所 OHLC：开盘 ≠ 收盘，且成交额量级与「成交量 × 收盘价」同阶
+    assert bool((frame["open"] - frame["close"]).abs().gt(1e-9).any())
+    implied = (frame["amount"] / (frame["volume"] * frame["close"])).dropna()
+    assert implied.between(0.95, 1.05).all()
+    # 匿名化：文件名与测试里的代码一致，且不对应任何真实标的代码段
+    assert FUND_FIXTURE.name == f"fund_{FUND_CODE}.csv"
+    assert FUND_CODE == "999901"
+
+
 def test_fund_file_kind_distinguishes_etf_ohlc_from_nav(tmp_path):
     """``fund_*.csv`` 的内容决定它是不是净值（复验 P1-3 / P2-3）。
 
-    真实公开 ETF 日线夹具（``open != close``、带 ``amount``/``postVol``）必须
+    匿名化 ETF 日线夹具（``open != close``、带 ``amount``/``postVol``）必须
     被判成 ``etf``；``open == close`` 的净值形态必须被判成 ``fund``。两者都写
     在 ``fund_*.csv`` 里，只看文件名无法区分 —— 这正是原实现把 ETF 标成
     ``fund_nav`` 的原因。
@@ -720,6 +750,284 @@ def test_settle_fund_missing_price_is_failed(ledger_tmp, tmp_path, monkeypatch):
     assert record["settle_status"] == "failed"
 
 
+# ---------------------------------------------------------------------------
+# 口径未确认 → 首次结算前一次重判（issue #99）
+#
+# 设计风险：记录当日**没有任何可用缓存**时，口径只能按代码段静态兜底
+# （个股/ETF 钉在 stock/qfq）。如果这只票其实是场外基金，此后即使缓存出现
+# 也只会 no_price_data，永远结算不了。对策：
+#   * 记录时写 ``basis_uncertain=true`` 并在 ``instrument_basis`` 说明；
+#   * 首次结算成功前允许**一次**重判，且**只能 uncertain → 确认**；
+#   * 已确认 / 已结算记录的口径永不改。
+# ---------------------------------------------------------------------------
+def test_record_without_any_cache_marks_basis_uncertain(ledger_tmp, tmp_path,
+                                                        monkeypatch):
+    """记录时无任何缓存 → ``basis_uncertain=true``，reason 写明口径未确认。"""
+    empty_dir = tmp_path / "no_cache"
+    empty_dir.mkdir()
+    monkeypatch.setattr(fl, "DATA_DIR", str(empty_dir))
+
+    fl.record_day([FUND_CODE], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code=FUND_CODE, as_of="2026-11-02")))
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"][FUND_CODE]
+    assert record["basis_uncertain"] is True
+    assert record["price_source"] == "local_qfq_cache"  # 代码段静态兜底
+    assert "记录时无可用缓存" in record["instrument_basis"]
+    assert "口径未确认" in record["instrument_basis"]
+    assert "重判" in record["instrument_basis"]
+    # 已确认记录的状态由下面的用例覆盖；这里确认字段是显式的 bool，不是 None
+    assert record["settled"] is None and record["settle_status"] is None
+
+
+def test_record_with_qfq_cache_is_confirmed_not_uncertain(ledger_tmp, tmp_path,
+                                                           monkeypatch):
+    """有 ``stock_*_qfq.csv`` → 口径已确认，``basis_uncertain=false``。"""
+    data_dir = tmp_path / "qfq_data"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(as_of="2026-11-02")))
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["basis_uncertain"] is False
+    assert "口径已确认" in record["instrument_basis"]
+    assert "结算时不再更改" in record["instrument_basis"]
+
+
+def test_uncertain_record_rejudged_to_fund_when_nav_appears(ledger_tmp, tmp_path,
+                                                             monkeypatch):
+    """无缓存记录 → 后来出现基金净值 → 首次结算前重判为 fund 并正确结算。
+
+    issue #99 的核心用例：记录当日什么都没有，之后 ``fund_*.csv``（净值形态）
+    到位。旧实现会永远按 stock/qfq 找 ``stock_*_qfq.csv`` → 永远
+    ``no_price_data``；现在首次结算前重判一次，按净值结算。
+    """
+    empty_dir = tmp_path / "empty_at_record"
+    empty_dir.mkdir()
+    monkeypatch.setattr(fl, "DATA_DIR", str(empty_dir))
+
+    fl.record_day([FUND_CODE], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code=FUND_CODE, as_of="2026-11-02")))
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"][FUND_CODE]
+    assert record["basis_uncertain"] is True
+    assert record["price_source"] == "local_qfq_cache"
+
+    # 记录之后净值缓存才到（与 test_settle_fund_record_success 同一组手算数据）
+    data_dir = tmp_path / "nav_later"
+    days = _bdays(date(2026, 12, 1), 29)
+    navs = [1.0] * 8 + [1.0250] + [1.01] * 19 + [0.9745]
+    _write_nav(data_dir, FUND_CODE, days, navs)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    assert stats["rejudged"] == [FUND_CODE]
+    assert stats["settled"] == 1 and stats["failed"] == 0
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"][FUND_CODE]
+    assert record["basis_uncertain"] is False
+    assert record["instrument_type"] == "fund"
+    assert record["price_source"] == "fund_nav"
+    assert record["price_caliber"] == "nav_to_nav"
+    assert "重判" in record["instrument_basis"]
+    settled = record["settled"]
+    assert settled["price_source"] == "fund_nav"
+    assert settled["ret_20d"] == pytest.approx(round(0.9745 / 1.0250 - 1, 6))
+
+    # 再跑一次：不再重判（已确认），数值不变（幂等）
+    again = fl.settle_all(ledger_dir=ledger_tmp)
+    assert again["rejudged"] == []
+    assert again["settled"] == 1
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"][FUND_CODE]
+    assert record["settled"] == settled
+
+
+def test_uncertain_record_stays_uncertain_until_cache_is_conclusive(ledger_tmp,
+                                                                    tmp_path,
+                                                                    monkeypatch):
+    """重判只接受**确认**结果：缓存仍是未复权交易所 OHLC 时保持未确认。"""
+    empty_dir = tmp_path / "empty_at_record"
+    empty_dir.mkdir()
+    monkeypatch.setattr(fl, "DATA_DIR", str(empty_dir))
+    fl.record_day([FUND_CODE], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code=FUND_CODE, as_of="2026-11-02")))
+
+    # 只出现未复权的交易所行情：口径仍无法确定 → 不重判
+    data_dir = tmp_path / "etf_ohlc_only"
+    data_dir.mkdir()
+    (data_dir / f"fund_{FUND_CODE}.csv").write_text(
+        FUND_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    assert stats["rejudged"] == []
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"][FUND_CODE]
+    assert record["basis_uncertain"] is True
+    assert record["price_source"] == "local_qfq_cache"
+    assert record["settle_status"] == "failed"  # 记录价源没有对应缓存
+
+
+def test_confirmed_record_never_rejudged(ledger_tmp, tmp_path, monkeypatch):
+    """已确认记录**永不改口径**：即使之后缓存变了也不重判。
+
+    个股记录时 ``stock_*_qfq.csv`` 存在（已确认 stock/qfq）。结算前把 qfq
+    缓存删掉、只留净值形态的 ``fund_*.csv`` —— 旧口径不得被改成 fund_nav，
+    结果是 ``no_price_data``（拒绝换源），不是「悄悄换一套口径算出来」。
+    """
+    data_dir = tmp_path / "confirmed_stock"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(as_of="2026-11-02")))
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["basis_uncertain"] is False
+
+    (data_dir / "stock_600519_qfq.csv").unlink()
+    _write_nav(data_dir, "600519", days, opens)
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    assert stats["rejudged"] == []
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["basis_uncertain"] is False
+    assert record["instrument_type"] == "stock"
+    assert record["price_source"] == "local_qfq_cache"
+    assert record["price_caliber"] == "qfq_open_to_open"
+    assert record["settle_reason"] == "no_price_data"
+
+
+def test_settled_record_never_rejudged(ledger_tmp, tmp_path, monkeypatch):
+    """已结算记录的数值与口径都不得被重判改动（issue #99 约束）。
+
+    构造一条**已按净值结算**的记录（人为标上 ``basis_uncertain=true``，模拟
+    历史脏状态），然后放一份 ``stock_*_qfq.csv`` 诱使重判。已结算记录不重判：
+    口径仍是 ``fund_nav``，``settled`` 数值逐项不变。
+    """
+    data_dir = tmp_path / "settled_fund"
+    days = _bdays(date(2026, 12, 1), 29)
+    navs = [1.0] * 8 + [1.0250] + [1.01] * 19 + [0.9745]
+    _write_nav(data_dir, FUND_CODE, days, navs)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    fl.record_day([FUND_CODE], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code=FUND_CODE, as_of="2026-11-02")))
+    fl.settle_all(ledger_dir=ledger_tmp)
+    before = fl.load_day("2026-11-02", ledger_tmp)["records"][FUND_CODE]
+    assert before["settle_status"] == "settled"
+    settled_before = dict(before["settled"])
+
+    # 人为把已结算记录标成未确认，并放一份 qfq 缓存诱使重判
+    payload = fl.load_day("2026-11-02", ledger_tmp)
+    payload["records"][FUND_CODE]["basis_uncertain"] = True
+    fl._atomic_write(fl.day_path("2026-11-02", ledger_tmp), payload)
+    _write_bars(data_dir, FUND_CODE, days, navs)
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    assert stats["rejudged"] == []
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"][FUND_CODE]
+    assert record["basis_uncertain"] is True  # 未确认标记也保持原样
+    assert record["price_source"] == "fund_nav"
+    assert record["price_caliber"] == "nav_to_nav"
+    assert record["settled"] == settled_before
+
+
+def test_basis_wording_says_caliber_is_fixed_at_record_time():
+    """basis 文案与「拒绝换源」语义统一（issue #99 P1）。
+
+    口径的两个状态各只有一句固定措辞，且两句都点明「记录时确定 / 重判」，
+    不再出现「按 brief 默认」「并告警」这类与实现不一致的旧说法。
+    """
+    assert "记录时确定" in fl.BASIS_CONFIRMED_SUFFIX
+    assert "结算时不再更改" in fl.BASIS_CONFIRMED_SUFFIX
+    assert "口径未确认" in fl.BASIS_UNCERTAIN_SUFFIX
+    assert "重判" in fl.BASIS_UNCERTAIN_SUFFIX
+    assert "按 brief" not in fl.BASIS_CONFIRMED_SUFFIX
+    assert "按 brief" not in fl.BASIS_UNCERTAIN_SUFFIX
+
+
+def test_resolve_price_plan_basis_states_caliber_is_fixed(tmp_path, monkeypatch):
+    """``resolve_price_plan`` 的 basis 与记录语义一致：口径结算时不再更改。"""
+    data_dir = tmp_path / "basis_data"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    _inst, source, _caliber, basis = fl.resolve_price_plan(
+        {"code": "600519", "price_source": "local_qfq_cache",
+         "instrument_type": "stock", "price_caliber": "qfq_open_to_open",
+         "basis_uncertain": False})
+    assert source == "local_qfq_cache"
+    assert "记录时确定，结算不再更改" in basis
+    # 老记录（无 price_source）同样标明口径来源
+    _inst, _source, _caliber, legacy_basis = fl.resolve_price_plan(
+        {"code": "600519"})
+    assert "记录时确定，结算不再更改" in legacy_basis
+
+
+def test_legacy_record_without_basis_uncertain_key_is_never_rejudged(
+        ledger_tmp, tmp_path, monkeypatch):
+    """引入 ``basis_uncertain`` 之前的记录不得被重判（迁移约束）。
+
+    这些记录在写下时已按当时的规则确认过口径；缺键若被当成「未确认」，一次
+    ``evaluate`` 就会把历史口径改掉 —— 那正是 issue #99 要防的反向改动。
+    """
+    data_dir = tmp_path / "legacy_no_key"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    _write_settled_day(ledger_tmp, "2026-11-02", {
+        "600519": {"as_of": "2026-11-02", "code": "600519", "action": "buy",
+                   "confidence": 0.5, "instrument_type": "stock",
+                   "price_source": "local_qfq_cache",
+                   "price_caliber": "qfq_open_to_open",
+                   "instrument_basis": "stock_600519_qfq.csv 存在（前复权）",
+                   "settled": None, "settle_reason": None},
+    })
+    # 记录之后 qfq 缓存消失、只剩净值形态的 fund_*.csv：不得借机改成 fund_nav
+    (data_dir / "stock_600519_qfq.csv").unlink()
+    _write_nav(data_dir, "600519", days, opens)
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    assert stats["rejudged"] == []
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert "basis_uncertain" not in record  # 不凭空加键
+    assert record["price_source"] == "local_qfq_cache"
+    assert record["settle_reason"] == "no_price_data"
+
+
+def test_migration_settled_ledger_has_zero_drift(ledger_tmp, tmp_path,
+                                                 monkeypatch):
+    """迁移对比：已有**已结算**台账重算后数值零漂移（issue #99 验收）。
+
+    记录旧实现的结算结果（ret / hit / 日期 / 价格 / 来源），让新实现重算一遍，
+    断言 ``settled`` 整块逐键相等 —— 本次改动只允许新增 ``basis_uncertain``。
+    """
+    data_dir = tmp_path / "migration"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(as_of="2026-11-02")))
+    fl.settle_all(ledger_dir=ledger_tmp)
+    before = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert isinstance(before["settled"], dict)
+
+    # 模拟老台账：抹掉本次新增的字段，再让新实现重算
+    payload = fl.load_day("2026-11-02", ledger_tmp)
+    payload["records"]["600519"].pop("basis_uncertain", None)
+    fl._atomic_write(fl.day_path("2026-11-02", ledger_tmp), payload)
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    after = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert stats["settled"] == 1 and stats["failed"] == 0
+    assert after["settled"] == before["settled"]
+    assert after["settle_reason"] == before["settle_reason"]
+    assert after["settle_status"] == before["settle_status"]
+    assert stats["rejudged"] == []
+
+
 def test_settle_no_bars_after_as_of_is_pending(ledger_tmp):
     """``no_bars_after_as_of`` 归 pending（数据未到），不计入 failed（issue #95）。"""
     days = _bdays(date(2026, 11, 2), 3)
@@ -889,6 +1197,30 @@ def _settled(action, confidence, ret, hit, flow_caliber="sina_total_net",
                     "price_source": "local_qfq_cache"},
         "settle_reason": None,
     }
+
+
+def test_report_counts_basis_uncertain_records(ledger_tmp):
+    """汇总里口径未确认的条数单独可见（issue #99）。"""
+    _write_settled_day(ledger_tmp, "2026-11-02", {
+        "000001": {"as_of": "2026-11-02", "action": "buy", "confidence": 0.5,
+                   "basis_uncertain": True, "settled": None,
+                   "settle_reason": "no_price_data", "settle_status": "failed"},
+        "000002": {"as_of": "2026-11-02", "action": "buy", "confidence": 0.5,
+                   "basis_uncertain": False, "settled": None,
+                   "settle_reason": "no_price_data", "settle_status": "failed"},
+    })
+    report = fl.build_report(ledger_dir=ledger_tmp)
+    assert report["basis_uncertain"] == 1
+    assert "口径未确认 1 条" in fl.format_report(report)
+    # 确认记录存在时不打扰输出
+    _write_settled_day(ledger_tmp, "2026-11-03", {
+        "000003": {"as_of": "2026-11-03", "action": "buy", "confidence": 0.5,
+                   "basis_uncertain": False, "settled": None,
+                   "settle_reason": "not_matured",
+                   "settle_status": "not_matured"},
+    })
+    report = fl.build_report(ledger_dir=ledger_tmp)
+    assert report["basis_uncertain"] == 1
 
 
 def test_report_empty_ledger_does_not_crash(ledger_tmp):
