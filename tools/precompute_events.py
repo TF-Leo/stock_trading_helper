@@ -76,17 +76,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "source")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
+TOOLS = os.path.join(ROOT, "tools")
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
 
 from stock_analysis.data_loader import events as events_loader  # noqa: E402
 
 OUT_DIR = events_loader.EVENTS_DIR
 CACHE_FILENAME = events_loader.CACHE_FILENAME
 
-#: 与 tools/precompute_flow.py 的 14 只自选保持一致（同一批标的，便于交叉核对）。
-DEFAULT_CODES = [
-    "000858", "002270", "002371", "002415", "002594", "300476", "300750",
-    "600036", "600519", "600522", "601318", "601398", "603259", "688981",
-]
+#: 默认票池不在本文件重复维护：直接复用 tools/precompute_flow.py 的 14 只自选，
+#: 两边共用同一份常量（同一批标的，便于交叉核对；也避免票池被复制成多份）。
+from precompute_flow import DEFAULT_CODES  # noqa: E402,F401
 
 DEFAULT_INTERVAL = 1.0
 DEFAULT_RETRIES = 1
