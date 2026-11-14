@@ -793,19 +793,32 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 - **只在首次结算成功前**发生（`settled` 仍为 `null`），且**只允许
   uncertain → 确认**：缓存出现且能确定口径时，四个口径字段改成确认值、
   `basis_uncertain` 置 `false`，`instrument_basis` 前缀「首次结算前重判：」；
+- 重判成功会写**显式标记** `basis_rejudged=true` / `basis_rejudged_at`；
+  `settle_all()` 的 `rejudged` 只看该标记在本次结算里是否新写入，不再比对
+  四个口径字段（字段抖动会误报 / 漏报）；
 - 仍无法确认（缓存仍是未复权 OHLC）→ 记录原样保留，下次结算再试；
 - **已确认记录永不重判**（`basis_uncertain=false`），**已结算记录永不重判**
-  （`settled` 非 null），引入该字段之前的老记录（缺键）同样不重判 ——
-  反向改动已确认口径正是这条规则要防的事。
+  （`settled` 块含必需字段），引入该字段之前**已有 `price_source`** 的老记录
+  同样不重判 —— 反向改动已确认口径正是这条规则要防的事。
 
 例：记录当日无缓存（按代码段判 stock/qfq，`basis_uncertain=true`）→ 之后
 `fund_*.csv` 净值到位 → 首次 `evaluate` 重判为 `fund` / `fund_nav` /
 `nav_to_nav` 并正常结算，`ret_20d` 来自净值序列。
 
-老记录没有 `price_source` 时按 brief 默认 **stock/qfq**；只有当 `fund_*.csv`
-存在、内容确认为**单位净值**（`open == close`、无交易所 `amount`/`postVol` 列）
-且没有 `stock_*_qfq.csv` 时才判场外基金；判定依据由 `settle_all()` 返回的
-`basis`（`{code: 依据}`）与 `warnings` 给出。
+老记录**没有 `price_source`** 时（issue #105）：记录阶段的口径从未钉住，旧实现
+每次结算按当时缓存重新分类，缓存一变口径就换。迁移不伪造当时的判定，而是补写
+显式 `basis_uncertain=true`（`basis_uncertain_source=legacy_record_without_price_source`），
+交给上面的一次性重判在首次能确定口径时钉住，之后永不换源；迁移幂等，**已结算
+记录不迁移**。已结算老记录的结算块里已有当时实际用的 `price_source`，后续结算
+直接沿用，避免重算时换口径。只有 `fund_*.csv` 存在、内容确认为**单位净值**
+（`open == close`、无交易所 `amount`/`postVol` 列）且没有 `stock_*_qfq.csv` 时
+才判场外基金；判定依据由 `settle_all()` 返回的 `basis`（`{code: 依据}`）与
+`warnings` 给出。
+
+「已结算」的判据不是 `settled` 是 dict，而是**非 null 且必需字段**
+（`ret_20d` / `entry_date` / `settle_date` / `entry_open` / `exit_open`）齐全；
+空 dict 或半截块按事实重推，不会虚增「已到期」与命中率分母（`hit` 可为 `null`，
+`hold` / `avoid` 没有方向）。
 
 `settle_status` 把「没到期 / 数据未到 / 从未结算」和「真失败」分开：
 

@@ -957,11 +957,14 @@ def test_resolve_price_plan_basis_states_caliber_is_fixed(tmp_path, monkeypatch)
          "instrument_type": "stock", "price_caliber": "qfq_open_to_open",
          "basis_uncertain": False})
     assert source == "local_qfq_cache"
-    assert "记录时确定，结算不再更改" in basis
+    # issue #105：结算阶段必须引用**同一常量**，不得再写差一个字的
+    # 「结算不再更改」内联字面量。
+    assert fl.BASIS_CONFIRMED_SUFFIX in basis
+    assert "结算时不再更改" in basis
     # 老记录（无 price_source）同样标明口径来源
     _inst, _source, _caliber, legacy_basis = fl.resolve_price_plan(
         {"code": "600519"})
-    assert "记录时确定，结算不再更改" in legacy_basis
+    assert fl.BASIS_CONFIRMED_SUFFIX in legacy_basis
 
 
 def test_legacy_record_without_basis_uncertain_key_is_never_rejudged(
@@ -1194,7 +1197,8 @@ def _settled(action, confidence, ret, hit, flow_caliber="sina_total_net",
                       "pb_percentile_3y": pb_pct, "ps_percentile_3y": None,
                       "as_of": "2026-11-02"},
         "settled": {"ret_20d": ret, "hit": hit, "settle_date": "2026-12-01",
-                    "price_source": "local_qfq_cache"},
+                    "entry_date": "2026-11-03", "entry_open": 10.0,
+                    "exit_open": 12.0, "price_source": "local_qfq_cache"},
         "settle_reason": None,
     }
 
@@ -1401,3 +1405,211 @@ def test_tool_evaluate_and_report(tmp_path, monkeypatch):
     assert record["settled"]["ret_20d"] == 0.2
     data = tool.report(ledger_dir=ledger_dir, as_json=True)
     assert data["matured"] == 1 and data["hit_rate"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# issue #105：台账四项残留
+# ---------------------------------------------------------------------------
+def test_settlement_basis_wording_references_the_constants(tmp_path, monkeypatch):
+    """结算阶段不再写内联字面量：记录价源 / 老记录 / 重判都引用常量（#105-1）。
+
+    历史文案「记录时确定，结算**不再**更改」与常量「记录时确定，结算**时**不再
+    更改」差一个字，同一语义两种写法；这里逐条断言实际输出含常量全文。
+    """
+    data_dir = tmp_path / "basis_constants"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    # 1) 记录里有 price_source → 结算沿用记录值
+    _inst, _src, _cal, basis = fl.resolve_price_plan(
+        {"code": "600519", "price_source": "local_qfq_cache",
+         "instrument_type": "stock", "price_caliber": "qfq_open_to_open",
+         "basis_uncertain": False})
+    assert fl.BASIS_CONFIRMED_SUFFIX in basis
+    assert "结算不再更改" not in basis  # 旧的差字写法
+
+    # 2) 老记录（无 price_source）→ 分类兜底，同样引用常量
+    _inst, _src, _cal, legacy_basis = fl.resolve_price_plan({"code": "600519"})
+    assert fl.BASIS_CONFIRMED_SUFFIX in legacy_basis
+
+    # 3) 重判 → 前缀也来自常量
+    record = {"code": "600519", "basis_uncertain": True, "settled": None}
+    plan = fl.rejudge_record(record, "600519")
+    assert plan is not None
+    assert plan[3].startswith(fl.BASIS_REJUDGED_PREFIX)
+    assert fl.BASIS_CONFIRMED_SUFFIX in plan[3]
+
+
+def test_empty_or_partial_settled_block_is_not_settled(ledger_tmp):
+    """``settled`` 是空 dict / 半截块时不得算已结算（#105-2）。
+
+    旧判据 ``isinstance(settled, dict)`` 会把 ``{}`` 当成已结算，``build_report``
+    的「已到期」与命中率分母凭空多一条。新判据要求非 null 且必需字段齐全。
+    """
+    _write_settled_day(ledger_tmp, "2026-11-02", {
+        "600519": {"as_of": "2026-11-02", "code": "600519", "action": "buy",
+                   "confidence": 0.5, "settled": {}, "settle_reason": None,
+                   "settle_status": "settled"},
+        "600000": {"as_of": "2026-11-02", "code": "600000", "action": "buy",
+                   "confidence": 0.5,
+                   "settled": {"ret_20d": 0.1, "hit": True},
+                   "settle_reason": None, "settle_status": "settled"},
+    })
+    report = fl.build_report(ledger_dir=ledger_tmp)
+    assert report["matured"] == 0
+    assert report["settle_status"]["settled"] == 0
+    assert report["pending"] == 2
+    assert report["by_action"]["buy"]["matured"] == 0
+    assert not fl.has_settlement({"settled": {}})
+    assert not fl.has_settlement({"settled": {"ret_20d": 0.1, "hit": True}})
+    assert not fl.has_settlement({"settled": None})
+    # 字段齐全（``hit`` 可为 None）才算已结算
+    valid = {"ret_20d": 0.1, "hit": None, "settle_date": "2026-12-01",
+             "entry_date": "2026-11-03", "entry_open": 10.0, "exit_open": 11.0}
+    assert fl.has_settlement({"settled": valid})
+
+
+def test_legacy_without_price_source_is_migrated_and_pinned_once(
+        ledger_tmp, tmp_path, monkeypatch):
+    """老记录无 ``price_source`` → 补标 ``basis_uncertain`` 后一次性钉住（#105-3）。
+
+    旧实现每次结算都按**当时**缓存重新分类，缓存一变口径就换。迁移不伪造记录
+    当日的判定，而是写显式 ``basis_uncertain=true``，交给既有的一次性重判在
+    首次能确认口径时钉住；之后缓存再怎么变都不再换源。迁移幂等。
+    """
+    data_dir = tmp_path / "legacy_pin"
+    days, opens = _bars_with_hand_math()
+    _write_bars(data_dir, "600519", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    _write_settled_day(ledger_tmp, "2026-11-02", {
+        "600519": {"as_of": "2026-11-02", "code": "600519", "action": "buy",
+                   "confidence": 0.5, "settled": None, "settle_reason": None},
+    })
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert stats["rejudged"] == ["600519"]
+    assert record["basis_uncertain"] is False
+    assert record["basis_uncertain_source"] == \
+        "legacy_record_without_price_source"
+    assert record["basis_rejudged"] is True
+    assert record["price_source"] == "local_qfq_cache"
+    assert record["price_caliber"] == "qfq_open_to_open"
+    assert record["instrument_basis"].startswith(fl.BASIS_REJUDGED_PREFIX)
+    settled_first = dict(record["settled"])
+    marker = record["basis_rejudged_at"]
+
+    # 幂等：再跑一次不重判、不改标记、数值零漂移
+    again = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert again["rejudged"] == []
+    assert record["basis_rejudged_at"] == marker
+    assert record["settled"] == settled_first
+
+    # 缓存换成只有净值形态的 fund_*.csv：已钉住的口径不得被改成 fund_nav
+    (data_dir / "stock_600519_qfq.csv").unlink()
+    _write_nav(data_dir, "600519", days, opens)
+    fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600519"]
+    assert record["price_source"] == "local_qfq_cache"
+    assert record["price_caliber"] == "qfq_open_to_open"
+    assert record["settle_reason"] == "no_price_data"
+
+
+def test_settled_legacy_record_keeps_the_source_used_at_settlement(tmp_path):
+    """已结算老记录没有记录级 ``price_source`` → 沿用结算块里的来源（#105-3）。
+
+    结算块写下了当时**实际用的**来源；下一次结算若按当前缓存重新分类，已结算
+    记录的口径就会被换掉。这里断言计划直接取 ``settled.price_source``。
+    """
+    settled = {"ret_20d": 0.1, "hit": True, "settle_date": "2026-12-01",
+               "entry_date": "2026-11-03", "entry_open": 1.0,
+               "exit_open": 1.1, "price_source": "fund_nav"}
+    inst, source, caliber, basis = fl.resolve_price_plan(
+        {"code": "600000", "settled": settled})
+    assert source == "fund_nav"
+    assert caliber == "nav_to_nav"
+    assert inst == "fund"
+    assert "结算块价源" in basis
+    assert fl.BASIS_CONFIRMED_SUFFIX in basis
+
+
+def test_rejudged_is_reported_from_explicit_marker_not_field_diff(
+        ledger_tmp, tmp_path, monkeypatch):
+    """``rejudged`` 由记录里的显式标记驱动，不再比对四个口径字段（#105-4）。"""
+    empty_dir = tmp_path / "marker_empty"
+    empty_dir.mkdir()
+    monkeypatch.setattr(fl, "DATA_DIR", str(empty_dir))
+    fl.record_day(["600000"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code="600000",
+                                              as_of="2026-11-02")))
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600000"]
+    assert record["basis_uncertain"] is True
+    assert record["basis_rejudged"] is False
+    assert record["basis_rejudged_at"] is None
+
+    # 缓存仍无法定论 → 不重判、不写标记
+    data_dir = tmp_path / "marker_inconclusive"
+    data_dir.mkdir()
+    (data_dir / "fund_600000.csv").write_text(
+        FUND_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600000"]
+    assert stats["rejudged"] == []
+    assert not record.get("basis_rejudged")
+    assert record.get("basis_rejudged_at") is None
+
+    # 缓存给出定论 → 重判并写显式标记；第二次不再报告
+    days, opens = _bars_with_hand_math()
+    qfq_dir = tmp_path / "marker_qfq"
+    _write_bars(qfq_dir, "600000", days, opens)
+    monkeypatch.setattr(fl, "DATA_DIR", str(qfq_dir))
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600000"]
+    assert stats["rejudged"] == ["600000"]
+    assert record["basis_rejudged"] is True
+    assert record["basis_rejudged_at"]
+    marker = record["basis_rejudged_at"]
+    again = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600000"]
+    assert again["rejudged"] == []
+    assert record["basis_rejudged_at"] == marker
+
+
+def test_settled_legacy_record_has_zero_drift_and_is_not_migrated(
+        ledger_tmp, tmp_path, monkeypatch):
+    """已结算老记录：不补标 ``basis_uncertain``，重算后数值逐项零漂移（#105-3）。
+
+    迁移只处理**未结算**的老记录；已结算记录的结算块里已有当时实际价源，
+    ``resolve_price_plan`` 沿用它，所以同一份缓存下重算结果不变。
+    """
+    data_dir = tmp_path / "legacy_settled_drift"
+    days = _bdays(date(2026, 12, 1), 29)
+    navs = [1.0] * 8 + [1.0250] + [1.01] * 19 + [0.9745]
+    _write_nav(data_dir, "600000", days, navs)
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    frame = _nav_frame(days, navs)
+    settled, reason = fl.compute_settlement(
+        {"as_of": "2026-11-02", "action": "buy"}, frame,
+        price_source="fund_nav")
+    assert reason is None
+    before = dict(settled)
+    _write_settled_day(ledger_tmp, "2026-11-02", {
+        "600000": {"as_of": "2026-11-02", "code": "600000", "action": "buy",
+                   "confidence": 0.5, "settled": before,
+                   "settle_reason": None, "settle_status": "settled"},
+    })
+
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600000"]
+    assert stats["rejudged"] == []
+    assert "basis_uncertain" not in record  # 已结算记录不迁移
+    assert record["settled"] == before
+    assert record["settle_status"] == "settled"
+    again = fl.settle_all(ledger_dir=ledger_tmp)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["600000"]
+    assert again["rejudged"] == []
+    assert record["settled"] == before
