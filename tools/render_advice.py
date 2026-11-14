@@ -6,6 +6,12 @@
     source/.venv/bin/python tools/render_advice.py --json-file payload.json
     source/.venv/bin/python cli.py 600000 --json | source/.venv/bin/python tools/render_advice.py
 
+可选参数：
+* ``--name "<简称>"``：覆盖 payload 里的名称（场外基金的 ``instrument.name``
+  常等于代码，Hermes 可用它喂入基金短名）。
+* ``--compact``：压缩 ``diagnostics.warnings``（去 URL / 堆栈 / 内部代号），
+  盘前投递建议开启；不传时输出与默认渲染逐字节一致。
+
 设计边界：
 * 只做 I/O 包装，渲染逻辑全部在 ``stock_analysis.advice_render.render_advice``；
 * **不触网**、不读行情缓存、不重算任何决策数值；
@@ -46,6 +52,10 @@ def main(argv=None) -> int:
         description="把 cli.py --json 的输出渲染成一段可直接投递的每日建议")
     parser.add_argument("--json-file", default="-", metavar="PATH",
                         help="payload JSON 文件；默认 '-' 表示从 stdin 读取")
+    parser.add_argument("--name", default=None, metavar="简称",
+                        help="覆盖 payload 名称（写入顶层 display_name）")
+    parser.add_argument("--compact", action="store_true",
+                        help="压缩 diagnostics.warnings（去 URL/堆栈/内部代号）")
     args = parser.parse_args(argv)
 
     try:
@@ -57,7 +67,12 @@ def main(argv=None) -> int:
         print(f"错误：读取 {args.json_file} 失败：{exc}", file=sys.stderr)
         return 2
 
-    print(render_advice(payload))
+    if args.name:
+        # 不修改原 payload：浅拷贝后注入 display_name，render_advice 仍是纯函数。
+        payload = dict(payload)
+        payload["display_name"] = args.name
+
+    print(render_advice(payload, compact=args.compact))
     return 0
 
 

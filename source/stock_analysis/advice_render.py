@@ -31,15 +31,23 @@ T5        资金流方向 + 口径标签（``evidence.flow``）
   ``diagnostics.warnings`` 里识别 CLI 已写入的「一字涨停/一字跌停」事实。
 * ``instrument.is_suspended`` 为 ``None`` 表示**无法判断**（盘前集合竞价前
   的正常现象），绝不能当成「确认停牌」；只有 ``True`` 才进不可执行闸门。
+* 名称优先取 ``instrument.display_name`` / 顶层 ``display_name``，其次
+  ``instrument.name``。场外基金的 ``name`` 常等于代码，此时只打印一次代码。
+* 新鲜度是**任一**非当日信号：``instrument.quote_stale``、``data.stale``、
+  ``data.lag_days >= 1``、``data.end < data.expected_date``。命中任意一项就
+  改用「收盘为 {date}」并给出滞后提示，不再写「现价」。
 * ``evidence.flow`` 的两种口径绝不混用：``eastmoney_main_net`` 用
   ``main_net_*``（元），``sina_total_net`` 用 ``net_*``（元）；口径缺失或两族
   同时有值时视为「混源」，只输出方向、不输出净额。
 * ``evidence.valuation`` 的 ``percentile_samples`` 小于 3 年窗口（756）时，
   文案标注「样本 N 日」。
+* ``compact=True`` 只压缩 ``diagnostics.warnings``：去掉 URL、异常类名/堆栈、
+  内部代号，保留首句与关键事实；默认输出逐字节不变。
 """
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Dict, List, Optional
 
 __all__ = [
@@ -67,6 +75,14 @@ _ONE_WORD_MARKERS = {
     "一字涨停": "up",
     "一字跌停": "down",
 }
+
+#: --compact 的告警压缩规则（只作用 ``diagnostics.warnings``）。
+_COMPACT_URL_RE = re.compile(r"https?://[^\s，。；、（）()]+")
+_COMPACT_INTERNAL_RE = re.compile(
+    r"（[^）]*(?:Traceback|Error|Exception|\.py\b|line \d+)[^）]*）")
+_COMPACT_CODE_RE = re.compile(
+    r"（(?:[A-Z]{1,2}\d{1,2}[a-z]?(?:-\d+)?|issue #\d+)）")
+_COMPACT_PATH_RE = re.compile(r"(?:/[\w.\-]+){2,}")
 
 #: regime 标签的相对强弱（只用于判断「逆风/顺风」，不参与任何决策）。
 _REGIME_RANK = {"Bull": 2, "Shock": 1, "Bear": 0}
@@ -151,6 +167,70 @@ def _warnings(payload: Dict[str, Any]) -> List[str]:
         return []
     return [str(item).strip() for item in raw
             if isinstance(item, str) and item.strip()]
+
+
+def _display_name(payload: Dict[str, Any], inst: Dict[str, Any]) -> Optional[str]:
+    """名称优先级：``instrument.display_name`` → 顶层 ``display_name`` → ``name``。"""
+    return (_text(inst.get("display_name"))
+            or _text(payload.get("display_name"))
+            or _text(inst.get("name")))
+
+
+def _is_fund(payload: Dict[str, Any]) -> bool:
+    """基金判定：board / request.type / status_source 任一指向基金即视为基金。"""
+    inst = _dict(payload.get("instrument"))
+    request = _dict(payload.get("request"))
+    if _text(inst.get("board")) == "fund":
+        return True
+    if _text(request.get("type")) == "fund":
+        return True
+    return (_text(inst.get("status_source")) or "").startswith("fund")
+
+
+def _freshness(payload: Dict[str, Any]):
+    """返回 ``(stale, lag_days, quote_stale, data_stale, end, expected, date_mismatch)``。
+
+    任一项成立即视为「非当日数据」：报价定格、行情回退旧缓存、lag_days >= 1、
+    行情末日早于期望交易日。只有 ``quote_stale`` 一项曾是旧行为。
+    """
+    inst = _dict(payload.get("instrument"))
+    data = _dict(payload.get("data"))
+    quote_stale = inst.get("quote_stale") is True
+    data_stale = data.get("stale") is True
+    lag_days = _num(data.get("lag_days"))
+    lagging = lag_days is not None and lag_days >= 1
+    end = _date_text(data.get("end"))
+    expected = _date_text(data.get("expected_date"))
+    date_mismatch = bool(end and expected and end < expected)
+    stale = quote_stale or data_stale or lagging or date_mismatch
+    return stale, lag_days, quote_stale, data_stale, end, expected, date_mismatch
+
+
+def _compact_warning(text: str) -> str:
+    """压缩单条 warning：去 URL / 异常堆栈 / 内部代号，保留首句与关键事实。"""
+    original = text
+    # 堆栈从 Traceback 起整段丢弃（前面若有可读事实则保留）。
+    if "Traceback" in text:
+        text = text.split("Traceback", 1)[0]
+    text = _COMPACT_URL_RE.sub("", text)
+    text = _COMPACT_INTERNAL_RE.sub("", text)
+    text = _COMPACT_PATH_RE.sub("", text)
+    text = _COMPACT_CODE_RE.sub("", text)
+
+    # 只保留首句（中文句号）；不在小数点/英文缩写上切分。
+    if "。" in text:
+        text = text.split("。", 1)[0] + "。"
+
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+([，。；、）])", r"\1", text)
+    text = re.sub(r"([（])\s+", r"\1", text)
+    text = text.strip(" ；，、")
+    if not text:
+        return "内部错误详情已省略"
+    # 压缩后若把原文的事实全删光（只剩标点），回退到首句原文。
+    if not re.search(r"[一-鿿A-Za-z0-9]", text):
+        return original.split("。", 1)[0].strip() or "内部错误详情已省略"
+    return text
 
 
 def _horizon_value(rec: Dict[str, Any]) -> Optional[int]:
@@ -244,15 +324,27 @@ def _price_line(payload: Dict[str, Any]) -> str:
     request = _dict(payload.get("request"))
 
     code = _text(inst.get("code")) or _text(request.get("code")) or "未知标的"
-    name = _text(inst.get("name"))
+    name = _display_name(payload, inst)
+    # 场外基金的 name 常等于代码：只打印一次代码，绝不出现「代码 代码」。
     head = code if not name or name == code else f"{code} {name}"
     price = _fmt_num(data.get("last_close"))
 
-    if inst.get("quote_stale") is True:
-        day = (_date_text(data.get("end"))
-               or _date_text(data.get("cache_last_date")) or "未知日期")
-        extra = f"（价格 {price}，报价定格）" if price else "（报价定格）"
-        return f"{head} 收盘为 {day}{extra}"
+    stale, lag_days, quote_stale, data_stale, end, expected, date_mismatch = \
+        _freshness(payload)
+    if stale:
+        day = (end or _date_text(data.get("cache_last_date"))
+               or expected or "未知日期")
+        hints: List[str] = []
+        if quote_stale:
+            hints.append("报价定格")
+        if lag_days is not None and lag_days >= 1:
+            hints.append(f"滞后 {int(lag_days)} 日")
+        elif date_mismatch:
+            hints.append("非最新交易日")
+        if data_stale and not hints:
+            hints.append("数据回退旧缓存")
+        inner = "，".join(([f"价格 {price}"] if price else []) + hints)
+        return f"{head} 收盘为 {day}（{inner}）"
     if price:
         return f"{head} 现价 {price}"
     return head
@@ -335,7 +427,8 @@ def _regime_line(payload: Dict[str, Any]) -> Optional[str]:
     kind = "逆风" if _REGIME_RANK[index_label] < _REGIME_RANK[stock_label] else "顺风"
     stock_conf = _fmt_num(regime.get("confidence"))
     index_conf = _fmt_num(index.get("confidence"))
-    stock_text = f"个股 {stock_label}" + (f"({stock_conf})" if stock_conf else "")
+    subject = "标的" if _is_fund(payload) else "个股"
+    stock_text = f"{subject} {stock_label}" + (f"({stock_conf})" if stock_conf else "")
     index_text = f"指数 {index_label}" + (f"({index_conf})" if index_conf else "")
     return (f"⚠️ 大盘{kind}：{index_text} vs {stock_text}"
             "（仅提示口径差异，不改变建议）")
@@ -439,11 +532,14 @@ def _flow_line(payload: Dict[str, Any]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
-def render_advice(payload: dict) -> str:
+def render_advice(payload: dict, compact: bool = False) -> str:
     """把 ``cli.py --json`` 的完整响应渲染成一段可直接投递的文本。
 
     纯函数：不改入参、不读文件、不触网。缺失字段对应的句子/段落整体消失，
     输出中不会出现 ``None``。
+
+    ``compact=True`` 只压缩 ``diagnostics.warnings``（去 URL / 堆栈 / 内部代号，
+    保留首句与关键事实）；其余行与默认输出完全一致。
     """
     document = _dict(payload)
     rec = _dict(document.get("recommendation"))
@@ -453,7 +549,8 @@ def render_advice(payload: dict) -> str:
 
     # T2（前置）：数据问题必须先于建议报告。
     for warning in _warnings(document):
-        lines.append(f"⚠️ 数据: {warning}")
+        shown = _compact_warning(warning) if compact else warning
+        lines.append(f"⚠️ 数据: {shown}")
     if lines:
         lines.append("")
 

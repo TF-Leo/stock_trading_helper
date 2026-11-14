@@ -42,6 +42,7 @@ FIXTURE_NAMES = (
     "st_warning",
     "quote_stale",
     "minimal_missing",
+    "data_stale_lag4",
 )
 
 
@@ -75,8 +76,8 @@ def test_render_snapshot(name):
     assert payload == original, "render_advice 必须是纯函数（不得修改入参）"
 
 
-def test_fixtures_are_six_distinct_cases():
-    assert len(FIXTURE_NAMES) == 6
+def test_fixtures_cover_required_cases():
+    assert len(FIXTURE_NAMES) == 7
     for name in FIXTURE_NAMES:
         assert (FIXTURES / f"{name}.json").is_file()
         assert (FIXTURES / f"{name}.expected.txt").is_file()
@@ -176,6 +177,88 @@ def test_t2_normal_stock_not_marked_unexecutable():
     output = _render("normal_buy")
     assert "不建议执行" not in output
     assert "交易状态" not in output
+
+
+def test_t2_any_non_today_signal_replaces_current_price():
+    """quote_stale=false 但 data.stale=true + lag_days=4 也必须走「收盘为」。"""
+    output = _render("data_stale_lag4")
+    assert "收盘为 2026-11-09" in output
+    assert "滞后 4 日" in output
+    assert "现价" not in output
+
+
+def test_t2_expected_date_ahead_is_enough():
+    payload = _payload("normal_buy")
+    payload["data"].update({
+        "stale": False, "lag_days": 0, "expected_date": "2026-11-16",
+    })
+    output = render_advice(payload)
+    assert "收盘为 2026-11-13" in output
+    assert "非最新交易日" in output
+    assert "现价" not in output
+
+
+def test_t2_fresh_data_still_says_current_price():
+    """四项新鲜度信号都为「当日」时保持原行为。"""
+    output = _render("normal_buy")
+    assert "现价 12" in output
+    assert "收盘为" not in output
+
+
+# ---------------------------------------------------------------------------
+# 名称：场外基金 name == code 时不得打印「代码 代码」
+# ---------------------------------------------------------------------------
+def _fund_payload(**instrument_overrides):
+    payload = {
+        "request": {"code": "123456", "type": "fund"},
+        "instrument": {
+            "code": "123456",
+            "name": "123456",
+            "board": "fund",
+            "is_st": None,
+            "is_suspended": None,
+            "quote_stale": None,
+            "status_source": "fund_static",
+        },
+        "data": {
+            "last_close": 1.2345, "end": "2026-11-13",
+            "expected_date": "2026-11-13", "stale": False, "lag_days": 0,
+        },
+        "recommendation": {"action": "hold", "confidence": 0.5},
+        "market_regime": {"label": "Bull", "confidence": 0.7,
+                          "index": {"label": "Shock", "confidence": 0.5}},
+    }
+    payload["instrument"].update(instrument_overrides)
+    return payload
+
+
+def test_name_equals_code_prints_code_once():
+    output = render_advice(_fund_payload())
+    assert output.splitlines()[0] == "123456 现价 1.2345"
+    assert "123456 123456" not in output
+
+
+def test_instrument_display_name_wins():
+    output = render_advice(_fund_payload(display_name="示例基金"))
+    assert output.splitlines()[0] == "123456 示例基金 现价 1.2345"
+
+
+def test_top_level_display_name_is_supported():
+    payload = _fund_payload()
+    payload["display_name"] = "示例基金二"
+    output = render_advice(payload)
+    assert output.splitlines()[0] == "123456 示例基金二 现价 1.2345"
+
+
+def test_empty_name_prints_code_only():
+    output = render_advice(_fund_payload(name=""))
+    assert output.splitlines()[0] == "123456 现价 1.2345"
+
+
+def test_fund_regime_uses_object_wording():
+    output = render_advice(_fund_payload())
+    assert "vs 标的 Bull(0.7)" in output
+    assert "个股" not in output
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +363,44 @@ def test_t5_stale_has_date_and_no_buy_wording():
     assert "2026-11-10 数据" in flow_line
     assert "买入" not in flow_line
     assert "建议" not in flow_line
+
+
+# ---------------------------------------------------------------------------
+# --compact：只压缩 warnings
+# ---------------------------------------------------------------------------
+def test_compact_warnings_strip_urls_stacks_and_codes():
+    payload = _payload("one_word_up")
+    payload["diagnostics"]["warnings"] = [
+        "接口失败 https://example.com/a?b=1（RuntimeError: timeout）；已回退旧缓存（P0-3）",
+        "Traceback (most recent call last): File \"/tmp/x.py\", line 1 ValueError: boom",
+        "ST 名单为空。后续还有一句不该出现",
+    ]
+    normal = render_advice(payload)
+    compact = render_advice(payload, compact=True)
+
+    assert "https://" in normal
+    assert "https://" not in compact
+    for token in ("RuntimeError", "P0-3", "Traceback", "ValueError", "/tmp/x.py"):
+        assert token not in compact
+    assert "接口失败" in compact
+    assert "已回退旧缓存" in compact
+    assert "ST 名单为空。" in compact
+    assert "后续还有一句" not in compact
+
+    # 非 warning 行逐行不变。
+    normal_lines = [line for line in normal.splitlines()
+                    if not line.startswith("⚠️ 数据:")]
+    compact_lines = [line for line in compact.splitlines()
+                     if not line.startswith("⚠️ 数据:")]
+    assert normal_lines == compact_lines
+    assert len([line for line in compact.splitlines()
+                if line.startswith("⚠️ 数据:")]) == 3
+
+
+def test_compact_does_not_change_default_output():
+    for name in FIXTURE_NAMES:
+        payload = _payload(name)
+        assert render_advice(payload) == render_advice(payload, compact=False)
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +523,22 @@ def test_tool_wrapper_reads_file_and_stdin():
     by_stdin = _run_tool(stdin=fixture.read_text(encoding="utf-8"))
     assert by_stdin.returncode == 0, by_stdin.stderr
     assert by_stdin.stdout == expected
+
+
+def test_tool_wrapper_name_override():
+    result = _run_tool("--json-file", str(FIXTURES / "normal_buy.json"),
+                       "--name", "覆盖简称")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == "600000 覆盖简称 现价 12"
+
+
+def test_tool_wrapper_compact_flag():
+    fixture = str(FIXTURES / "one_word_up.json")
+    normal = _run_tool("--json-file", fixture)
+    compact = _run_tool("--json-file", fixture, "--compact")
+    assert normal.returncode == 0 and compact.returncode == 0
+    assert "P0-3" in normal.stdout
+    assert "P0-3" not in compact.stdout
 
 
 def test_tool_wrapper_rejects_invalid_json():

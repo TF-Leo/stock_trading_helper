@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-11-13T09:16:00",
+  "request": {"code": "601999", "type": "stock", "fast": true},
+  "instrument": {
+    "code": "601999",
+    "name": "示例能源",
+    "board": "sh_main",
+    "price_limit_pct": 0.1,
+    "is_st": false,
+    "is_suspended": false,
+    "limit_up": 21.0,
+    "limit_down": 17.2,
+    "quote_stale": false,
+    "status_source": "eastmoney_st_list+tencent_quote"
+  },
+  "data": {
+    "bars": 500,
+    "start": "2024-09-02",
+    "end": "2026-11-09",
+    "last_close": 18.7,
+    "source": "cache",
+    "from_cache": true,
+    "stale": true,
+    "lag_days": 4,
+    "expected_date": "2026-11-13",
+    "cache_last_date": "2026-11-09"
+  },
+  "market_regime": {
+    "label": "Bear",
+    "confidence": 0.6,
+    "as_of": "2026-11-09",
+    "definition": "ma20_ma60_return_volatility",
+    "index": {
+      "label": "Bear",
+      "confidence": 0.6,
+      "as_of": "2026-11-09",
+      "definition": "ma20_ma60_return_volatility",
+      "source": "tencent_index:sh000300",
+      "bars": 500
+    }
+  },
+  "recommendation": {
+    "status": "ok",
+    "action": "hold",
+    "action_reason": ["策略当前空仓；今日无合格买点（20 日期望样本不足）"],
+    "confidence": 0.55,
+    "position_fraction": null,
+    "horizon_days": [20, 20],
+    "review_date": "2026-12-07",
+    "entry_zone": null,
+    "stop_loss": null,
+    "take_profit": null
+  },
+  "evidence": {},
+  "diagnostics": {
+    "warnings": ["行情数据回退到旧缓存（lag_days=4）；结论基于 2026-11-09 收盘"],
+    "elapsed_seconds": 27.3
+  },
+  "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
+}
