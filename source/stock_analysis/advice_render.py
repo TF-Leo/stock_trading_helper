@@ -586,6 +586,26 @@ def _status_note(inst: Dict[str, Any]) -> Optional[str]:
     return "交易状态：未知（无实时报价，不能确认是否停牌）"
 
 
+def _st_note(inst: Dict[str, Any]) -> Optional[str]:
+    """ST 状态不可得时的措辞（issue #106）。
+
+    只有 ``is_st_source='unavailable'`` / ``is_st is None`` 时才输出
+    「ST 状态未知」；**绝不**把未知写成「非 ST」。基金不参与 ST 判定。
+    """
+    if _text(inst.get("board")) == "fund":
+        return None
+    if (_text(inst.get("status_source")) or "").startswith("fund"):
+        return None
+    if inst.get("is_st") is True:
+        return None  # 已由可执行性闸门写「ST 风险警示股」
+    source = _text(inst.get("is_st_source"))
+    if source == "unavailable":
+        return "ST 状态未知（ST 名单、实时报价与本地名称均不可用）"
+    if inst.get("is_st") is None and source:
+        return "ST 状态未知（仅本地名称不含 ST 标记，未能复核）"
+    return None
+
+
 def _price_line(payload: Dict[str, Any]) -> str:
     inst = _dict(payload.get("instrument"))
     data = _dict(payload.get("data"))
@@ -1266,6 +1286,10 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     note = _status_note(inst)
     if note:
         lines.append(note)
+
+    st_note = _st_note(inst)
+    if st_note:
+        lines.append(st_note)
 
     levels = _levels_line(rec)
     if levels:

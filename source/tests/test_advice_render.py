@@ -349,6 +349,46 @@ def test_t2_normal_stock_not_marked_unexecutable():
     assert "交易状态" not in output
 
 
+# issue #106：ST 状态未知的渲染措辞
+def _st_payload(**instrument_overrides):
+    inst = {
+        "code": "600000", "name": "示例银行", "board": "sh_main",
+        "is_st": None, "is_st_source": "unavailable",
+        "is_suspended": None, "quote_stale": None,
+        "status_source": "unavailable",
+    }
+    inst.update(instrument_overrides)
+    return {"instrument": inst,
+            "recommendation": {"action": "hold", "confidence": 0.6}}
+
+
+def test_st_source_unavailable_renders_unknown_not_non_st():
+    output = render_advice(_st_payload())
+    assert "ST 状态未知" in output
+    assert "非 ST" not in output
+    assert "非ST" not in output
+
+
+def test_st_unknown_from_local_name_is_not_rendered_as_non_st():
+    payload = _st_payload(is_st_source="local_name", status_source="offline")
+    output = render_advice(payload)
+    assert "ST 状态未知" in output
+    assert "非 ST" not in output
+
+
+def test_st_confirmed_true_gates_and_has_no_unknown_wording():
+    output = render_advice(_st_payload(is_st=True, is_st_source="exchange_list"))
+    assert "【今日不建议执行】" in output
+    assert "ST 风险警示股" in output
+    assert "ST 状态未知" not in output
+
+
+def test_fund_ignores_st_unknown_wording():
+    payload = _fund_payload(is_st=None, status_source="fund_static")
+    payload["instrument"]["is_st_source"] = "unavailable"
+    assert "ST 状态未知" not in render_advice(payload)
+
+
 def test_t2_any_non_today_signal_replaces_current_price():
     """quote_stale=false 但 data.stale=true + lag_days=4 也必须走「收盘为」。"""
     output = _render("data_stale_lag4")

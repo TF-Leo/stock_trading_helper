@@ -16,6 +16,7 @@
     "board",
     "code",
     "is_st",
+    "is_st_source",
     "is_suspended",
     "limit_down",
     "limit_up",

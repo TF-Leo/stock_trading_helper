@@ -422,6 +422,245 @@ def test_nan_quote_degrades_to_nulls():
 
 
 # ---------------------------------------------------------------------------
+# issue #106：ST 名单三态 / 重试 / 缓存 / 重复代码清洗 / 来源标注
+# ---------------------------------------------------------------------------
+def _empty_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=["code", "name"])
+
+
+def _dup_frame(conflict: bool = False) -> pd.DataFrame:
+    frame = _st_frame()
+    extra = frame.iloc[[0]].copy()
+    if conflict:
+        extra.loc[:, "name"] = "ST冲突示例"
+    return pd.concat([frame, extra], ignore_index=True)
+
+
+def test_st_list_empty_is_suspicious_and_retried_once(monkeypatch):
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    calls = {"n": 0}
+
+    def empty():
+        calls["n"] += 1
+        return _empty_frame()
+
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        empty)
+    snap = status.get_st_list(now=dt.datetime(2026, 11, 12, 14, 0))
+    assert calls["n"] == 2, "空表必须重试一次"
+    assert not snap.available
+    assert snap.state == "empty"
+    assert snap.retried
+    assert snap.warning and "为空（可疑）" in snap.warning
+    assert "不能当成" in snap.warning and "今日没有 ST" in snap.warning
+    assert "已重试 1 次" in snap.warning
+
+
+def test_st_list_empty_retry_succeeds(monkeypatch):
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        return _empty_frame() if calls["n"] == 1 else _st_frame()
+
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        flaky)
+    snap = status.get_st_list(now=dt.datetime(2026, 11, 12, 14, 0))
+    assert snap.available and snap.state == "ok"
+    assert snap.retried
+    assert calls["n"] == 2
+
+
+def test_st_list_duplicate_codes_cleaned_on_retry(monkeypatch):
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    calls = {"n": 0}
+
+    def dup():
+        calls["n"] += 1
+        return _dup_frame()
+
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        dup)
+    snap = status.get_st_list(now=dt.datetime(2026, 11, 12, 14, 0))
+    assert calls["n"] == 2, "重复代码必须先重试一次"
+    assert snap.available and snap.retried
+    assert snap.cleaned_duplicates == 1
+    assert "已清洗" in (snap.warning or "")
+    assert "600001" in snap.codes
+
+
+def test_snapshot_from_frame_cleaning_rules():
+    from stock_analysis.data_loader import status
+
+    with pytest.raises(status.StListDuplicateError):
+        status._snapshot_from_frame(_dup_frame())
+    cleaned = status._snapshot_from_frame(_dup_frame(), allow_clean=True)
+    assert cleaned.available and cleaned.cleaned_duplicates == 1
+    with pytest.raises(status.StListDuplicateError):
+        status._snapshot_from_frame(_dup_frame(conflict=True), allow_clean=True)
+
+
+def test_st_list_empty_falls_back_to_expired_cache_with_date_and_stale(
+        monkeypatch):
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        lambda: _st_frame())
+    status.get_st_list(now=dt.datetime(2026, 11, 12, 14, 0))
+    status.reset_cache()
+
+    calls = {"n": 0}
+
+    def empty():
+        calls["n"] += 1
+        return _empty_frame()
+
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        empty)
+    snap = status.get_st_list(now=dt.datetime(2026, 11, 13, 14, 0))
+    assert calls["n"] == 2
+    assert snap.available and snap.degraded and snap.stale
+    assert snap.state == "empty"
+    assert "600001" in snap.codes
+    assert snap.warning and "2026-11-12" in snap.warning
+    assert "stale=true" in snap.warning and "已重试 1 次" in snap.warning
+
+
+def test_st_list_conflicting_duplicates_fall_back_to_cache(monkeypatch):
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        lambda: _st_frame())
+    status.get_st_list(now=dt.datetime(2026, 11, 12, 14, 0))
+    status.reset_cache()
+
+    calls = {"n": 0}
+
+    def conflict():
+        calls["n"] += 1
+        return _dup_frame(conflict=True)
+
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        conflict)
+    snap = status.get_st_list(now=dt.datetime(2026, 11, 13, 14, 0))
+    assert calls["n"] == 2
+    assert snap.available and snap.degraded and snap.stale
+    assert snap.state == "duplicate"
+    assert "重复（可疑）" in snap.warning
+    assert "2026-11-12" in snap.warning and "stale=true" in snap.warning
+
+
+def test_network_failure_is_not_retried(monkeypatch):
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        raise RuntimeError("429 Too Many Requests")
+
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        boom)
+    snap = status.get_st_list(now=dt.datetime(2026, 11, 12, 14, 0))
+    assert calls["n"] == 1, "网络失败不额外重试（避免放大限流压力）"
+    assert not snap.available and snap.state == "failed"
+    assert snap.warning and "接口失败" in snap.warning
+
+
+def test_fresh_cache_state_is_ok_not_stale(monkeypatch):
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    monkeypatch.setattr("stock_analysis.data_sources._astock_generated.st_stock_list",
+                        lambda: _st_frame())
+    now = dt.datetime(2026, 11, 12, 14, 0)
+    status.get_st_list(now=now)
+    status.reset_cache()
+    snap = status.get_st_list(now=now)
+    assert snap.available and snap.state == "ok"
+    assert not snap.stale and not snap.degraded
+
+
+# --- 来源标注 -----------------------------------------------------------------
+def test_is_st_source_exchange_list():
+    out = _resolve(_quote("quote_normal.json"), code="600519",
+                   snapshot=_snapshot(codes={"600001"}))
+    assert out.is_st is False
+    assert out.is_st_source == "exchange_list"
+
+
+def test_is_st_source_quote_name():
+    out = _resolve(_quote("quote_normal.json"), code="600519",
+                   snapshot=_snapshot(available=False))
+    assert out.is_st is False
+    assert out.is_st_source == "quote_name"
+
+
+def test_is_st_source_local_name():
+    out = _resolve(None, quote_error="AstockError: no quote", code="600568",
+                   snapshot=_snapshot(available=False), name="ST中珠")
+    assert out.is_st is True
+    assert out.is_st_source == "local_name"
+    unknown = _resolve(None, quote_error="AstockError: no quote", code="600519",
+                       snapshot=_snapshot(available=False), name="示例银行")
+    assert unknown.is_st is None
+    assert unknown.is_st_source == "local_name"
+
+
+def test_is_st_source_unavailable():
+    out = _resolve(None, quote_error="AstockError: no quote", code="999999",
+                   snapshot=_snapshot(available=False), name="999999")
+    assert out.is_st is None
+    assert out.is_st_source == "unavailable"
+
+
+# --- 冲突取保守 ---------------------------------------------------------------
+def test_conflict_list_says_no_quote_name_says_st():
+    out = _resolve(_quote("quote_st_main.json"), code="600001",
+                   snapshot=_snapshot())
+    assert out.is_st is True
+    assert out.is_st_source == "quote_name"
+    assert any("不一致" in w and "保守" in w for w in out.warnings)
+
+
+def test_conflict_list_says_no_local_name_says_st():
+    """报价名称说非 ST、本地名称说 ST —— 不能被报价名称掩盖。"""
+    out = _resolve(_quote("quote_normal.json"), code="600568",
+                   snapshot=_snapshot(), name="ST中珠")
+    assert out.is_st is True
+    assert out.is_st_source == "local_name"
+    assert any("不一致" in w and "保守" in w for w in out.warnings)
+
+
+def test_conflict_list_says_st_quote_name_says_no_still_st():
+    out = _resolve(_quote("quote_normal.json"), code="600001",
+                   snapshot=_snapshot(codes={"600001"}))
+    assert out.is_st is True
+    assert out.is_st_source == "exchange_list"
+    assert any("名单含该代码" in w for w in out.warnings)
+
+
+def test_quote_without_name_does_not_masquerade_as_non_st():
+    quote = _quote("quote_normal.json")
+    quote["name"] = ""
+    out = _resolve(quote, code="600519", snapshot=_snapshot(available=False),
+                   name="示例银行")
+    assert out.is_st is None, "报价名称为空时不得据此确认非 ST"
+    assert out.is_st_source == "local_name"
+    assert any("is_st 未知" in w for w in out.warnings)
+
+
+# ---------------------------------------------------------------------------
 # CLI 接线（instrument 字段 + 可执行性拦截 + 错误路径同构）
 # ---------------------------------------------------------------------------
 def _toy(n=150, seed=7, drift=0.001, vol=0.02, start=100.0):
@@ -469,11 +708,13 @@ def test_cli_instrument_additive_fields(monkeypatch):
 
     trading = TradingStatus(is_st=True, is_suspended=False, limit_up=5.2,
                             limit_down=4.7, quote_stale=False,
+                            is_st_source="exchange_list",
                             status_source="eastmoney_st_list+tencent_quote",
                             price_limit_pct=0.05, warnings=[])
     out = _run_cli(monkeypatch, trading)
     inst = out["instrument"]
     assert inst["is_st"] is True
+    assert inst["is_st_source"] == "exchange_list"
     assert inst["is_suspended"] is False
     assert inst["limit_up"] == pytest.approx(5.2)
     assert inst["limit_down"] == pytest.approx(4.7)
@@ -549,6 +790,7 @@ def test_error_response_instrument_keys_isomorphic(monkeypatch):
     assert set(doc["instrument"]) == set(ok["instrument"])
     assert doc["instrument"]["one_word_limit"] is None
     assert doc["instrument"]["is_suspended"] is None
+    assert doc["instrument"]["is_st_source"] == "unavailable"
     assert doc["instrument"]["status_source"] == "unavailable"
 
 
@@ -557,7 +799,7 @@ def test_schema_instrument_declares_additive_fields():
 
     fields = Instrument.__dataclass_fields__
     for name in ("is_suspended", "limit_up", "limit_down", "quote_stale",
-                 "status_source"):
+                 "status_source", "is_st_source"):
         assert name in fields
 
 
