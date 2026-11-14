@@ -23,11 +23,11 @@
 - **文档**：新增 `docs/ST_LIST_PRECOMPUTE.md`（cron `35 18 * * 1-5`、时段、
   缓存结构、退出码、验证口径）；README 的 ST 段落与 `status_source` 说明同步。
 - **证据（本机 Linux，`~/.venv` Python 3.12）**：
-  - `python -m pytest tests/ -q` → **1004 passed, 1 failed**；唯一失败
+  - `python -m pytest tests/ -q` → **1006 passed, 1 failed**；唯一失败
     `test_probe_requirements.py::test_current_environment_passes_via_probe`
     仍是父 commit 基线已有的解释器/依赖版本不符（akshare/requests/numpy/
     pandas/pytest），与本改动无关（#107 正文已记录同一失败）。
-  - 新增 `source/tests/test_st_precompute.py` 13 项：缓存字段/一次全市场请求
+  - 新增 `source/tests/test_st_precompute.py` 15 项：缓存字段/一次全市场请求
     序列、空表与冲突重复不覆盖、网络失败不覆盖、444/零字节 FIN 请求数=1 +
     冷却期 0 请求、`main` 退出码 3/4、盘前 `advise_internal` 的
     `is_st_source=exchange_list` 且 `EM_SESSION.get` / `st_stock_list` /

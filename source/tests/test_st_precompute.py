@@ -333,6 +333,29 @@ def test_corrupt_cache_is_rejected_not_trusted(tmp_path):
     assert "校验失败" in snap.warning
 
 
+def test_success_clears_stale_cooldown(monkeypatch):
+    status.mark_cooldown("http_444", "旧封锁", seconds=60, now=NOW_CLOSE)
+    assert Path(status.cooldown_path()).exists()
+
+    calls = []
+    _patch_st_list(monkeypatch, _st_frame(), calls)
+    stats = pre.precompute(now=NOW_CLOSE + dt.timedelta(seconds=61), force=True)
+
+    assert stats["ok"] is True
+    assert not Path(status.cooldown_path()).exists(), \
+        "成功取数说明封锁已解除，应清掉冷却文件"
+
+
+def test_write_rejects_bad_snapshot():
+    with pytest.raises(ValueError):
+        status.write_st_list_cache(
+            status.StListSnapshot(available=False, state="empty"), now=NOW_CLOSE)
+    with pytest.raises(ValueError):
+        status.write_st_list_cache(
+            status.StListSnapshot(available=True, state="duplicate",
+                                  stocks={"600001": {}}), now=NOW_CLOSE)
+
+
 # ---------------------------------------------------------------------------
 # 5) CLI 主路径零请求（真实 advise_internal，打桩行情/回测）
 # ---------------------------------------------------------------------------

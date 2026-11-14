@@ -169,6 +169,11 @@ def precompute(now=None, force=False, dry_run=False) -> dict:
         stats["ok"] = True
         stats["count"] = len(snapshot.stocks)
         stats["reason"] = snapshot.warning
+        # 成功取数说明封锁已解除：清掉可能残留的过期/已强制跳过的冷却文件。
+        try:
+            st.clear_cooldown()
+        except OSError:
+            pass
         return stats
 
     # 空表 / 重复代码 / 网络失败：只告警，绝不覆盖已有好缓存。
@@ -214,6 +219,8 @@ def main(argv=None) -> int:
 
     if stats["skipped_cooldown"]:
         print(f"SKIP {stats['reason']}")
+    elif stats["dry_run"]:
+        print(f"DRY-RUN requests=0 {stats['reason']}")
     elif stats["ok"]:
         print(f"OK count={stats['count']} requests={stats['requests']} "
               f"state={stats['state']} -> {stats['path']}")
