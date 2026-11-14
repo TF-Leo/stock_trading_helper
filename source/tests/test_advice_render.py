@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -33,7 +34,10 @@ GOLDEN = FIXTURES / "cli_json_structure.golden.json"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from stock_analysis.advice_render import render_advice  # noqa: E402
+from stock_analysis.advice_render import (  # noqa: E402
+    COMPACT_GLOSSARY,
+    render_advice,
+)
 
 FIXTURE_NAMES = (
     "normal_buy",
@@ -553,30 +557,22 @@ def _compact_single(warning: str) -> str:
     return lines[0] if lines else ""
 
 
+#: ``--compact`` 的词表是**封闭集合**：条目的增删必须同时改这条测试与 README
+#: 的契约说明（issue #92 裁定）。这里刻意不复制实现的正则，只锁定集合内容。
+CLOSED_GLOSSARY = {
+    "p_positive": "买侧期望胜率",
+    "trigger.current": "触发参考价",
+    "is_st": "ST 标记",
+    "ProxyError": "代理异常",
+    "no_edge": "无统计优势",
+    "95% CI": "置信区间",
+}
+
+
 def _is_deletion_subsequence(shorter: str, longer: str) -> bool:
     """``shorter`` 的字符是否按序出现在 ``longer`` 中（允许中间有删除）。"""
     iterator = iter(longer)
     return all(char in iterator for char in shorter)
-
-
-#: 与 ``advice_render._COMPACT_FIELD_LABELS`` 对应的固定词表（issue #92）。
-FIELD_LABEL_SUBSTITUTIONS = (
-    ("p_positive", "买侧期望胜率"),
-    ("trigger.current", "触发参考价"),
-    ("is_st", "ST 标记"),
-    ("ProxyError", "代理异常"),
-)
-
-
-def _substitute_field_labels(text: str) -> str:
-    for source, label in FIELD_LABEL_SUBSTITUTIONS:
-        text = text.replace(source, label)
-    return text
-
-
-def _is_compact_derivation(shorter: str, longer: str) -> bool:
-    """compact 结果 = 原文先做固定词表替换、再按序删除若干整段。"""
-    return _is_deletion_subsequence(shorter, _substitute_field_labels(longer))
 
 
 def _parens_balanced(text: str) -> bool:
@@ -591,18 +587,112 @@ def _parens_balanced(text: str) -> bool:
     return depth == 0
 
 
-COMPACT_SAFETY_WARNINGS = (
+#: 不含词表 token 的告警：compact 结果必须是原文的删除子序列。
+DELETION_ONLY_WARNINGS = (
     *REAL_WARNINGS,
     "接口失败 https://example.com/a?b=1（RuntimeError: timeout）；已回退旧缓存（P0-3）",
     "状态未知：停牌/退市/代码无效无法区分",
+    # token 落在整对括号里，括号被整段删除 → 结果仍只是删除。
     "统计证据不足（p_positive=0.42，n=12）",
-    "统计证据不足 p_positive=0.42",
     "两条独立事实。第二句不得被截断。",
     "括号不配对（issue #1 决策",
     "括号不配对 issue #1 决策）",
     "During handling of the above exception, another exception occurred: boom",
     'File "/tmp/x.py", line 12, in f',
 )
+
+#: 含词表 token 的告警：(原文, 期望 compact 输出)。
+#: 期望值显式写出，**不**用裸 ``str.replace`` 复算——上一轮变异测试没抓住
+#: 边界缺陷，正是因为测试 helper 与实现用了不同的替换语义。
+GLOSSARY_CASES = (
+    ("统计证据不足 p_positive=0.42", "统计证据不足买侧期望胜率=0.42"),
+    ("统计证据不足 trigger.current=null", "统计证据不足触发参考价=null"),
+    ("状态 is_st 只能依据名称判断", "状态 ST 标记只能依据名称判断"),
+    ("上游抛 ProxyError", "上游抛代理异常"),
+    # 两个词表 token 相邻：接缝里的空格也不得留下「中文 空格 中文」。
+    ("is_st p_positive", "ST 标记买侧期望胜率"),
+    # P4：no_edge 告警不得把 95% CI / no_edge 漏给用户。
+    ("超额收益 95% CI 上界 ≤ 0：统计上无优势，判 no_edge（B8）",
+     "超额收益置信区间上界 ≤ 0：统计上无优势，判无统计优势"),
+)
+
+#: token 前后粘连字母/数字/下划线/中文/dot 时不得替换（词边界）。
+GLOSSARY_BOUNDARY_WARNINGS = (
+    "字段 is_status 未知",
+    "字段 my_p_positive 未知",
+    "字段 p_positive_2 未知",
+    "字段 trigger.current_x 未知",
+    "字段 ProxyErrors 未知",
+    "字段 xProxyError 未知",
+    "仅is_st推断",
+    "is_st仅按名称",
+    "x.is_st 推断",
+)
+
+
+def test_compact_glossary_is_closed_set():
+    assert COMPACT_GLOSSARY == CLOSED_GLOSSARY
+
+
+@pytest.mark.parametrize("warning", DELETION_ONLY_WARNINGS)
+def test_compact_deletion_only_warning_is_deletion_subsequence(warning):
+    """不含词表 token：compact 结果必须仍是原文的删除子序列。"""
+    assert _is_deletion_subsequence(_compact_single(warning), warning)
+
+
+@pytest.mark.parametrize("warning,expected", GLOSSARY_CASES)
+def test_compact_glossary_substitution_is_exact(warning, expected):
+    """含词表 token：经公开 ``render_advice`` 断言逐字结果（含空格吸收）。"""
+    assert _compact_single(warning) == expected
+
+
+@pytest.mark.parametrize("warning", GLOSSARY_BOUNDARY_WARNINGS)
+def test_compact_glossary_respects_word_boundaries(warning):
+    """``is_st`` 不得命中 ``is_status`` / ``仅is_st推断`` 等粘连形式。
+
+    这条测试就是边界 lookaround 的变异哨兵：去掉 ``(?<![\\w.])`` 或
+    ``(?![\\w.])`` 后，上面 9 个用例至少 6 个立刻变红。
+    """
+    assert _compact_single(warning) == warning
+
+
+def test_compact_glossary_does_not_insert_cjk_spaces():
+    """P3：替换不得把中文与中文顶出空格（``ST 标记 只能`` → ``ST 标记只能``）。"""
+    compacted = _compact_single("状态 is_st 只能依据名称判断")
+    assert compacted == "状态 ST 标记只能依据名称判断"
+    assert "ST 标记 只能" not in compacted
+    assert "  " not in compacted
+    assert not re.search(r"[\u4e00-\u9fff] [\u4e00-\u9fff]", compacted)
+
+
+@pytest.mark.parametrize(
+    "warning", DELETION_ONLY_WARNINGS + tuple(case[0] for case in GLOSSARY_CASES))
+def test_compact_output_has_no_double_or_cjk_spaces(warning):
+    compacted = _compact_single(warning)
+    assert "  " not in compacted, compacted
+    assert not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff] "
+                         r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", compacted), compacted
+
+
+def test_compact_no_edge_warning_has_no_jargon_and_keeps_semantics():
+    """P4：no_edge 告警在 compact 下不得再出现 ``95% CI`` / ``no_edge``。
+
+    语义红线：只能说「统计上无优势」，不得写成「没有机会」或「样本不足」的
+    反转（样本不足是另一类判定）。
+    """
+    payload = _payload("no_edge")
+    payload["diagnostics"]["warnings"] = [
+        "超额收益 95% CI 上界 ≤ 0：统计上无优势，判 no_edge（B8）",
+    ]
+    compact = render_advice(payload, compact=True)
+    warning_line = next(line for line in compact.splitlines()
+                        if line.startswith("⚠️ 数据:"))
+    assert "95% CI" not in warning_line
+    assert "CI" not in warning_line
+    assert "no_edge" not in warning_line
+    assert "置信区间" in warning_line
+    assert "统计上无优势" in warning_line
+    assert "没有机会" not in compact
 
 
 def test_compact_warnings_strip_urls_stacks_and_codes():
@@ -659,13 +749,8 @@ def test_compact_real_warning_keeps_unknown_status():
     assert _parens_balanced(st_line)
 
 
-@pytest.mark.parametrize("warning", COMPACT_SAFETY_WARNINGS)
-def test_compact_output_is_deletion_or_vocabulary_substitution(warning):
-    """compact 结果 = 固定词表替换 + 按序删除若干整段，不做其它改写。"""
-    assert _is_compact_derivation(_compact_single(warning), warning)
-
-
-@pytest.mark.parametrize("warning", COMPACT_SAFETY_WARNINGS)
+@pytest.mark.parametrize(
+    "warning", DELETION_ONLY_WARNINGS + tuple(case[0] for case in GLOSSARY_CASES))
 def test_compact_never_breaks_parentheses(warning):
     compacted = _compact_single(warning)
     if _parens_balanced(warning):
@@ -697,9 +782,13 @@ def test_compact_replaces_bare_internal_field_names():
     for token in ("p_positive", "trigger.current", "is_st", "ProxyError"):
         assert token not in compacted
     assert "买侧期望胜率=0.42" in compacted
-    assert "触发参考价 缺失" in compacted
-    assert "ST 标记 仅按名称判断" in compacted
-    assert "上游抛 代理异常" in compacted
+    assert "触发参考价缺失" in compacted
+    assert "ST 标记仅按名称判断" in compacted
+    assert "上游抛代理异常" in compacted
+    # P3：替换不得在中文之间留下空格。
+    assert "触发参考价 缺失" not in compacted
+    assert "ST 标记 仅按" not in compacted
+    assert "上游抛 代理异常" not in compacted
 
 
 def test_compact_field_vocabulary_does_not_touch_other_internal_names():
@@ -713,6 +802,10 @@ SAFETY_QUALIFIER_WARNINGS = (
     "无法判断是否停牌（p_positive=0.2）",
     "ST 标的：退市与流动性风险（is_st 由报价名称判断）",
     "一字涨停（最高=最低=涨停价），买单无法成交（P0-3）",
+    # 词表替换路径同样不得吃掉任何限定词。
+    "状态未知：停牌/退市无法区分 is_st",
+    "无法判断是否停牌 ProxyError",
+    "一字跌停（最高=最低=跌停价），卖单无法成交 is_st",
 )
 
 
@@ -729,6 +822,9 @@ def test_compact_preserves_safety_qualifiers(warning):
             assert token in compacted, (token, compacted)
     # 不得把「无法判断」压成事实性结论。
     assert not compacted.endswith("：停牌")
+    # P3：词表替换后也不得在中文之间留下空格。
+    assert not re.search(r"[\u4e00-\u9fff] [\u4e00-\u9fff]", compacted), compacted
+    assert "  " not in compacted, compacted
 
 
 def test_compact_does_not_change_default_output():

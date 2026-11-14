@@ -10,8 +10,9 @@
 * ``--name "<简称>"``：覆盖 payload 里的名称（场外基金的 ``instrument.name``
   常等于代码，Hermes 可用它喂入基金短名）。
 * ``--compact``：压缩 ``diagnostics.warnings``（整段删除 URL / 堆栈回溯段 /
-  配对完整的内部引用括号，再把少量裸内部字段名换成固定中文表述），盘前投递
-  建议开启；不传时输出与默认渲染逐字节一致。
+  配对完整的内部引用括号，再按模块级封闭词表 ``COMPACT_GLOSSARY`` 把少量
+  内部术语换成固定中文表述；词表之外只许删除），盘前投递建议开启；不传时输出
+  与默认渲染逐字节一致。
 
 设计边界：
 * 只做 I/O 包装，渲染逻辑全部在 ``stock_analysis.advice_render.render_advice``；
@@ -57,7 +58,7 @@ def main(argv=None) -> int:
                         help="覆盖 payload 名称（写入顶层 display_name）")
     parser.add_argument("--compact", action="store_true",
                         help="压缩 diagnostics.warnings（整段删除 URL/堆栈/内部引用括号，"
-                             "并把少量裸内部字段名换成固定中文表述）")
+                             "并按封闭词表 COMPACT_GLOSSARY 替换少量内部术语）")
     args = parser.parse_args(argv)
 
     try:
