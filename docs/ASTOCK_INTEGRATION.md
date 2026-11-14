@@ -345,15 +345,17 @@ read timeout）仍靠 HTTP timeout 兜底。实测：3s 预算 + 12s 阻塞通�
 | 失败 | 判定 | 冷却 | 行为 |
 |---|---|---|---|
 | 限流 | HTTP 429，或 200 + 空响应（无 `data`） | **120s**（`tencent_cooldown.json` 的 `hosts` 段） | 三入口全冷却时 `fetch_daily` **不发请求**，抛 `TencentThrottled`；到期自动恢复 |
-| WAF | **HTTP 501 且响应体含 JS 挑战特征**（`location.href` / `btoa`） | **1800s**（`waf.hosts` 段；`TENCENT_WAF_COOLDOWN_SECONDS` 可覆盖，建议 1800–3600s） | 一次探测即中止（不再轮询三入口），抛 `TencentWafBlocked`；冷却期内**一个请求都不发**，渠道池 attempts 记 `waf_blocked` / `cooldown` |
+| WAF | **HTTP 501 且响应体含 JS 挑战特征**（`location.href` / `btoa`） | **1800s**（`waf.hosts` 段；`TENCENT_WAF_COOLDOWN_SECONDS` 可覆盖，建议 1800–3600s） | **逐入口标记**（issue #73）：只冷却实际 501 的入口，其余入口同轮继续尝试；三个入口全部确认后才抛 `TencentWafBlocked`、冷却期内**一个请求都不发**，渠道池 attempts 记 `waf_blocked` / `cooldown`。`TENCENT_WAF_SHARED_BACKEND=1` 可恢复「一次确认 → 全标记」（默认关闭） |
 
 实现（全部在适配层，**生成物仍与快照逐字节一致**）：
 
 | 层 | 位置 | 行为 |
 |---|---|---|
-| 识别 | `tencent_throttle.wrap_http_for_waf` ← `astock._waf_guard()` | 在本轮 `tencent_kline` 调用期间包一层 `_v39_http`：501 + 挑战页 → `WafBlocked`。它**不继承** `RuntimeError`，所以上游生成物 `_tencent_kline_call` 的 `except RuntimeError`（记 120s 限流、换下一个入口）不会把它吞掉 |
+| 识别 | `tencent_throttle.wrap_http_for_waf` ← `astock._waf_guard()` | 在本轮 `tencent_kline` 调用期间包一层 `_v39_http`：501 + 挑战页 → `WafBlocked`，并且**只标记该入口**。`WafBlocked` **继承** `RuntimeError`，上游生成物 `_tencent_kline_call` 的 `except RuntimeError` 会换下一个入口（这是 issue #73「部分入口可用」的前提）；仍在 WAF 长冷却中的入口会在写回时从 120s 限流段剔除 |
+| 并发隔离 | `astock._waf_guard()` | 引用计数 + 锁：并发/嵌套调用只安装**一层**包装，最后一个退出者还原到进入前的函数对象；`astock.waf_guard_depth()` 可验证归零 |
+| 200 挑战页 | `tencent_throttle.wrap_http_for_waf` | 状态码 200 但响应体含挑战特征：只打 `[WARN]` 到 stderr，**不判 WAF**（避免误伤） |
 | 持久化 | `tencent_throttle.mark_waf` | 写 `tencent_cooldown.json` 的 `waf.hosts` 段（与限流段 `hosts` 互不覆盖，`schema_version=2`）；`fcntl.flock` 串行化读-改-写 |
-| 闸门 | `astock.fetch_daily` | 取数前 `waf_hosts_cooling()` → 直接抛 `TencentWafBlocked`；到期后自动放行**一次**探测，成功即恢复正常，失败重新写长冷却 |
+| 闸门 | `astock.fetch_daily` | 取数前把磁盘 `waf.hosts` 同步进进程内跳过表（`sync_waf_process_state`），只探测未被标记的入口；`waf_hosts_cooling()`（三入口全冷却）→ 直接抛 `TencentWafBlocked`；到期后自动放行**一次**探测，成功即恢复正常，失败重新写长冷却 |
 | 渠道池 | `data_loader/bars.py` | WAF → 该通道本轮 `cooldown_until` 用 WAF 剩余秒数；attempts 带 `waf_blocked: true`，后续票以 `ok=null, cooldown=true` 跳过（不再调用 fetcher） |
 
 **不误伤**：WAF 长冷却只约束个股 `fqkline`。指数 `newfqkline`（`fetch_index_daily`）
