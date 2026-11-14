@@ -11,7 +11,9 @@ import numpy as np
 from stock_analysis.data_loader import get_stock_daily, get_fund_daily, get_stock_name
 from stock_analysis.data_loader.meta import last_fetch_info
 from stock_analysis.data_loader.bars import format_attempt_warnings
-from stock_analysis.data_loader.status import resolve_trading_status
+from stock_analysis.data_loader.status import (
+    get_st_list_cached, resolve_trading_status,
+)
 from decision.context import evidence_context
 from stock_analysis.data_sources.market_watch import (  # T6 重点监控池
     market_watch_evidence as _market_watch_evidence, with_market_watch_block)
@@ -245,10 +247,13 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
 
     # P0-3（issue #6）：真实交易状态（ST / 停牌 / 涨跌停 / 退市信号）。
     # 只对个股查询；基金保留静态字段。查询失败永不阻断主流程，只降级 + warning。
+    # issue #107 P1：ST 名单**只读收盘后预计算缓存**（get_st_list_cached），
+    # 盘前对 push2/push2delay 的请求数为 0；名单过期只降级 + warning。
     trading = None
     if data_type == 'stock':
         trading = resolve_trading_status(
-            code, board, name=name, data_lag_days=fetch_info.get('lag_days'))
+            code, board, name=name, data_lag_days=fetch_info.get('lag_days'),
+            st_snapshot=get_st_list_cached())
         if trading.price_limit_pct is not None:
             price_limit_pct = trading.price_limit_pct
         # is_st 可能为 None（ST 名单 / 腾讯报价 / 本地名称都不可用）：

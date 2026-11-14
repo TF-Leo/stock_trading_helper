@@ -1,5 +1,44 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-15 · PR #107 P1：ST 名单改为收盘后预计算 + 盘前只读缓存
+
+- **分支**：`task/st-list-robust`（PR #107，父 = `origin/main` `ab7d435`）；
+  未改 `source/decision/*`，未引入依赖，隐私口径不变。
+- **根因（A5500 实测）**：东财 push2/push2delay 对本机出口 IP 触发 nginx 444
+  （3 分钟内约 10 次请求即触发）；ST 名单走 clist 全市场翻页，盘前逐票各跑
+  一次 CLI = 每天把全市场名单反复拉 N 次，且旧缓存从未落盘。
+- **预计算**：新增 `tools/precompute_st_list.py`，18:30–18:40 运行一次，
+  原子写 `source/stock_analysis/data/state/st_list.json`（schema 2：
+  `fetched_at` / `session_date` / `count` / `sha256` / `codes[]` / `source` /
+  `stocks` 留档）。空表 / 冲突重复按 #106 重试一次，仍异常**只告警、不写**；
+  网络失败不重试；坏结果永不覆盖好缓存。
+- **盘前只读**：`cli.py` 改用 `status.get_st_list_cached()`（只读磁盘，零联网）。
+  覆盖最近交易日 → `is_st_source=exchange_list`；过期 → 仍用但 `stale=true`
+  + 缓存日期/期望日期 warning；无缓存/校验失败 → `unavailable`（报价名称兜底）。
+  `sha256` 校验失败按「拒绝使用」处理（防止 ST 假阴性）。
+- **熔断**：`StListFetchGuard` 包 `_astock_generated.em_get`，命中 HTTP 444 或
+  零字节 FIN 时抛 `StListBlocked`（不换域、不重试，请求数恰为 1），写
+  `st_list_cooldown.json`（默认 1800s，`ST_LIST_COOLDOWN_SECONDS` 可覆盖）；
+  冷却期内预计算 0 请求、退出码 3。旧 `get_st_list` 也尊重冷却，不再撞墙。
+- **文档**：新增 `docs/ST_LIST_PRECOMPUTE.md`（cron `35 18 * * 1-5`、时段、
+  缓存结构、退出码、验证口径）；README 的 ST 段落与 `status_source` 说明同步。
+- **证据（本机 Linux，`~/.venv` Python 3.12）**：
+  - `python -m pytest tests/ -q` → **1004 passed, 1 failed**；唯一失败
+    `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    仍是父 commit 基线已有的解释器/依赖版本不符（akshare/requests/numpy/
+    pandas/pytest），与本改动无关（#107 正文已记录同一失败）。
+  - 新增 `source/tests/test_st_precompute.py` 13 项：缓存字段/一次全市场请求
+    序列、空表与冲突重复不覆盖、网络失败不覆盖、444/零字节 FIN 请求数=1 +
+    冷却期 0 请求、`main` 退出码 3/4、盘前 `advise_internal` 的
+    `is_st_source=exchange_list` 且 `EM_SESSION.get` / `st_stock_list` /
+    `fetch_st_list` / 旧 `get_st_list` 调用数均为 0、过期缓存 stale+日期、
+    无缓存 unavailable、损坏缓存拒绝。
+- **未验证**：本机无 `pwsh`，`tools/check_gates.ps1` 未执行；真实端点仍处于
+  444 封禁窗口，未做联网复测（预计算用离线桩覆盖 444/FIN 行为）。
+- **遗留风险**：cron 接线由协调者安排；若预计算未运行，盘前持续用旧缓存并
+  `stale=true`；若东财改拦截形态（如 403 + HTML），按 `failed` 处理、保留
+  旧缓存但不会自动冷却。
+
 ## 2026-11-15 · issue #106 ST 名单三态 / 重试 / 缓存回退 / 来源标注
 
 - **分支**：`task/st-list-robust`（父 = `origin/main` `ab7d435`）；未改 `source/decision/*`
