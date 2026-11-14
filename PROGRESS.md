@@ -1,5 +1,36 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-15 · issue #109：ST 名单六项复验残留
+
+- **分支**：`task/st-p2-cleanup`（父 = `origin/main` `aeb1d04`）；未改
+  `source/decision/*`，未引入依赖；`--json` 只做 additive / 语义修正。
+- **1) 清洗生产可达**：上游 §6.8 `st_stock_list()` 在重复代码时先 raise 合并
+  文案，本地 `_snapshot_from_frame(allow_clean=True)` 只有桩能触发。生成器新增
+  受控覆盖 `_DuplicateCheckRelaxed`：函数增加 `allow_duplicates=False`（默认行为
+  不变）；重试时传 `True` 拿回原始表，由本地判定同内容重复（清洗计数）与内容
+  冲突（仍报错）。`astock_extract.py --check` 通过，manifest 增记
+  `st_duplicate_check_relaxable`。新增两条**只桩 HTTP、走真实上游**的用例
+  （同内容 → `state=ok` + `cleaned_duplicates=1`；冲突 → `state=duplicate`）。
+- **2) 误判修正**：`_st_failure_kind(exc, relaxed_duplicates=)` 把合并文案归为
+  `ambiguous`（重试后复现只可能是空表 → `empty`）；「有一边为空」归 `failed`，
+  不再因字面含「为空」被当成可疑空表。新增逐文案断言。
+- **3) 死分支**：`_st_note` 删除 `board == "fund"`（159xxx 场内基金 board 是
+  unknown），改由既有 `status_source` 的 `fund_*` 前缀拦截；新增 unknown board
+  用例。
+- **4) 基金语义**：`cli.py` 基金路径 `is_st=null` + `is_st_source="not_applicable"`
+  （原为 `false` + `unavailable` 自相矛盾）。新增 fund 路径 CLI 用例。
+- **5) 错误路径**：`recommendation.status` 为 `data_source_error` /
+  `insufficient_data` 时不渲染「ST 状态未知」；新增两种错误响应断言。
+- **6) README**：两处 600519 示例统一为真实样例的 `quote_name` +
+  `tencent_quote`；`is_st_source` 词表补 `not_applicable` 与错误路径说明；
+  `test_readme_consistency.py` 新增「所有示例取值一致且等于真实样例」断言。
+- **证据（本机 Linux，`~/.venv` Python 3.12）**：
+  - `python -m pytest tests/ -q` → **1030 passed, 1 failed**；唯一失败仍是
+    `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    （父 commit 已有的解释器/依赖版本不符，与本改动无关）。
+  - `python tools/astock_extract.py --check` → OK（44 symbols）。
+  - 本机无 `pwsh`，`tools/check_gates.ps1` 未执行。
+
 ## 2026-11-15 · PR #107 P1：ST 名单改为收盘后预计算 + 盘前只读缓存
 
 - **分支**：`task/st-list-robust`（PR #107，父 = `origin/main` `ab7d435`）；

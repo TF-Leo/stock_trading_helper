@@ -213,7 +213,8 @@ class StListSnapshot:
     degraded: bool = False
     warning: Optional[str] = None
     # issue #106：三态区分 —— ``ok`` / ``empty``（可疑空表）/ ``duplicate``
-    # （可疑重复代码）/ ``failed``（请求失败）/ ``offline``（显式离线未请求）。
+    # （可疑重复代码）/ ``ambiguous``（上游合并文案「为空或代码重复」，单看
+    # 文案无法区分）/ ``failed``（请求失败）/ ``offline``（显式离线未请求）。
     # ``available=False`` 时 state 必须明确说明「为什么不可用」，调用方不得
     # 把空表当成「今天没有 ST」。
     state: str = "ok"
@@ -238,20 +239,31 @@ class StListDuplicateError(RuntimeError):
     """ST 名单出现无法清洗的重复代码（同一代码内容冲突）。"""
 
 
-def _st_failure_kind(exc: BaseException) -> str:
-    """把取数异常归类为 ``empty`` / ``duplicate`` / ``failed``。
+def _st_failure_kind(exc: BaseException,
+                     relaxed_duplicates: bool = False) -> str:
+    """把取数异常归类为 ``empty`` / ``duplicate`` / ``ambiguous`` / ``failed``。
 
-    上游 ``st_stock_list()`` 没有专用异常类型，只能按错误文案归类；归类只影响
-    warning 措辞与「是否重试一次」，不会把失败静默成空名单。
+    上游 ``st_stock_list()`` 没有专用异常类型，只能按错误文案归类（issue #109）：
+    * ``StListDuplicateError`` 只能来自本地内容冲突判定（行可复核）；
+    * 上游把「空表 / 重复代码」合并成一句
+      「ST 名单为空或代码重复」，单看文案无法区分 → ``ambiguous``；
+      第二次尝试已放开重复检查，同一条文案再出现只可能是空表 → ``empty``；
+    * 「有一边为空」是沪深/北交所半边缺失，属于取数不完整（``failed``），
+      **不能**因为字面含「为空」就当成可疑空表。
+    归类只影响 warning 措辞与「是否重试一次」，不会把失败静默成空名单。
     """
     if isinstance(exc, StListEmptyError):
         return "empty"
     if isinstance(exc, StListDuplicateError):
         return "duplicate"
     text = str(exc or "")
-    if "代码重复" in text or "重复" in text:
+    if "为空或代码重复" in text:
+        return "empty" if relaxed_duplicates else "ambiguous"
+    if "有一边为空" in text or "不能当成沪深京完整名单" in text:
+        return "failed"
+    if "代码重复" in text or "重复（" in text:
         return "duplicate"
-    if "为空" in text or "0 条" in text or "empty" in text.lower():
+    if "名单为空" in text or "0 条" in text or "empty" in text.lower():
         return "empty"
     return "failed"
 
@@ -420,7 +432,13 @@ def _snapshot_from_frame(frame, allow_clean: bool = False) -> StListSnapshot:
 def _fetch_st_list(allow_clean: bool = False) -> StListSnapshot:
     from stock_analysis.data_sources import _astock_generated as _g
 
-    frame = _g.st_stock_list()
+    # issue #109：上游在「有重复代码」时**先 raise**，本地清洗分支只有在放开
+    # 重复检查的那次重试里才拿得到原始表。``allow_duplicates=True`` 仍保留
+    # 空表报错；同代码冲突由 :func:`_snapshot_from_frame` 判定后继续报错。
+    if allow_clean:
+        frame = _g.st_stock_list(allow_duplicates=True)
+    else:
+        frame = _g.st_stock_list()
     return _snapshot_from_frame(frame, allow_clean=allow_clean)
 
 
@@ -434,6 +452,7 @@ def _st_list_warning(kind: str, reason: str, cached: Optional[dict],
     label = {
         "empty": "ST 名单为空（可疑）",
         "duplicate": "ST 名单代码重复（可疑）",
+        "ambiguous": "ST 名单为空或代码重复（可疑）",
         "failed": "ST 名单接口失败",
     }.get(kind, "ST 名单接口异常")
     retry_note = "，已重试 1 次仍异常" if retried else ""
@@ -447,6 +466,9 @@ def _st_list_warning(kind: str, reason: str, cached: Optional[dict],
         return (f"{label}{retry_note}（{reason}）：接口返回 0 条，不能当成"
                 "「今日没有 ST」，is_st 只能依据实时报价/本地名称判断")
     if kind == "duplicate":
+        return (f"{label}{retry_note}（{reason}）：名单不能当成完整快照，"
+                "is_st 只能依据实时报价/本地名称判断")
+    if kind == "ambiguous":
         return (f"{label}{retry_note}（{reason}）：名单不能当成完整快照，"
                 "is_st 只能依据实时报价/本地名称判断")
     return (f"{label}（{reason}）{retry_note}，且无本地缓存："
@@ -527,21 +549,30 @@ def fetch_st_list() -> StListSnapshot:
     重试口径与 #106 一致：空表 / 重复代码重试一次；网络失败（含 444 / FIN）
     不额外重试，避免把一次封禁放大成多次请求。调用方（预计算）据
     ``snapshot.state`` 决定是否落盘。
+
+    issue #109：上游在重复代码时先抛合并文案，本地清洗分支因此在生产路径
+    不可达。第一次异常若可能是重复代码（``duplicate`` / ``ambiguous``），
+    重试时放开上游的重复检查并真正走 :func:`_snapshot_from_frame` 的清洗
+    判定；内容一致的重复行被清洗并计数，内容冲突仍然报错。
     """
     last_exc: Optional[BaseException] = None
     kind = "failed"
     retried = False
+    relaxed = False
     for attempt in range(1 + ST_LIST_RETRY):
         try:
-            snapshot = _fetch_st_list(allow_clean=(attempt > 0))
+            snapshot = _fetch_st_list(allow_clean=relaxed)
             if attempt > 0:
                 snapshot.retried = True
             return snapshot
         except Exception as exc:  # 网络 / 空表 / 重复代码
             last_exc = exc
-            kind = _st_failure_kind(exc)
-            if attempt < ST_LIST_RETRY and kind in ("empty", "duplicate"):
+            kind = _st_failure_kind(exc, relaxed_duplicates=relaxed)
+            if attempt < ST_LIST_RETRY and kind in ("empty", "duplicate",
+                                                    "ambiguous"):
                 retried = True
+                # 只有「可能是重复代码」才需要放开上游检查；空表重试不变。
+                relaxed = kind in ("duplicate", "ambiguous")
                 continue
             break
     reason = f"{type(last_exc).__name__}: {last_exc}"

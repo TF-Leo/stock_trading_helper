@@ -482,7 +482,7 @@ def test_st_list_duplicate_codes_cleaned_on_retry(monkeypatch):
     _enable_network(monkeypatch)
     calls = {"n": 0}
 
-    def dup():
+    def dup(**kwargs):
         calls["n"] += 1
         return _dup_frame()
 
@@ -545,7 +545,7 @@ def test_st_list_conflicting_duplicates_fall_back_to_cache(monkeypatch):
 
     calls = {"n": 0}
 
-    def conflict():
+    def conflict(**kwargs):
         calls["n"] += 1
         return _dup_frame(conflict=True)
 
@@ -589,6 +589,116 @@ def test_fresh_cache_state_is_ok_not_stale(monkeypatch):
     snap = status.get_st_list(now=now)
     assert snap.available and snap.state == "ok"
     assert not snap.stale and not snap.degraded
+
+
+# ---------------------------------------------------------------------------
+# issue #109：重复代码清洗必须走生产路径（只桩 HTTP，不桩 st_stock_list）
+# ---------------------------------------------------------------------------
+class _ClistResponse:
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+
+    def __init__(self, rows):
+        self._payload = {"rc": 0, "data": {"total": len(rows), "diff": rows}}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+def _patch_st_list_http(monkeypatch, shsz_rows, bj_rows=()):
+    """只替换东财 HTTP 层，保留真实 st_stock_list / _em_clist_all / em_get。"""
+    from stock_analysis.data_sources import _astock_generated as _g
+
+    calls = {"n": 0}
+
+    def fake_get(url, params=None, headers=None, timeout=15, **kwargs):
+        calls["n"] += 1
+        fs = (params or {}).get("fs", "")
+        if fs == "m:0+t:81+s:2048":
+            return _ClistResponse(list(bj_rows))
+        return _ClistResponse(list(shsz_rows))
+
+    monkeypatch.setattr(_g.EM_SESSION, "get", fake_get)
+    monkeypatch.setattr(_g, "_em_last_call", [time.time()])
+    monkeypatch.setattr(_g.time, "sleep", lambda seconds: None)
+    return calls
+
+
+def test_production_duplicate_rows_are_cleaned_on_retry(monkeypatch):
+    """issue #109：上游先 raise 的合并文案必须真正走清洗，而不是只有桩能触发。
+
+    只打桩 HTTP 层，真实 ``st_stock_list`` 第一次仍抛
+    「ST 名单为空或代码重复」；第二次重试放开重复检查后，同代码同内容的
+    两行由本地清洗掉并计数（公开基准代码 600519 / 600000）。
+    """
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    row = {"f12": "600519", "f13": 1, "f14": "*ST茅台示例",
+           "f2": 1500.0, "f3": 1.0}
+    calls = _patch_st_list_http(
+        monkeypatch,
+        [row, dict(row),
+         {"f12": "600000", "f13": 1, "f14": "ST浦发示例", "f2": 10.0, "f3": -0.5}],
+        [{"f12": "830001", "f13": 0, "f14": "ST北交示例", "f2": 2.0, "f3": 0.0}],
+    )
+
+    snap = status.fetch_st_list()
+
+    assert snap.available and snap.state == "ok"
+    assert snap.retried is True
+    assert snap.cleaned_duplicates == 1
+    assert snap.warning and "已清洗" in snap.warning
+    assert set(snap.codes) == {"600519", "600000", "830001"}
+    assert calls["n"] == 4, "两次尝试各 2 次 clist（沪深 + 北交所）"
+
+
+def test_production_conflicting_duplicates_still_reported_as_duplicate(monkeypatch):
+    """同代码不同内容无法清洗：仍判 duplicate，不写坏名单。"""
+    from stock_analysis.data_loader import status
+
+    _enable_network(monkeypatch)
+    row = {"f12": "600519", "f13": 1, "f14": "*ST茅台示例",
+           "f2": 1500.0, "f3": 1.0}
+    conflict = dict(row, f14="ST冲突行")
+    calls = _patch_st_list_http(
+        monkeypatch,
+        [row, conflict,
+         {"f12": "600000", "f13": 1, "f14": "ST浦发示例", "f2": 10.0, "f3": -0.5}],
+        [{"f12": "830001", "f13": 0, "f14": "ST北交示例", "f2": 2.0, "f3": 0.0}],
+    )
+
+    snap = status.fetch_st_list()
+
+    assert not snap.available
+    assert snap.state == "duplicate"
+    assert "重复（可疑）" in snap.warning
+    assert calls["n"] == 4
+
+
+def test_st_failure_kind_reads_upstream_messages_literally():
+    """issue #109：合并文案不是 duplicate，「有一边为空」也不是 empty。"""
+    from stock_analysis.data_loader import status
+
+    merged = RuntimeError("ST 名单为空或代码重复，不能当成完整快照")
+    assert status._st_failure_kind(merged) == "ambiguous"
+    # 第二次尝试已放开重复检查，同一条文案再出现只能是空表。
+    assert status._st_failure_kind(merged, relaxed_duplicates=True) == "empty"
+
+    one_side = RuntimeError(
+        "东财风险警示板 0 条、北交所全表 12 条，有一边为空，不能当成沪深京完整名单")
+    assert status._st_failure_kind(one_side) == "failed"
+
+    assert status._st_failure_kind(
+        RuntimeError("东财 ST 名单不可达（ConnectionError）；baostock 兜底已禁用")
+    ) == "failed"
+
+    assert status._st_failure_kind(
+        status.StListEmptyError("ST 名单为空，不能当成完整快照")) == "empty"
+    assert status._st_failure_kind(
+        status.StListDuplicateError("ST 名单代码 '600519' 重复，无法判断")) == "duplicate"
 
 
 # --- 来源标注 -----------------------------------------------------------------
@@ -701,6 +811,52 @@ def _run_cli(monkeypatch, trading, stock_name="示例", code="600519"):
     monkeypatch.setattr(cli, "run_strategy_tournament",
                         lambda *a, **k: (names[0], res, comp))
     return cli.advise_internal(code, fast=True, no_regime=True)
+
+
+def _run_cli_fund(monkeypatch, code="510300"):
+    """基金路径：data_type=fund 时不解析交易状态（公开基准 ETF 510300）。"""
+    import cli
+    import stock_analysis.data_loader.meta as meta
+    from stock_analysis.backtest.engine import BacktestResult
+
+    df = _toy()
+    monkeypatch.setattr(meta, "resolve_and_fetch", lambda *a, **k: (df, "fund", None))
+    monkeypatch.setattr(cli, "last_fetch_info",
+                        lambda: {"source": "cache", "from_cache": True,
+                                 "degraded": None, "lag_days": None})
+
+    def _no_status(*a, **k):
+        raise AssertionError("基金不参与 ST/交易状态判定，不得调用 resolve_trading_status")
+
+    monkeypatch.setattr(cli, "resolve_trading_status", _no_status)
+
+    names = list(cli.build_fund_strategy_signals().keys())[:3]
+    comp = pd.DataFrame(
+        [{"评分": 1.0 - i * 0.1, "评分IS": 1.0 - i * 0.1, "评分OOS": 0.9 - i * 0.1,
+          "年化收益": "10.00%", "最大回撤": "5.00%", "胜率": "60.00%", "交易次数": 20}
+         for i, _ in enumerate(names)],
+        index=names,
+    )
+    res = BacktestResult(trade_count=20, win_rate=0.6, annual_return=0.1,
+                         max_drawdown=0.05, unaffordable_lot_events=0)
+    res.equity_curve = [100000.0] * 50
+    monkeypatch.setattr(cli, "run_strategy_tournament",
+                        lambda *a, **k: (names[0], res, comp))
+    return cli.advise_internal(code, fast=True, no_regime=True)
+
+
+def test_cli_fund_instrument_marks_st_not_applicable(monkeypatch):
+    """issue #109：基金不是 ST=false，而是 is_st=null + not_applicable。
+
+    ``is_st=false`` 配 ``is_st_source=unavailable`` 自相矛盾：前者断言「非 ST」，
+    后者说明「未知」。基金根本不做 ST 判定，必须用显式的「不适用」。
+    """
+    out = _run_cli_fund(monkeypatch)
+    inst = out["instrument"]
+    assert out["request"]["type"] == "fund"
+    assert inst["is_st"] is None
+    assert inst["is_st_source"] == "not_applicable"
+    assert inst["status_source"] == "fund_static"
 
 
 def test_cli_instrument_additive_fields(monkeypatch):

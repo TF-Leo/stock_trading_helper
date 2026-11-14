@@ -8,8 +8,8 @@
     "skill_sha256": "09f7e8a3f826f747d293a1e86883003dbda932cf7fdd9e61714077ba057bf0f2"
   },
   "generated_file": "source/stock_analysis/data_sources/_astock_generated.py",
-  "generated_sha256": "c017ca48d5f5cec005cb30f213f7cbd990037845ca9a460beb27dd61ab2181e0",
-  "body_sha256": "ba914924a3e6df6db07a2b090ea23cb7b40f8bec10ffd2373c526f9a668e390e",
+  "generated_sha256": "af7cec001b9241bfd09b04905dfa73fabfa6bb52ecf1f353fde8348434dd592e",
+  "body_sha256": "62ba2c14f26098b0efc9fef19ce7cabeaa27cc1c45b2a8ffcaf549dc1f911bf6",
   "selections": [
     {
       "symbol": "SH_INDEX",
@@ -319,7 +319,7 @@
       "symbol": "st_stock_list",
       "section": "§6.8 ST / *ST 名单",
       "upstream_sha256": "6b836d4a686eb7c1b98e81582fc7644bb57dca188261146301274425b2e2ac9f",
-      "generated_sha256": "ab19399e15f56ca5dad5694d5ab2a129d45e313d569990b11eeec70bcab255b1",
+      "generated_sha256": "afde77d8b93420d75b3bff1b9640983ca761e005fc28b6151c80d96c5350f4d2",
       "timeout_injections": 0,
       "baostock_fallback_disabled": 1
     },
@@ -373,6 +373,11 @@
     {
       "kind": "baostock_fallback_disabled",
       "detail": "§6.8 st_stock_list's baostock fallback return replaced by an explicit RuntimeError; no baostock dependency is added.",
+      "injections": 1
+    },
+    {
+      "kind": "st_duplicate_check_relaxable",
+      "detail": "§6.8 st_stock_list accepts allow_duplicates=False: a retry can request the raw frame so identical duplicate rows are cleaned by the caller; empty/conflicting rows still raise.",
       "injections": 1
     },
     {

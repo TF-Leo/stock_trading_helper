@@ -244,6 +244,12 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     # 标的信息
     board, price_limit_pct, is_st = classify_board(code)
     name = get_stock_name(code) if data_type == 'stock' else code
+    # issue #109：基金不参与 ST 判定。``is_st=false`` + ``is_st_source=unavailable``
+    # 是自相矛盾的值；基金显式 ``is_st=null`` + ``is_st_source=not_applicable``。
+    # 个股在下面由 ``resolve_trading_status`` 覆盖这两个值。
+    if data_type != 'stock':
+        is_st = None
+    is_st_source = 'not_applicable'
 
     # P0-3（issue #6）：真实交易状态（ST / 停牌 / 涨跌停 / 退市信号）。
     # 只对个股查询；基金保留静态字段。查询失败永不阻断主流程，只降级 + warning。
@@ -259,6 +265,7 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
         # is_st 可能为 None（ST 名单 / 腾讯报价 / 本地名称都不可用）：
         # 直接透传未知态，绝不保留 classify_board 的静态 False 伪装成"非 ST"。
         is_st = trading.is_st
+        is_st_source = trading.is_st_source
         warnings.extend(trading.warnings)
 
     # 运行回测
@@ -531,9 +538,10 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'price_limit_pct': price_limit_pct,
             'is_st': is_st,
             # issue #106 additive：ST 判定来源（exchange_list / quote_name /
-            # local_name / unavailable）。渲染层据 unavailable 显示「ST 状态未知」。
-            'is_st_source': ('unavailable' if trading is None
-                             else trading.is_st_source),
+            # local_name / unavailable / not_applicable）。渲染层据 unavailable
+            # 显示「ST 状态未知」；not_applicable 表示该标的类型（基金）不参与
+            # ST 判定（issue #109）。
+            'is_st_source': is_st_source,
             # P0-3 additive：真实交易状态（未知显式 null，不伪装成 False）
             'is_suspended': None if trading is None else trading.is_suspended,
             'limit_up': None if trading is None else trading.limit_up,

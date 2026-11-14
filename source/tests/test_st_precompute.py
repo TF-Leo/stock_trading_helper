@@ -61,7 +61,7 @@ def _seed_good_cache(now=NOW_CLOSE):
 
 
 def _patch_st_list(monkeypatch, frame, calls):
-    def fake():
+    def fake(**kwargs):
         calls.append(1)
         return frame
 

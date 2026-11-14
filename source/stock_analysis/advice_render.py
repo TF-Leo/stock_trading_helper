@@ -586,13 +586,19 @@ def _status_note(inst: Dict[str, Any]) -> Optional[str]:
     return "交易状态：未知（无实时报价，不能确认是否停牌）"
 
 
-def _st_note(inst: Dict[str, Any]) -> Optional[str]:
-    """ST 状态不可得时的措辞（issue #106）。
+def _st_note(inst: Dict[str, Any],
+             rec: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """ST 状态不可得时的措辞（issue #106 / #109）。
 
     只有 ``is_st_source='unavailable'`` / ``is_st is None`` 时才输出
-    「ST 状态未知」；**绝不**把未知写成「非 ST」。基金不参与 ST 判定。
+    「ST 状态未知」；**绝不**把未知写成「非 ST」。基金不参与 ST 判定，靠
+    ``status_source`` 的 ``fund_*`` 前缀拦截（``board == 'fund'`` 不可靠：
+    159xxx 等场内基金代码的 board 是 ``unknown``，该分支在真实响应里点不到，
+    issue #109 已删除）。取数/数据不足的错误响应不渲染本行：ST 状态根本
+    没有被解析，属于「未尝试」，不是「尝试后未知」，再说一遍只会打扰读者。
     """
-    if _text(inst.get("board")) == "fund":
+    if _text((rec or {}).get("status")) in ("data_source_error",
+                                            "insufficient_data"):
         return None
     if (_text(inst.get("status_source")) or "").startswith("fund"):
         return None
@@ -1287,7 +1293,7 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     if note:
         lines.append(note)
 
-    st_note = _st_note(inst)
+    st_note = _st_note(inst, rec)
     if st_note:
         lines.append(st_note)
 
