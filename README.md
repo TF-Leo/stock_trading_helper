@@ -613,14 +613,33 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 | 资金面 | `flow.{available,source,caliber,net_5d,net_20d,as_of,main_net_5d,main_net_20d}` |
 | 估值 | `valuation.{available,pe_percentile_3y,pb_percentile_3y,ps_percentile_3y,as_of}` |
 | 市况 | `market_regime.{label,confidence}` / `index_regime.{label,confidence}` |
-| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` |
-| 结算 | `settled.{ret_20d,hit,settle_date,entry_date,entry_open,exit_open,horizon_days,price_source}` 或 `null` + `settle_reason` |
+| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` `instrument_type` |
+| 结算 | `settled.{ret_20d,hit,settle_date,entry_date,entry_open,exit_open,horizon_days,price_source}` 或 `null` + `settle_reason`，外加 `settle_status` |
 
 结算口径：`open_{d+1+20} / open_{d+1} − 1`，用**前复权**开盘价（分红送转在比值里
 自然抵消）。「交易日」以该票自己的行情索引为准（停牌日无开盘价，不能成交）。
 `buy` 记 `ret > 0`、`sell` 记 `ret < 0`；`hold` / `avoid` / `insufficient_data`
-没有方向，**不参与命中率与校准**。价格取不到时 `settled=null` + `settle_reason`
-（`no_price_data` / `not_matured` / `no_bars_as_of`），**不缩短持有期、不猜**。
+没有方向，**不参与命中率与校准**。价格取不到时 `settled=null` + `settle_reason`，
+**不缩短持有期、不猜**。
+
+价源按标的类型选（issue #95）：个股读 `stock_*_qfq.csv`（`price_source` =
+`local_qfq_cache`），场外基金读 `fund_*.csv`（`price_source` = `fund_nav`；
+OTC 基金只有单位净值，`open` 由净值补齐，口径仍是开盘对开盘）。
+类型取自记录里的 `instrument_type`（记录阶段从 CLI 的 `request.type` 落下）；
+老记录没有该键时按 `stock_*_qfq.csv` → `fund_*.csv` 顺序探测，与修复前一致。
+
+`settle_status` 把「没到期 / 数据未到」和「真失败」分开：
+
+| `settle_status` | 触发 `settle_reason` | 是否计入失败率 |
+|---|---|---|
+| `settled` | —（已算出收益） | 否 |
+| `not_matured` | `not_matured`（还没攒够 20 根） | 否 |
+| `pending` | `no_bars_after_as_of`（as_of 之后还没有行情，通常是缓存未更新） | 否 |
+| `failed` | `no_price_data` / `open_missing` / `price_parse_error` | 是 |
+
+`report` 输出里 `pending` 与 `failed` 分开计数（`settle_status` 逐态计数，
+`pending` / `failed` 两个顶层键）。老台账没有 `settle_status` 时按
+`settle_reason` 反推，口径一致。
 
 `report` 给出：已到期条数、方向命中率、按 `confidence` 分箱的校准（含 Brier）、
 按 `action` / `flow.caliber` / `flow.available` / `valuation.pb` 分位的分层命中率 ——

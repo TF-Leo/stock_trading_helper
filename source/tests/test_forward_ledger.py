@@ -48,9 +48,13 @@ def _bdays(end: date, n: int):
 
 def _cli_payload(code="002415", as_of="2026-11-12", action="buy",
                  confidence=0.62, flow=None, valuation=None,
-                 market=None, index=None, status="ok"):
-    """构造一份与 ``cli.py --json`` 同构的最小输出。"""
+                 market=None, index=None, status="ok", type_hint="stock"):
+    """构造一份与 ``cli.py --json`` 同构的最小输出。
+
+    ``type_hint`` 写进 ``request.type``：issue #95 起台账按它选结算价源。
+    """
     return {
+        "request": {"code": code, "type": type_hint, "type_hint": "auto"},
         "data": {"end": as_of, "last_close": 30.5, "bars": 1600},
         "market_regime": {
             "label": "Bull", "confidence": 0.71, "as_of": as_of,
@@ -365,6 +369,196 @@ def test_settle_all_skips_not_matured(ledger_tmp):
     assert stats["not_matured"] == 1 and stats["settled"] == 0
     record = fl.load_day("2026-11-20", ledger_tmp)["records"]["002415"]
     assert record["settled"] is None and record["settle_reason"] == "not_matured"
+    # issue #95：未到期是「数据未到」，归非失败态，不计入 failed
+    assert record["settle_status"] == "not_matured"
+    assert stats["failed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 场外基金结算（issue #95）
+#
+# 基金净值不在 ``stock_*_qfq.csv``，而在 ``fund_*.csv``。夹具
+# ``tests/fixtures/fund/fund_999901.csv`` 是**真实公开 ETF 日线**的 140 个交易日
+# 切片，代码已匿名化为 999901 —— 仓库里不出现任何真实基金/持仓代码。
+# 场外 OTC 基金走同一张表（``get_fund_daily`` 用单位净值补齐 open），
+# 所以这条路径与 ETF 共用。
+# ---------------------------------------------------------------------------
+FUND_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "fund" / "fund_999901.csv"
+FUND_CODE = "999901"  # 虚构代码，不对应任何真实标的
+
+
+def _fund_fixture_frame():
+    frame = pd.read_csv(FUND_FIXTURE, index_col=0, parse_dates=True)
+    return frame.sort_index()
+
+
+def test_load_price_bars_reads_fund_csv_for_fund(tmp_path, monkeypatch):
+    """``instrument_type='fund'`` 必须读 ``fund_*.csv``，不是 ``stock_*_qfq.csv``。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / f"fund_{FUND_CODE}.csv").write_text(
+        FUND_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    bars = fl.load_price_bars(FUND_CODE, "fund")
+    assert bars is not None and len(bars) == len(_fund_fixture_frame())
+    assert list(bars.columns[:1]) == ["open"]
+    # 明确指 fund 时不去找 stock_*：只有 fund_*.csv 存在也能读到
+    assert not (data_dir / f"stock_{FUND_CODE}_qfq.csv").exists()
+
+
+def test_load_price_bars_stock_path_unchanged(tmp_path, monkeypatch):
+    """个股路径不回归：仍然只读 ``stock_*_qfq.csv``。"""
+    data_dir = tmp_path / "data"
+    _write_bars(data_dir, FUND_CODE, _bdays(date(2026, 12, 1), 5),
+                [10.0, 10.1, 10.2, 10.3, 10.4])
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    bars = fl.load_price_bars(FUND_CODE, "stock")
+    assert bars is not None and len(bars) == 5
+    assert float(bars["open"].iloc[0]) == 10.0
+
+
+def test_load_price_bars_falls_back_to_fund_when_type_unknown(tmp_path, monkeypatch):
+    """老记录没有 ``instrument_type``：先探 stock，再探 fund。"""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / f"fund_{FUND_CODE}.csv").write_text(
+        FUND_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(fl, "DATA_DIR", str(data_dir))
+
+    assert fl.load_price_bars(FUND_CODE) is not None
+    assert fl.load_price_bars(FUND_CODE, None) is not None
+
+
+def test_settle_fund_record_success(ledger_tmp, monkeypatch):
+    """基金记录结算成功，且 ``price_source`` 写真实来源 ``fund_nav``。
+
+    用真实基金日线夹具离线回归：``as_of=2026-09-01`` → entry 2026-09-02
+    开盘 4.65 → exit 2026-10-08 开盘 4.418，手算 ``4.418/4.65 − 1 = -0.049892``。
+    """
+    monkeypatch.setattr(fl, "DATA_DIR", str(FUND_FIXTURE.parent))
+    frame = _fund_fixture_frame()
+    entry_open = float(frame.loc["2026-09-02", "open"])
+    exit_open = float(frame.loc["2026-10-08", "open"])
+
+    fl.record_day([FUND_CODE], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code=FUND_CODE, type_hint="fund",
+                                              as_of="2026-09-01")))
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    assert stats["settled"] == 1 and stats["failed"] == 0
+
+    record = fl.load_day("2026-09-01", ledger_tmp)["records"][FUND_CODE]
+    assert record["instrument_type"] == "fund"
+    assert record["settle_status"] == "settled"
+    settled = record["settled"]
+    assert settled["entry_date"] == "2026-09-02"
+    assert settled["settle_date"] == "2026-10-08"
+    assert settled["entry_open"] == pytest.approx(entry_open)
+    assert settled["exit_open"] == pytest.approx(exit_open)
+    assert settled["ret_20d"] == pytest.approx(round(exit_open / entry_open - 1, 6))
+    assert settled["ret_20d"] == pytest.approx(-0.049892)
+    assert settled["hit"] is False  # buy 且收益为负
+    # issue #95 要求 2：来源写真实值，不再统一写 local_qfq_cache
+    assert settled["price_source"] == "fund_nav"
+
+
+def test_settle_fund_missing_price_is_failed(ledger_tmp, tmp_path, monkeypatch):
+    """基金缺价：``no_price_data`` 仍是 failed（真拿不到价，不是数据未到）。"""
+    empty_dir = tmp_path / "empty_data"
+    empty_dir.mkdir()
+    monkeypatch.setattr(fl, "DATA_DIR", str(empty_dir))
+    fl.record_day([FUND_CODE], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code=FUND_CODE, type_hint="fund",
+                                              as_of="2026-09-01")))
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    assert stats["settled"] == 0 and stats["failed"] == 1
+    assert stats["reasons"] == {"no_price_data": 1}
+    record = fl.load_day("2026-09-01", ledger_tmp)["records"][FUND_CODE]
+    assert record["settled"] is None and record["settle_reason"] == "no_price_data"
+    assert record["settle_status"] == "failed"
+
+
+def test_settle_no_bars_after_as_of_is_pending(ledger_tmp):
+    """``no_bars_after_as_of`` 归 pending（数据未到），不计入 failed（issue #95）。"""
+    days = _bdays(date(2026, 11, 2), 3)
+    frame = pd.DataFrame({"open": [10.0, 10.0, 10.0]},
+                         index=pd.to_datetime([d.isoformat() for d in days]))
+    fl.record_day(["002415"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(as_of="2026-11-02")))
+    stats = fl.settle_all(ledger_dir=ledger_tmp,
+                          price_loader=lambda _code: frame)
+    assert stats["pending"] == 1
+    assert stats["failed"] == 0
+    assert stats["settled"] == 0
+    assert stats["reasons"] == {"no_bars_after_as_of": 1}
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    assert record["settled"] is None
+    assert record["settle_reason"] == "no_bars_after_as_of"
+    assert record["settle_status"] == "pending"
+
+
+def test_settle_fund_record_without_instrument_type_still_labels_fund(ledger_tmp,
+                                                                      monkeypatch):
+    """老记录没有 ``instrument_type``：只要真读了 ``fund_*.csv`` 就标 ``fund_nav``。
+
+    issue #95 要求 2 是「写真实来源」，不是「按字段猜来源」：探测到基金文件
+    时若还写 ``local_qfq_cache`` 就是假话。
+    """
+    monkeypatch.setattr(fl, "DATA_DIR", str(FUND_FIXTURE.parent))
+    _write_settled_day(ledger_tmp, "2026-09-01", {
+        FUND_CODE: {"as_of": "2026-09-01", "code": FUND_CODE,
+                    "action": "buy", "confidence": 0.5,
+                    "settled": None, "settle_reason": None},
+    })
+    stats = fl.settle_all(ledger_dir=ledger_tmp)
+    assert stats["settled"] == 1
+    record = fl.load_day("2026-09-01", ledger_tmp)["records"][FUND_CODE]
+    assert record["settled"]["price_source"] == "fund_nav"
+
+
+def test_settle_stock_price_source_stays_local_qfq(ledger_tmp):
+    """个股路径不回归：``price_source`` 仍是 ``local_qfq_cache``。"""
+    days, opens = _bars_with_hand_math()
+    frame = pd.DataFrame({"open": opens}, index=pd.to_datetime(
+        [d.isoformat() for d in days]))
+    fl.record_day(["002415"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(as_of="2026-11-02")))
+    fl.settle_all(ledger_dir=ledger_tmp, price_loader=lambda _code: frame)
+    record = fl.load_day("2026-11-02", ledger_tmp)["records"]["002415"]
+    assert record["instrument_type"] == "stock"
+    assert record["settled"]["price_source"] == "local_qfq_cache"
+
+
+def test_report_counts_pending_separately(ledger_tmp):
+    """汇总里 pending 单独计数，不进 failed。"""
+    _write_settled_day(ledger_tmp, "2026-11-02", {
+        "000001": {"as_of": "2026-11-02", "action": "buy", "confidence": 0.5,
+                   "settled": None, "settle_reason": "no_bars_after_as_of",
+                   "settle_status": "pending"},
+        "000002": {"as_of": "2026-11-02", "action": "buy", "confidence": 0.5,
+                   "settled": None, "settle_reason": "no_price_data",
+                   "settle_status": "failed"},
+        "000003": {"as_of": "2026-11-02", "action": "buy", "confidence": 0.5,
+                   "settled": None, "settle_reason": "not_matured",
+                   "settle_status": "not_matured"},
+    })
+    report = fl.build_report(ledger_dir=ledger_tmp)
+    assert report["pending"] == 1
+    assert report["failed"] == 1
+    assert report["settle_status"]["not_matured"] == 1
+    text = fl.format_report(report)
+    assert "pending 1" in text and "结算失败 1" in text
+
+
+def test_report_infers_pending_for_legacy_records(ledger_tmp):
+    """老台账没有 ``settle_status``：按 ``settle_reason`` 反推，口径一致。"""
+    _write_settled_day(ledger_tmp, "2026-11-02", {
+        "000001": {"as_of": "2026-11-02", "action": "buy", "confidence": 0.5,
+                   "settled": None, "settle_reason": "no_bars_after_as_of"},
+    })
+    report = fl.build_report(ledger_dir=ledger_tmp)
+    assert report["pending"] == 1 and report["failed"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -161,7 +161,8 @@ def evaluate(ledger_dir=None):
     """CSV 结算（旧行为）+ JSON 台账结算（issue #56）。"""
     stats = ledger.settle_all(ledger_dir=ledger_dir)
     print(f"JSON 台账结算：{stats['days']} 天，已到期 {stats['settled']} 条，"
-          f"未到期 {stats['not_matured']} 条，价格缺失 {stats['failed']} 条"
+          f"未到期 {stats['not_matured']} 条，数据未到 pending {stats['pending']} 条，"
+          f"结算失败 {stats['failed']} 条"
           + (f"（{stats['reasons']}）" if stats["reasons"] else ""))
     if not LOG.exists():
         print(f"没有 CSV 台账：{LOG}")

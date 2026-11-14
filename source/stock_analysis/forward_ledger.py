@@ -44,12 +44,34 @@ R4 的 C 路径（校准，Brier 改善 ≥0.02）要求 **≥200 条已到期�
 * ``hit``：``buy`` 记 ``ret > 0``，``sell`` 记 ``ret < 0``；``hold`` / ``avoid`` /
   ``insufficient_data`` **没有方向**，不参与命中率与校准（只在 ``by_action`` 里
   计数），避免把「不动作」当成猜对。
+
+场外基金（issue #95）
+---------------------
+基金净值不在 ``stock_*_qfq.csv`` 里，而在 ``fund_*.csv``（OTC 场外基金只有单位
+净值，``meta.get_fund_daily`` 把 ``open`` 补成净值；场内 ETF 是真实 OHLC）。
+``load_price_bars`` 因此**按标的类型选源**，取价口径不变
+（``open_{d+1+20} / open_{d+1} − 1``）：
+
+* 类型判定优先用记录里的 ``instrument_type``（记录阶段从 CLI 的
+  ``request.type`` 落下，additive 字段）；老记录没有该字段时退回文件探测 ——
+  **先找 ``stock_*_qfq.csv``，再找 ``fund_*.csv``**，与修复前行为一致
+  （``510300`` 这类场内 ETF 两份缓存都有，老记录仍走个股路径，不改变历史口径）。
+* 结算里的 ``price_source`` 写真实来源：个股 ``local_qfq_cache``、
+  基金 ``fund_nav``。
+* ``settle_status`` 把「没到期 / 数据未到」和「真失败」分开：
+  ``settled`` / ``not_matured``（还没攒够 20 根）/ ``pending``
+  （``no_bars_after_as_of``：as_of 之后一根都没有，通常是缓存还没更新）/
+  ``failed``（``no_price_data`` / ``open_missing`` / ``price_parse_error``）。
+  ``pending`` 与 ``not_matured`` **不计入失败率**。``price_source`` 取
+  ``load_price_bars`` 实际读到的文件（``bars.attrs``），老记录探测到
+  ``fund_*.csv`` 也会如实标 ``fund_nav``。
 * ``confidence`` 当作「该方向判断正确的概率」用于校准（Brier）。这是 C 路径的
   操作性定义；它回答的是「置信度可不可信」，不回答「买点好不好」。
 """
 from __future__ import annotations
 
 import datetime as _dt
+import inspect
 import json
 import os
 
@@ -66,6 +88,29 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 HORIZON_DAYS = 20
 
 DIRECTIONAL_ACTIONS = ("buy", "sell")
+
+#: 标的类型（issue #95）。记录阶段从 CLI 的 ``request.type`` 落下；
+#: 决定结算时读 ``stock_*_qfq.csv`` 还是 ``fund_*.csv``。
+INSTRUMENT_TYPES = ("stock", "fund")
+
+#: 结算来源标注（写进 ``settled.price_source``，issue #95 要求真实来源）。
+PRICE_SOURCE_STOCK = "local_qfq_cache"
+PRICE_SOURCE_FUND = "fund_nav"
+
+#: ``settle_status`` 取值。``pending`` / ``not_matured`` 都**不算失败**：
+#: 前者是「as_of 之后还没有行情」（缓存没更新），后者是「还没攒够 20 根」。
+SETTLE_STATUS_SETTLED = "settled"
+SETTLE_STATUS_NOT_MATURED = "not_matured"
+SETTLE_STATUS_PENDING = "pending"
+SETTLE_STATUS_FAILED = "failed"
+
+#: ``settle_reason`` → ``settle_status`` 的**非失败**映射。未列出的
+#: （``no_price_data`` / ``open_missing`` / ``price_parse_error``）一律 ``failed``。
+#: ``not_matured``（未攒够 20 根）与 ``no_bars_after_as_of``（数据未到）都不算失败。
+_NON_FAILURE_STATUS = {
+    "not_matured": SETTLE_STATUS_NOT_MATURED,
+    "no_bars_after_as_of": SETTLE_STATUS_PENDING,
+}
 
 #: ``confidence`` 校准分箱（左闭右开，最后一箱右闭）。
 CONFIDENCE_BINS = ((0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0))
@@ -211,9 +256,15 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
         "cli_exit": cli_exit,
         "elapsed_s": elapsed_s,
         "recorded_at": _now_iso(now),
+        # issue #95 additive：结算时按类型选价源（``stock_*_qfq.csv`` / ``fund_*.csv``）。
+        # 老记录没有这个键，``load_price_bars`` 退回文件探测。
+        "instrument_type": None,
         "missing": {},
         "settled": None,
         "settle_reason": None,
+        # issue #95 additive：``settled`` / ``not_matured`` / ``pending`` / ``failed``。
+        # ``no_bars_after_as_of`` 归 ``pending``（数据未到），不再算失败。
+        "settle_status": None,
     }
     missing = rec["missing"]
 
@@ -256,6 +307,16 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
                              FLOW_KEYS + FLOW_EXTRA_KEYS, missing, "flow")
     rec["valuation"] = _sub_block(evidence.get("valuation"),
                                   VALUATION_KEYS, missing, "valuation")
+
+    # issue #95：CLI 的 ``request.type`` 是唯一可靠的标的类型来源（``board``
+    # 只看 5 开头，场外基金 0/1 段会被判成 unknown，不能用来选价源）。
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    inst_type = request.get("type")
+    if inst_type in INSTRUMENT_TYPES:
+        rec["instrument_type"] = inst_type
+    else:
+        missing["instrument_type"] = (
+            "cli_block_absent" if not request else "field_absent_in_cli_output")
 
     market = payload.get("market_regime")
     rec["market_regime"] = _sub_block(market, REGIME_KEYS, missing, "market_regime")
@@ -367,21 +428,85 @@ def record_day(codes, as_of=None, ledger_dir=None, runner=None, now=None):
 # ---------------------------------------------------------------------------
 # 结算
 # ---------------------------------------------------------------------------
-def load_price_bars(code):
-    """读该票的前复权日线缓存；缺失 / 不可读返回 ``None``。"""
+def price_source_for(instrument_type):
+    """标的类型 → ``settled.price_source`` 标注（issue #95）。"""
+    return PRICE_SOURCE_FUND if instrument_type == "fund" else PRICE_SOURCE_STOCK
+
+
+def price_cache_path(code, instrument_type):
+    """该标的的价格缓存路径；``fund`` 走 ``fund_*.csv``，其余走 ``stock_*_qfq.csv``。"""
+    code = _normalize_code(code)
+    if instrument_type == "fund":
+        return os.path.join(DATA_DIR, f"fund_{code}.csv")
+    return os.path.join(DATA_DIR, f"stock_{code}_qfq.csv")
+
+
+def load_price_bars(code, instrument_type=None):
+    """读该标的的日线缓存；缺失 / 不可读返回 ``None``（issue #95）。
+
+    个股读 ``stock_*_qfq.csv``（前复权），场外基金读 ``fund_*.csv``（单位净值，
+    ``open`` 由 ``data_loader.meta.get_fund_daily`` 用净值补齐）。
+
+    ``instrument_type`` 为空（老记录没有这个键）时**文件探测**：先
+    ``stock_*_qfq.csv``，再 ``fund_*.csv``。顺序是有意的 —— ``510300`` 这类
+    场内 ETF 两份缓存都可能存在，先个股与修复前行为一致，历史口径不变。
+
+    返回的 DataFrame 在 ``attrs["price_source"]`` 上标注**实际读到的**来源，
+    供 :func:`compute_settlement` 写进结算记录：老记录即使没落
+    ``instrument_type``，只要真读了 ``fund_*.csv`` 也不会被标成
+    ``local_qfq_cache``（issue #95 要求 2）。
+    """
     import pandas as pd
 
-    path = os.path.join(DATA_DIR, f"stock_{_normalize_code(code)}_qfq.csv")
-    if not os.path.exists(path):
-        return None
+    if instrument_type in INSTRUMENT_TYPES:
+        candidates = [(price_cache_path(code, instrument_type),
+                       price_source_for(instrument_type))]
+    else:
+        candidates = [(price_cache_path(code, "stock"), PRICE_SOURCE_STOCK),
+                      (price_cache_path(code, "fund"), PRICE_SOURCE_FUND)]
+    for path, source in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            bars = pd.read_csv(path, index_col=0, parse_dates=True)
+        except Exception:
+            continue
+        if bars is None or len(bars) == 0 or "open" not in bars.columns:
+            continue
+        bars = bars.sort_index()
+        try:
+            bars.attrs["price_source"] = source
+        except Exception:  # pragma: no cover - 老 pandas 没有 attrs
+            pass
+        return bars
+    return None
+
+
+def _call_price_loader(loader, code, instrument_type):
+    """按 loader 的签名传参：新 loader 收 ``instrument_type``，旧替身只收 code。
+
+    测试与外部调用历史上注入的都是 ``lambda code: frame``；为了不让 issue #95
+    破坏这些调用方，只有 loader 显式声明了 ``instrument_type`` 参数才传。
+    """
     try:
-        bars = pd.read_csv(path, index_col=0, parse_dates=True)
-    except Exception:
-        return None
-    if bars is None or len(bars) == 0 or "open" not in bars.columns:
-        return None
-    bars = bars.sort_index()
-    return bars
+        params = inspect.signature(loader).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "instrument_type" in params:
+        return loader(code, instrument_type=instrument_type)
+    return loader(code)
+
+
+def settle_status_for(reason):
+    """``settle_reason`` → ``settle_status``（issue #95）。
+
+    ``not_matured``（还没攒够 20 根）与 ``no_bars_after_as_of``（as_of 之后
+    一根行情都没有，通常是缓存还没更新）都是「数据未到」，分别归
+    ``not_matured`` / ``pending``，**都不算失败**；只有真拿不到价才算 ``failed``。
+    """
+    if reason is None:
+        return SETTLE_STATUS_SETTLED
+    return _NON_FAILURE_STATUS.get(reason, SETTLE_STATUS_FAILED)
 
 
 def compute_settlement(record, bars, horizon=HORIZON_DAYS):
@@ -389,6 +514,11 @@ def compute_settlement(record, bars, horizon=HORIZON_DAYS):
 
     ``settled`` 为 ``None`` 时 ``reason`` 说明为什么（``not_matured`` /
     ``no_price_data`` / ``open_missing`` ...）。**不猜、不缩短持有期。**
+
+    ``price_source`` 标注**真实来源**（issue #95）：优先用
+    ``bars.attrs["price_source"]``（:func:`load_price_bars` 实际读到的文件），
+    其次按记录的 ``instrument_type`` 推断 —— 个股 ``local_qfq_cache``、
+    基金 ``fund_nav``。注入自定义 ``price_loader`` 时没有 attrs，走类型推断。
     """
     if bars is None or len(bars) == 0:
         return None, "no_price_data"
@@ -429,17 +559,37 @@ def compute_settlement(record, bars, horizon=HORIZON_DAYS):
         "entry_open": round(entry_open, 6),
         "exit_open": round(exit_open, 6),
         "horizon_days": int(horizon),
-        "price_source": "local_qfq_cache",
+        "price_source": _price_source_of(record, bars),
     }, None
+
+
+def _price_source_of(record, bars):
+    """结算来源：先看价源文件自报（``bars.attrs``），再退回记录类型。"""
+    attrs = getattr(bars, "attrs", None)
+    if isinstance(attrs, dict):
+        source = attrs.get("price_source")
+        if source in (PRICE_SOURCE_STOCK, PRICE_SOURCE_FUND):
+            return source
+    return price_source_for(record.get("instrument_type"))
 
 
 def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_DAYS,
                now=None):
-    """结算所有已到期记录；返回 ``{"days": n, "settled": n, "not_matured": n,
-    "failed": n}``。每次重算（缓存更新后可用新数据修正），幂等。"""
+    """结算所有已到期记录。
+
+    返回 ``{"days", "settled", "not_matured", "pending", "failed", "reasons"}``。
+    ``not_matured``（未攒够 20 根）与 ``pending``（``no_bars_after_as_of``，
+    数据未到）**都不算失败**，``failed`` 只统计真拿不到价的情况。
+
+    每次重算（缓存更新后可用新数据修正），幂等。价源按记录类型选：
+    ``price_loader`` 若接受 ``instrument_type`` 就传，否则按 code 调用（兼容
+    旧的单参测试替身）。缓存按 ``(code, instrument_type)`` 分键 —— 同一代码
+    在个股与基金两侧都可能有记录，混用缓存会拿错价。
+    """
     price_loader = price_loader or load_price_bars
     wanted = None if not codes else {_normalize_code(c) for c in codes}
-    stats = {"days": 0, "settled": 0, "not_matured": 0, "failed": 0, "reasons": {}}
+    stats = {"days": 0, "settled": 0, "not_matured": 0, "pending": 0,
+             "failed": 0, "reasons": {}}
     cache = {}
     for day in list_days(ledger_dir):
         payload = load_day(day, ledger_dir)
@@ -452,21 +602,30 @@ def settle_all(ledger_dir=None, codes=None, price_loader=None, horizon=HORIZON_D
                 continue
             if not isinstance(record, dict):
                 continue
-            if code not in cache:
-                cache[code] = price_loader(code)
-            settled, reason = compute_settlement(record, cache[code], horizon=horizon)
-            if record.get("settled") != settled or record.get("settle_reason") != reason:
+            inst_type = record.get("instrument_type")
+            cache_key = (code, inst_type)
+            if cache_key not in cache:
+                cache[cache_key] = _call_price_loader(price_loader, code, inst_type)
+            settled, reason = compute_settlement(record, cache[cache_key],
+                                                 horizon=horizon)
+            status = settle_status_for(reason)
+            if (record.get("settled") != settled
+                    or record.get("settle_reason") != reason
+                    or record.get("settle_status") != status):
                 changed = True
             record["settled"] = settled
             record["settle_reason"] = reason
-            if settled is None:
-                if reason == "not_matured":
-                    stats["not_matured"] += 1
-                else:
-                    stats["failed"] += 1
-                    stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
-            else:
+            record["settle_status"] = status
+            if settled is not None:
                 stats["settled"] += 1
+            elif status == SETTLE_STATUS_NOT_MATURED:
+                stats["not_matured"] += 1
+            elif status == SETTLE_STATUS_PENDING:
+                stats["pending"] += 1
+                stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+            else:
+                stats["failed"] += 1
+                stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
         if changed:
             payload["updated_at"] = _now_iso(now)
             _atomic_write(day_path(day, ledger_dir), payload)
@@ -523,13 +682,29 @@ def iter_records(ledger_dir=None):
 
 
 def build_report(ledger_dir=None):
-    """汇总报告（纯字典，便于测试与 ``--json`` 复用）。空台账返回零值，不崩。"""
+    """汇总报告（纯字典，便于测试与 ``--json`` 复用）。空台账返回零值，不崩。
+
+    issue #95：``pending``（``no_bars_after_as_of``，数据未到）单独计数，
+    不进 ``failed``、也不进失败率分母；``failed`` 只数真拿不到价的记录。
+    """
     days = list_days(ledger_dir)
     all_records = list(iter_records(ledger_dir))
     matured = [(day, code, r) for day, code, r in all_records
                if isinstance(r.get("settled"), dict)]
     directional = [(day, code, r) for day, code, r in matured
                    if r["settled"].get("hit") is not None]
+
+    settle_counts = {SETTLE_STATUS_SETTLED: 0, SETTLE_STATUS_NOT_MATURED: 0,
+                     SETTLE_STATUS_PENDING: 0, SETTLE_STATUS_FAILED: 0}
+    for _day, _code, record in all_records:
+        status = record.get("settle_status")
+        if status is None:
+            # 老台账没有这个键：从 settled / settle_reason 反推，口径与现在一致。
+            status = settle_status_for(record.get("settle_reason"))
+        if status in settle_counts:
+            settle_counts[status] += 1
+    pending = settle_counts[SETTLE_STATUS_PENDING]
+    failed = settle_counts[SETTLE_STATUS_FAILED]
 
     hit_rate, hit_n = _hit_rate([r["settled"] for _, _, r in matured])
 
@@ -610,6 +785,10 @@ def build_report(ledger_dir=None):
         "last_day": days[-1] if days else None,
         "records": len(all_records),
         "matured": len(matured),
+        # issue #95：pending（数据未到）与 failed（真拿不到价）分开计数。
+        "settle_status": settle_counts,
+        "pending": pending,
+        "failed": failed,
         "directional_matured": hit_n,
         "hit_rate": hit_rate,
         "horizon_days": HORIZON_DAYS,
@@ -631,6 +810,10 @@ def format_report(report):
         f"（{report['days']} 天），记录 {report['records']} 条",
         f"  已到期 {report['matured']} 条，其中有方向 {report['directional_matured']} 条，"
         f"方向命中率 {_pct(report['hit_rate'])}（持有 {report['horizon_days']} 交易日）",
+        # issue #95：pending（数据未到）单独列出，不进失败率。
+        f"  未到期 {report['settle_status']['not_matured']} 条，"
+        f"数据未到 pending {report['pending']} 条，"
+        f"结算失败 {report['failed']} 条",
     ]
     if report["by_action"]:
         lines.append("  按 action：")
