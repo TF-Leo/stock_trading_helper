@@ -160,9 +160,19 @@ def _load_close(code):
 def evaluate(ledger_dir=None):
     """CSV 结算（旧行为）+ JSON 台账结算（issue #56）。"""
     stats = ledger.settle_all(ledger_dir=ledger_dir)
-    print(f"JSON 台账结算：{stats['days']} 天，已到期 {stats['settled']} 条，"
-          f"未到期 {stats['not_matured']} 条，价格缺失 {stats['failed']} 条"
-          + (f"（{stats['reasons']}）" if stats["reasons"] else ""))
+    # PR #96 复验 P2-2：reasons 现在同时含 pending 与 failed 的原因，直接拼在
+    # 「结算失败 N 条」后面会自相矛盾（失败 0 条却挂 10 条原因）。按状态分开打印，
+    # 且每一行只挂自己那一类的原因。
+    line = (f"JSON 台账结算：{stats['days']} 天，已到期 {stats['settled']} 条，"
+            f"未到期 {stats['not_matured']} 条，待结算 pending {stats['pending']} 条，"
+            f"结算失败 {stats['failed']} 条")
+    if stats["failed_reasons"]:
+        line += f"（失败原因：{stats['failed_reasons']}）"
+    print(line)
+    if stats["pending_reasons"]:
+        print(f"  pending 原因：{stats['pending_reasons']}")
+    for warning in stats.get("warnings") or []:
+        print(f"  [WARN] {warning}")
     if not LOG.exists():
         print(f"没有 CSV 台账：{LOG}")
         return

@@ -613,17 +613,54 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 | 资金面 | `flow.{available,source,caliber,net_5d,net_20d,as_of,main_net_5d,main_net_20d}` |
 | 估值 | `valuation.{available,pe_percentile_3y,pb_percentile_3y,ps_percentile_3y,as_of}` |
 | 市况 | `market_regime.{label,confidence}` / `index_regime.{label,confidence}` |
-| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` |
-| 结算 | `settled.{ret_20d,hit,settle_date,entry_date,entry_open,exit_open,horizon_days,price_source}` 或 `null` + `settle_reason` |
+| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` `instrument_type` `price_source` `price_caliber` `instrument_basis` |
+| 结算 | `settled.{ret_20d,hit,settle_date,entry_date,entry_open,exit_open,horizon_days,price_source}` 或 `null` + `settle_reason`，外加 `settle_status` |
 
-结算口径：`open_{d+1+20} / open_{d+1} − 1`，用**前复权**开盘价（分红送转在比值里
-自然抵消）。「交易日」以该票自己的行情索引为准（停牌日无开盘价，不能成交）。
+结算口径：`open_{d+1+20} / open_{d+1} − 1`。**个股与场内 ETF** 用前复权开盘价
+（`qfq_open_to_open`，分红送转在比值里自然抵消）；**场外基金**只有单位净值，
+`open` 由净值补齐，因此是**净值对净值**（`nav_to_nav`，OTC 无开盘价）。
+「交易日」以该票自己的行情索引为准（停牌日无开盘价，不能成交）。
 `buy` 记 `ret > 0`、`sell` 记 `ret < 0`；`hold` / `avoid` / `insufficient_data`
-没有方向，**不参与命中率与校准**。价格取不到时 `settled=null` + `settle_reason`
-（`no_price_data` / `not_matured` / `no_bars_as_of`），**不缩短持有期、不猜**。
+没有方向，**不参与命中率与校准**。价格取不到时 `settled=null` + `settle_reason`，
+**不缩短持有期、不猜**。
+
+价源按**记录里写下的** `price_source` 走，结算时**绝不换源**（PR #96 复验 P1-1）：
+
+| 标的 | 数据文件 | `price_source` | `price_caliber` |
+|---|---|---|---|
+| 个股 | `stock_*_qfq.csv` | `local_qfq_cache` | `qfq_open_to_open` |
+| 场内 ETF / LOF | `stock_*_qfq.csv` | `local_qfq_cache` | `qfq_open_to_open` |
+| 场外基金 | `fund_*.csv`（单位净值） | `fund_nav` | `nav_to_nav` |
+
+`instrument_type` 在**记录时**判定，依据是数据文件类型 + 代码段静态信息
+（判定依据写进 `instrument_basis`），**不取 CLI 的 `request.type`** —— 那是取数
+通道，`auto` 失败会回落到另一侧，按它结算会把个股/ETF 永久钉在错误口径上。
+记录里指定的文件缺失、损坏、为空或没有 `open` 列时，直接 `no_price_data`
+（`failed`），**不会滑到另一个口径的缓存**。
+
+老记录没有 `price_source` 时按 brief 默认 **stock/qfq**；只有当 `fund_*.csv`
+存在、内容确认为**单位净值**（`open == close`、无交易所 `amount`/`postVol` 列）
+且没有 `stock_*_qfq.csv` 时才判场外基金；判定依据由 `settle_all()` 返回的
+`basis`（`{code: 依据}`）与 `warnings` 给出。
+
+`settle_status` 把「没到期 / 数据未到 / 从未结算」和「真失败」分开：
+
+| `settle_status` | 触发条件 | 是否计入失败率 |
+|---|---|---|
+| `settled` | 已算出收益 | 否 |
+| `not_matured` | `not_matured`（还没攒够 20 根） | 否 |
+| `pending` | `no_bars_after_as_of`（as_of 之后还没有行情，通常是缓存未更新）；或**从未跑过 `evaluate`** | 否 |
+| `failed` | `no_price_data` / `open_missing` / `price_parse_error` | 是 |
+
+`report` 输出里 `pending` 与 `failed` 分开计数（`settle_status` 逐态计数，
+`pending` / `failed` 两个顶层键）。老台账没有 `settle_status` 时按 `settled` /
+`settle_reason` 反推：两者都为空（从未结算）归 `pending`，**不再算成 `settled`**。
+`evaluate` 打印时 pending 与 failed 的原因也分开列出，不会出现「失败 0 条」后面
+挂一串 pending 原因。
 
 `report` 给出：已到期条数、方向命中率、按 `confidence` 分箱的校准（含 Brier）、
-按 `action` / `flow.caliber` / `flow.available` / `valuation.pb` 分位的分层命中率 ——
+按 `action` / `price.caliber` / `price.source` / `flow.caliber` / `flow.available` /
+`valuation.pb` 分位的分层命中率 ——
 供 `docs/P1_EVIDENCE_PLAN.md` §3.6.3 的 C 路径（Brier 改善 ≥0.02，需 ≥200 条已到期记录）使用。
 `confidence` 在这里的操作性定义是「该方向判断正确的概率」。
 
