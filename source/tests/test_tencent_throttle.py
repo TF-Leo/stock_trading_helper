@@ -634,6 +634,31 @@ def _waf_http(calls, status=501, body=WAF_CHALLENGE_HTML):
     return fake_http
 
 
+def _mixed_waf_http(calls, waf_hosts, as_200=False, payload=None):
+    """指定入口返回 501 挑战页（或 200 挑战页），其余入口返回正常 K 线。
+
+    issue #73 的验收场景：1 个入口被 WAF、另外两个仍可用。
+    """
+    success = _fake_kline_http(calls, payload=payload)
+
+    def fake_http(url, params=None, data=None, headers=None, method="GET",
+                  timeout=None, **kwargs):
+        host = next((item for item in HOSTS if str(url).startswith(item)), None)
+        if host in waf_hosts:
+            calls.append(url)
+            return FakeResponse(WAF_CHALLENGE_HTML,
+                                status=200 if as_200 else 501, url=url)
+        return success(url, params=params, data=data, headers=headers,
+                       method=method, timeout=timeout)
+
+    return fake_http
+
+
+def _attempted_hosts(calls):
+    return [next(host for host in HOSTS if str(url).startswith(host))
+            for url in calls]
+
+
 @pytest.mark.parametrize("status,body,expected", [
     (501, WAF_CHALLENGE_HTML, True),
     (501, '<script>location.href="/x";</script>', True),
@@ -647,8 +672,12 @@ def test_is_waf_challenge_classification(status, body, expected):
     assert throttle.is_waf_challenge(status, body) is expected
 
 
-def test_waf_501_enters_long_cooldown_with_single_probe(clean_throttle, monkeypatch):
-    """打桩 501 + 挑战页：一次探测即中止，写长冷却，不污染 120s 限流段。"""
+def test_all_entries_waf_marks_all_and_stops_requests(clean_throttle, monkeypatch):
+    """3×501（issue #73）：每个入口各探测一次、全部标记；冷却期内 0 请求。
+
+    旧行为（issue #69）是「一次探测即中止、全标记」；issue #73 改为逐入口
+    标记后，三个入口都会各探测一次，因此 ``calls`` 从 1 变 3。
+    """
     monkeypatch.setenv(throttle.WAF_COOLDOWN_ENV, "1800")
     calls = []
     monkeypatch.setattr(generated, "_v39_http", _waf_http(calls))
@@ -656,8 +685,9 @@ def test_waf_501_enters_long_cooldown_with_single_probe(clean_throttle, monkeypa
     with pytest.raises(astock.TencentWafBlocked) as excinfo:
         astock.fetch_daily("600519", start_date="20200101", adjust="qfq")
 
-    # 只探测第一个入口，不把一次 WAF 放大成三次
-    assert len(calls) == 1, calls
+    # 每个入口各探测一次（不重复撞同一个入口）
+    assert len(calls) == len(HOSTS), calls
+    assert set(_attempted_hosts(calls)) == set(HOSTS)
     assert "WAF" in str(excinfo.value)
     payload = json.loads(clean_throttle.read_text(encoding="utf-8"))
     assert payload["schema_version"] == throttle.SCHEMA_VERSION == 2
@@ -672,6 +702,152 @@ def test_waf_501_enters_long_cooldown_with_single_probe(clean_throttle, monkeypa
     with pytest.raises(astock.TencentWafBlocked):
         astock.fetch_daily("600519", start_date="20200101", adjust="qfq")
     assert len(calls) == before
+
+
+def test_partial_waf_marks_only_501_entry_and_keeps_others_usable(
+        clean_throttle, monkeypatch):
+    """1×501 + 2×200（issue #73 验收）：只标记 501 入口，其余入口照常取数。"""
+    monkeypatch.setenv(throttle.WAF_COOLDOWN_ENV, "1800")
+    calls = []
+    monkeypatch.setattr(generated, "_v39_http",
+                        _mixed_waf_http(calls, {HOSTS[0]}))
+
+    frame = astock.fetch_daily("600519", start_date="20200101", adjust="")
+    assert len(frame) == 3
+    attempted = _attempted_hosts(calls)
+    assert attempted[0] == HOSTS[0], attempted
+    assert set(attempted[1:]) == {HOSTS[1]}, attempted
+    assert HOSTS[2] not in attempted, "第一个入口成功后不应继续撞第三个入口"
+
+    assert set(throttle.active_waf_hosts()) == {HOSTS[0]}
+    assert not throttle.waf_hosts_cooling(), "只有 1/3 入口被拦，不得整域封锁"
+    payload = json.loads(clean_throttle.read_text(encoding="utf-8"))
+    assert set(payload["waf"]["hosts"]) == {HOSTS[0]}
+    assert payload["hosts"] == {}, "WAF 不得写 120s 限流段"
+
+    # 第二轮：已确认 501 的入口被跳过，可用入口继续服务（attempts 可复核）
+    before = len(calls)
+    frame2 = astock.fetch_daily("600519", start_date="20200101", adjust="")
+    assert len(frame2) == 3
+    second = _attempted_hosts(calls[before:])
+    assert second and set(second) == {HOSTS[1]}, second
+
+    # 第三轮：可用入口 1 失败时，入口 2 仍被使用 —— 两个 200 入口都未被封锁
+    before = len(calls)
+    fallback = _fake_kline_http(calls)
+
+    def host1_down_http(url, params=None, data=None, headers=None,
+                        method="GET", timeout=None, **kwargs):
+        host = next((item for item in HOSTS if str(url).startswith(item)), None)
+        if host == HOSTS[1]:
+            calls.append(url)
+            raise RuntimeError("429 Too Many Requests")
+        return fallback(url, params=params, data=data, headers=headers,
+                        method=method, timeout=timeout)
+
+    monkeypatch.setattr(generated, "_v39_http", host1_down_http)
+    frame3 = astock.fetch_daily("600519", start_date="20200101", adjust="")
+    assert len(frame3) == 3
+    third = _attempted_hosts(calls[before:])
+    assert HOSTS[2] in third, third
+    assert HOSTS[0] not in third, f"已标记 501 的入口不得再被使用: {third}"
+
+
+def test_200_with_challenge_body_only_warns(clean_throttle, monkeypatch, capsys):
+    """200 + 挑战页：只记 warning，不判 WAF、不写长冷却（issue #73 第 4 条）。"""
+    calls = []
+    monkeypatch.setattr(generated, "_v39_http",
+                        _mixed_waf_http(calls, {HOSTS[0]}, as_200=True))
+
+    frame = astock.fetch_daily("600519", start_date="20200101", adjust="")
+    assert len(frame) == 3
+    assert _attempted_hosts(calls)[0] == HOSTS[0]
+    assert throttle.active_waf_hosts() == {}, "200 挑战页不得写 WAF 长冷却"
+    err = capsys.readouterr().err
+    assert "[WARN]" in err and "HTTP 200" in err, err
+
+
+def test_shared_backend_strategy_marks_all_when_one_confirmed(
+        clean_throttle, monkeypatch):
+    """可选策略：TENCENT_WAF_SHARED_BACKEND=1 → 一次确认即全标记（默认关闭）。"""
+    monkeypatch.setenv(throttle.WAF_SHARED_BACKEND_ENV, "1")
+    calls = []
+    monkeypatch.setattr(generated, "_v39_http",
+                        _mixed_waf_http(calls, {HOSTS[0]}))
+
+    frame = astock.fetch_daily("600519", start_date="20200101", adjust="")
+    assert len(frame) == 3, "共享后端策略只影响标记范围，不影响本轮可用入口"
+    assert set(throttle.active_waf_hosts()) == set(HOSTS)
+    assert throttle.waf_hosts_cooling()
+
+
+def test_shared_backend_strategy_is_off_by_default(clean_throttle, monkeypatch):
+    monkeypatch.delenv(throttle.WAF_SHARED_BACKEND_ENV, raising=False)
+    assert throttle.waf_shared_backend() is False
+    monkeypatch.setenv(throttle.WAF_SHARED_BACKEND_ENV, "1")
+    assert throttle.waf_shared_backend() is True
+
+
+def test_waf_guard_nested_calls_install_single_layer(monkeypatch):
+    """嵌套进入只装一层包装；退出后还原到进入前的函数对象。"""
+    original = generated._v39_http
+    with astock._waf_guard():
+        first = generated._v39_http
+        assert first is not original
+        assert getattr(first, "__waf_wrapper__", False) is True
+        assert astock.waf_guard_depth() == 1
+        with astock._waf_guard():
+            assert generated._v39_http is first, "嵌套不得层层叠加"
+            assert astock.waf_guard_depth() == 2
+        assert generated._v39_http is first
+    assert generated._v39_http is original
+    assert astock.waf_guard_depth() == 0
+
+
+def test_waf_guard_concurrent_calls_leave_no_residual_wrapper(
+        clean_throttle, monkeypatch):
+    """≥10 次并发取数：只装一层包装，全部退出后计数归零、无残留（issue #73）。"""
+    last_fake = None
+    for _ in range(2):  # 第二轮验证不会层层叠加
+        entered = threading.Semaphore(0)
+        release = threading.Event()
+        success = _fake_kline_http([])
+
+        def blocking_http(url, params=None, data=None, headers=None,
+                          method="GET", timeout=None, **kwargs):
+            entered.release()
+            assert release.wait(10), "并发请求未被放行"
+            return success(url, params=params, data=data, headers=headers,
+                           method=method, timeout=timeout)
+
+        last_fake = blocking_http
+        monkeypatch.setattr(generated, "_v39_http", blocking_http)
+        errors = []
+
+        def worker():
+            try:
+                astock.fetch_daily("600519", start_date="20200101", adjust="")
+            except BaseException as exc:  # noqa: BLE001 - 并发断言用
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for thread in threads:
+            thread.start()
+        for _ in range(10):
+            assert entered.acquire(timeout=15), "10 个并发调用没有全部进入取数"
+        # 10 个调用同时在 _waf_guard 内：只能看见一层包装
+        assert astock.waf_guard_depth() == 10
+        assert generated._v39_http is not blocking_http
+        assert getattr(generated._v39_http, "__waf_wrapper__", False) is True
+        release.set()
+        for thread in threads:
+            thread.join(15)
+            assert not thread.is_alive()
+        assert errors == [], errors
+
+    assert astock.waf_guard_depth() == 0
+    assert generated._v39_http is last_fake, "并发结束后残留了包装层"
+    assert not getattr(generated._v39_http, "__waf_wrapper__", False)
 
 
 def test_waf_detected_when_http_helper_raises_wrapped_error(clean_throttle):
@@ -689,7 +865,9 @@ def test_waf_detected_when_http_helper_raises_wrapped_error(clean_throttle):
     wrapped = throttle.wrap_http_for_waf(boom)
     with pytest.raises(throttle.WafBlocked):
         wrapped(HOSTS[0] + "/appstock/app/fqkline/get")
-    assert throttle.waf_hosts_cooling()
+    # issue #73：只标记实际 501 的入口，不整域封锁
+    assert set(throttle.active_waf_hosts()) == {HOSTS[0]}
+    assert not throttle.waf_hosts_cooling()
 
 
 def test_429_and_empty_response_keep_short_cooldown(clean_throttle, monkeypatch):
@@ -755,7 +933,7 @@ def test_failed_probe_after_expiry_reenters_long_cooldown(clean_throttle, monkey
     monkeypatch.setattr(generated, "_v39_http", _waf_http(calls))
     with pytest.raises(astock.TencentWafBlocked):
         astock.fetch_daily("600519", start_date="20200101", adjust="qfq")
-    assert len(calls) == 1
+    assert len(calls) == len(HOSTS), "issue #73：三个入口各探测一次后才全标记"
     assert throttle.waf_hosts_cooling()
     assert throttle.waf_remaining() > 1700
 
@@ -811,7 +989,9 @@ def test_cross_process_waf_cooldown_blocks_second_process(clean_throttle, tmp_pa
     state = tmp_path / "cross" / "tencent_cooldown.json"
     first = _run_waf_child(state)
     assert first["outcome"] == "TencentWafBlocked"
-    assert len(first["calls"]) == 1
+    # issue #73：逐入口标记 → 三个入口各探测一次后全标记
+    assert len(first["calls"]) == len(HOSTS), first["calls"]
+    assert {url.split("/appstock")[0] for url in first["calls"]} == set(HOSTS)
     payload = json.loads(state.read_text(encoding="utf-8"))
     assert set(payload["waf"]["hosts"]) == set(HOSTS)
     assert all(until > time.time() for until in payload["waf"]["hosts"].values())

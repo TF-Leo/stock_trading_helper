@@ -1,5 +1,38 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-15 · issue #73：WAF 按入口标记 + 并发包装隔离
+
+- **分支**：`TF-Leo/waf-per-host`（远程 `task/waf-per-host`，父 `origin/main`
+  `26be605`）；**PR #114** 关联 #73，**未合并**。未改 `decision/*`，未新增依赖，
+  `--json` 无新增必需字段。
+- **1) 按入口标记**：`tencent_throttle._enter_waf` 默认 `mark_waf(hosts=[host])`
+  —— 只有实际返回 501 + 挑战页的入口进 1800s 长冷却；`WafBlocked` 改为继承
+  `RuntimeError`，上游 `_tencent_kline_call` 的 `except RuntimeError` 会换下
+  一个入口。可选策略 `TENCENT_WAF_SHARED_BACKEND=1` 恢复「一次确认 → 全标记」
+  （默认关闭）。
+- **2) 不污染限流段**：进程内 WAF 入口由 `sync_waf_process_state()` 镜像进
+  `_tencent_host_down_until`（后续轮次直接跳过）；`flush_process_state()` 写回
+  磁盘时剔除仍在 WAF 长冷却中的入口，`waf.hosts` 与 `hosts` 仍互不覆盖。
+- **3) 并发隔离**：`astock._waf_guard` 改为锁 + 引用计数，只装一层包装、
+  最后一个退出者还原；新增 `astock.waf_guard_depth()` 供验证。
+- **4) 200 挑战页**：`wrap_http_for_waf` 对 200 + `location.href`/`btoa` 只打
+  `[WARN]` 到 stderr，不判 WAF、不写冷却。
+- **5) 测试**：旧 `test_waf_501_enters_long_cooldown_with_single_probe` 的
+  「一次探测即中止、全标记」是 issue #69 的旧契约，按 #73 改为「3×501 各探测
+  一次 → 全标记」；新增部分 WAF（1×501+2×200：第二轮只走可用入口，第三轮
+  第一个可用入口失败时第二个 200 入口仍被使用）、200 告警、共享后端开关、
+  嵌套单层、10 并发无残留（两轮）用例。
+- **证据（本机 Linux）**：
+  - 依赖按 `requirements.txt` 精确锁定的 venv（Python 3.14.7）：
+    `python -m pytest tests/ -q` → **1046 passed**；
+    `pytest tests/test_tencent_throttle.py -q` → **46 passed**。
+  - 项目 `~/.venv`（Python 3.12）：`pytest tests/ -q` → **1045 passed,
+    1 failed**；唯一失败 `test_probe_requirements.py::test_current_environment_
+    passes_via_probe` 为解释器/依赖版本不符（本机 akshare 1.17.44 /
+    requests 2.34.2 / numpy 2.3.5 / pandas 3.0.6 / pytest 9.1.1），与基线一致，
+    与本改动无关。
+- **未验证**：本机无 `pwsh`，`tools/check_gates.ps1` 未执行。
+
 ## 2026-11-15 · PR #111 rebase 至 main + `settled_value_drift` P3 用例
 
 - **分支**：`TF-Leo/rebase-pr111`（原 PR 头 `ce693ab` rebase 到 `origin/main`

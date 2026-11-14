@@ -31,6 +31,7 @@ import datetime as _dt
 import json
 import os
 import sys
+import threading
 
 import pandas as pd
 
@@ -51,6 +52,7 @@ __all__ = [
     "OFFLINE_ENV",
     "TencentThrottled",
     "TencentWafBlocked",
+    "waf_guard_depth",
 ]
 
 OFFLINE_ENV = "ASTOCK_CALENDAR_OFFLINE"
@@ -86,11 +88,12 @@ class TencentThrottled(AstockError):
 
 
 class TencentWafBlocked(AstockError):
-    """腾讯个股 K 线被 **WAF 挑战页**拦截（HTTP 501），已进入长冷却。
+    """腾讯个股 K 线**三个入口全部**被 WAF 挑战页拦截（HTTP 501），已进入长冷却。
 
     与 :class:`TencentThrottled`（429/空响应限流，120s）分开：WAF 是边缘策略
     拦截，默认冷却 1800s；冷却期内一个请求都不发。指数 ``newfqkline`` 与腾讯
-    报价不受影响（issue #69）。
+    报价不受影响（issue #69）。issue #73 起按入口标记：只有 1 个入口 501 时
+    其余入口照常取数，**不会**抛本异常。
     """
 
 
@@ -143,23 +146,49 @@ def _http_timeout(timeout):
         _g._ASTOCK_HTTP_TIMEOUT = _DEFAULT_HTTP_TIMEOUT
 
 
+# issue #73：``_waf_guard`` 用**引用计数**隔离并发/嵌套调用。
+# 旧实现每次进入都把「当前」``_v39_http`` 再包一层、退出时还原自己看到的
+# 那个函数对象：并发时先退出者会把包装层还原掉，后退出者又把旧包装写回，
+# 最终残留一层包装（且嵌套会层层叠加）。现在只有最外层安装/还原一次，
+# 其余调用复用同一层包装；入口/退出都在锁内改计数。
+_WAF_GUARD_LOCK = threading.Lock()
+_WAF_GUARD_DEPTH = 0
+_WAF_GUARD_BASE = None
+
+
+def waf_guard_depth() -> int:
+    """当前仍在 ``_waf_guard`` 内的调用数（0 = 无包装层残留）。"""
+    with _WAF_GUARD_LOCK:
+        return _WAF_GUARD_DEPTH
+
+
 @contextlib.contextmanager
 def _waf_guard():
-    """取数期间给生成物的 HTTP 调用装上 WAF 识别（issue #69）。
+    """取数期间给生成物的 HTTP 调用装上 WAF 识别（issue #69 / #73）。
 
-    只在本上下文内替换 ``_v39_http``：501 + JS 挑战页 → :class:`tencent_throttle.WafBlocked`
-    （**不是** RuntimeError，不会触发上游的 120s 限流冷却 / 换入口），并写 WAF 长冷却。
-    429 / 空响应仍原样返回给上游，走既有 120s 短冷却。
+    最外层调用把当前的 ``_v39_http`` 包一层：501 + JS 挑战页 → 抛
+    :class:`tencent_throttle.WafBlocked`（RuntimeError 子类，上游会换下一个
+    入口；默认只标记实际 501 的入口）。429 / 空响应仍原样返回给上游，走既有
+    120s 短冷却。
 
-    恢复目标是**进入时的函数对象**（可能是测试打的桩），因此测试里的
-    ``monkeypatch.setattr(generated, "_v39_http", fake)`` 仍然有效。
+    并发安全：引用计数保证任意嵌套深度/并发调用下只装**一层**包装，且
+    最后一个调用者退出时才还原到**进入时的函数对象**（可能是测试打的桩）。
     """
-    original = _g._v39_http
-    _g._v39_http = _throttle.wrap_http_for_waf(original)
+    global _WAF_GUARD_DEPTH, _WAF_GUARD_BASE
+    with _WAF_GUARD_LOCK:
+        if _WAF_GUARD_DEPTH == 0:
+            _WAF_GUARD_BASE = _g._v39_http
+            _g._v39_http = _throttle.wrap_http_for_waf(_WAF_GUARD_BASE)
+        _WAF_GUARD_DEPTH += 1
     try:
         yield
     finally:
-        _g._v39_http = original
+        with _WAF_GUARD_LOCK:
+            _WAF_GUARD_DEPTH -= 1
+            if _WAF_GUARD_DEPTH <= 0:
+                _WAF_GUARD_DEPTH = 0
+                _g._v39_http = _WAF_GUARD_BASE
+                _WAF_GUARD_BASE = None
 
 
 def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.DataFrame:
@@ -188,9 +217,11 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.D
     **协作式**上限，墙钟仍由调用方的 ``run_with_deadline`` 兜底。
 
     **WAF（issue #69）**：HTTP 501 + JS 挑战页（``location.href`` / ``btoa``）
-    与 429/空响应限流是两种失败。WAF 会抛 :class:`TencentWafBlocked` 并写入
-    1800s 长冷却（``TENCENT_WAF_COOLDOWN_SECONDS`` 可覆盖），冷却期内本函数
-    一个请求都不发；到期后自动放行一次探测。指数与腾讯报价不受影响。
+    与 429/空响应限流是两种失败。**逐入口标记（issue #73）**：只有实际返回
+    501 + 挑战页的入口进入 1800s 长冷却（``TENCENT_WAF_COOLDOWN_SECONDS``
+    可覆盖），同一轮里其余入口继续可用；三个入口全部确认后才抛
+    :class:`TencentWafBlocked`、冷却期内本函数一个请求都不发。到期后自动
+    放行一次探测。指数与腾讯报价不受影响。
     """
     if str(os.getenv(FORCE_FAIL_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
         raise AstockError(f"{FORCE_FAIL_ENV}=1：腾讯源被强制失败（降级演练）")
@@ -206,6 +237,9 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.D
     fetch_adjust = "" if needs_factor else adjust_value
 
     _throttle.sync_process_state()
+    # issue #73：把磁盘上的**逐入口** WAF 冷却也镜像进进程内跳过表，
+    # 后续轮次直接跳过已确认 501 的入口（其余入口照常可用）。
+    _throttle.sync_waf_process_state()
     if _throttle.waf_hosts_cooling():
         # issue #69：WAF（501 挑战页）与限流是两类失败。长冷却期内一个请求都不发；
         # 到期后本闸门自动放行一次探测，成功即恢复正常（失败会重新写长冷却）。
@@ -227,13 +261,19 @@ def fetch_daily(symbol: str, start_date=None, adjust="qfq", budget=None) -> pd.D
             frame = _g.tencent_kline(digits, period="day", adjust=fetch_adjust,
                                      start=start)
     except _throttle.WafBlocked as exc:
-        # 501 + 挑战页已经由 _waf_guard 写入长冷却；这里换成对调用方更明确的类型。
+        # 逐入口标记（issue #73）：单入口 501 通常会被上游循环吞掉并换入口；
+        # 走到这里说明三个入口全部命中 WAF（或调用被直接打断）。
         raise TencentWafBlocked(
             f"腾讯K线 WAF 拦截({digits}): {exc}") from exc
     except ValueError as exc:
         # 参数错误（区间过长 / 北交所 / 代码不存在）与来源格式错误区分开
         raise AstockError(f"腾讯K线参数错误({digits}): {exc}") from exc
     except Exception as exc:  # RuntimeError / requests 异常等
+        # 上游循环在「三个入口都不可用」时只抛 RuntimeError；若这轮把三个
+        # 入口都确认成了 WAF，仍要交给渠道池明确的 TencentWafBlocked。
+        if _throttle.waf_hosts_cooling():
+            raise TencentWafBlocked(
+                f"腾讯K线 全部入口 WAF 拦截({digits}): {exc}") from exc
         raise AstockError(f"腾讯K线拉取失败({digits}): {exc}") from exc
     finally:
         # 生成物把失败入口写进进程内 `_tencent_host_down_until`；这里立刻镜像到

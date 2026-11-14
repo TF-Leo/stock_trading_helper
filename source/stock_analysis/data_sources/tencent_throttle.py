@@ -45,15 +45,26 @@ WAF 与限流是两种不同失败（issue #69）
   一起误伤。
 
 识别入口是 :func:`wrap_http_for_waf`：包一层生成物的 ``_v39_http``，只在
-「501 + 挑战页特征」时抛 :class:`WafBlocked`。它刻意不继承 ``RuntimeError``，
-这样上游 ``_tencent_kline_call`` 的 ``except RuntimeError``（按 120s 限流处理
-并换下一个入口）不会把一次 WAF 探测放大成三次。
+「501 + 挑战页特征」时抛 :class:`WafBlocked`。**只标记实际返回 501 + 挑战页
+的那个入口**（issue #73）：同一轮里其余入口继续按顺序尝试，实测「1×501 +
+2×200」不会再白丢两个可用入口。若确认某个部署的三个入口共享同一后端、会
+同时 501，可置 ``TENCENT_WAF_SHARED_BACKEND=1`` 恢复「一次确认 → 全标记」
+（默认关闭）。
+
+``WafBlocked`` 继承 ``RuntimeError``：上游 ``_tencent_kline_call`` 的
+``except RuntimeError`` 会换下一个入口（这是 issue #73 需要的「部分入口
+可用」语义）。它**不会**被记成 120s 限流段：WAF 入口已在 ``waf.hosts``
+里，:func:`flush_process_state` 写回磁盘时会剔除仍在 WAF 长冷却中的入口。
+
+200 + 挑战页（状态码正常但响应体是挑战页）只打 ``[WARN]`` 到 stderr，
+**不判 WAF**，避免把上游偶发错误页误伤成长冷却。
 """
 from __future__ import annotations
 
 import contextlib
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -62,17 +73,21 @@ __all__ = [
     "BUDGET_ENV",
     "DEFAULT_COOLDOWN_SECONDS",
     "WAF_COOLDOWN_ENV",
+    "WAF_SHARED_BACKEND_ENV",
     "DEFAULT_WAF_COOLDOWN_SECONDS",
     "WAF_STATUS_CODE",
     "WafBlocked",
     "waf_cooldown_seconds",
+    "waf_shared_backend",
     "is_waf_challenge",
+    "has_waf_challenge_markers",
     "wrap_http_for_waf",
     "mark_waf",
     "active_waf_hosts",
     "waf_hosts_cooling",
     "waf_remaining",
     "waf_summary",
+    "sync_waf_process_state",
     "DEFAULT_FAILURE_BUDGET_SECONDS",
     "MAX_BATCH_SIZE",
     "MIN_BATCH_PAUSE_SECONDS",
@@ -108,6 +123,9 @@ DEFAULT_COOLDOWN_SECONDS = 120.0
 #: 120s 后重试往往就好；WAF 是腾讯边缘把整条个股 K 线路径拦成 501 挑战页，
 #: 几分钟内重试只会继续撞墙。默认冷却 30 分钟，可用环境变量覆盖（建议 1800–3600s）。
 WAF_COOLDOWN_ENV = "TENCENT_WAF_COOLDOWN_SECONDS"
+#: issue #73：可选策略。确认三个入口共享同一后端、会同时 501 时置 1，
+#: 一次确认即给全部入口记长冷却；默认关闭 → 只标记实际 501 的入口。
+WAF_SHARED_BACKEND_ENV = "TENCENT_WAF_SHARED_BACKEND"
 DEFAULT_WAF_COOLDOWN_SECONDS = 1800.0
 WAF_STATUS_CODE = 501
 #: 挑战页特征；命中任一即认定为 JS 挑战，而不是普通 501 错误页。
@@ -117,12 +135,13 @@ WAF_CHALLENGE_MARKERS = ("location.href", "btoa")
 SCHEMA_VERSION = 2
 
 
-class WafBlocked(Exception):
-    """腾讯 K 线 HTTP 501 + JS 挑战页（WAF），本次调用立即中止。
+class WafBlocked(RuntimeError):
+    """腾讯 K 线 HTTP 501 + JS 挑战页（WAF），当前入口不可用。
 
-    刻意**不继承** ``RuntimeError``：上游生成物 ``_tencent_kline_call`` 用
-    ``except RuntimeError`` 把失败入口记成 120s 限流并换下一个入口；WAF 必须
-    跳出这个循环，否则会把一次 WAF 探测放大成三次，并把长冷却写成短冷却。
+    继承 ``RuntimeError``（issue #73）：上游生成物 ``_tencent_kline_call`` 的
+    ``except RuntimeError`` 会跳过该入口、继续尝试下一个入口 —— 这正是
+    「只标记实际 501 的入口，其余入口保持可用」所需的行为。WAF 入口已在
+    ``waf.hosts`` 段里，:func:`flush_process_state` 不会把它写进 120s 限流段。
     """
 
 
@@ -137,10 +156,23 @@ def waf_cooldown_seconds() -> float:
     return min(max(value, 60.0), 86400.0)
 
 
+def waf_shared_backend() -> bool:
+    """是否启用「一次确认 → 全标记」策略（``TENCENT_WAF_SHARED_BACKEND``）。"""
+    return str(os.getenv(WAF_SHARED_BACKEND_ENV, "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def has_waf_challenge_markers(text) -> bool:
+    """响应体是否含 JS 挑战特征（**不看状态码**，供 200 告警复用）。"""
+    body = str(text or "")
+    return any(marker in body for marker in WAF_CHALLENGE_MARKERS)
+
+
 def is_waf_challenge(status, text) -> bool:
     """HTTP 501 **且**响应体含 JS 挑战特征 → WAF。
 
-    429 / 空响应 / 普通 501 错误页都不算：限流与 WAF 必须分开处理（issue #69）。
+    429 / 空响应 / 普通 501 错误页 / 200 挑战页都不算：限流与 WAF 必须分开
+    处理（issue #69）；200 + 挑战页只告警，不判 WAF（issue #73）。
     """
     try:
         code = int(status)
@@ -148,8 +180,7 @@ def is_waf_challenge(status, text) -> bool:
         return False
     if code != WAF_STATUS_CODE:
         return False
-    body = str(text or "")
-    return any(marker in body for marker in WAF_CHALLENGE_MARKERS)
+    return has_waf_challenge_markers(text)
 
 
 def _now(now=None) -> float:
@@ -358,8 +389,29 @@ def sync_process_state(now=None) -> dict:
     return process_hosts(now)
 
 
+def sync_waf_process_state(now=None) -> dict:
+    """把磁盘上的 WAF 长冷却并入进程内跳过表（issue #73）。
+
+    生成物 ``_tencent_kline_call`` 只认 ``_tencent_host_down_until``；
+    把 ``waf.hosts`` 也镜像进去，后续轮次才会**直接跳过**已确认 501 的入口，
+    而不是每个进程都再撞一次。WAF 段仍只存磁盘（写回时由
+    :func:`flush_process_state` 剔除），不会污染 120s 限流段。
+    """
+    now = _now(now)
+    process = _process_dict()
+    for host, until in load_state(now)["waf_hosts"].items():
+        if float(process.get(host, 0.0)) < until:
+            process[host] = until
+    return process_hosts(now)
+
+
 def flush_process_state(reason=None, now=None) -> dict:
-    """进程内冷却 → 磁盘（原子）。没有有效冷却时直接返回，不触碰磁盘。"""
+    """进程内冷却 → 磁盘（原子）。没有有效冷却时直接返回，不触碰磁盘。
+
+    issue #73：仍在 WAF 长冷却中的入口**不写入** 120s 限流段 —— 它已由
+    ``waf.hosts`` 覆盖更久，混入限流段会让 ``all_hosts_cooling`` 等判定
+    失真，也违反「WAF 不得写限流段」的既有约束。
+    """
     now = _now(now)
     alive = process_hosts(now)
     if not alive:
@@ -367,9 +419,12 @@ def flush_process_state(reason=None, now=None) -> dict:
     path = state_path()
     with _FileLock(_lock_path(path)):
         state = load_state(now)
+        waf_active = state["waf_hosts"]
         merged = state["hosts"]
         changed = False
         for host, until in alive.items():
+            if float(waf_active.get(host, 0.0)) > now:
+                continue
             if float(merged.get(host, 0.0)) < until:
                 merged[host] = until
                 changed = True
@@ -447,17 +502,32 @@ def _response_is_waf(response) -> bool:
 
 
 def _enter_waf(url, response, cause=None):
-    """记录长冷却并抛出 :class:`WafBlocked`（不再尝试其余入口）。"""
+    """记录 WAF 长冷却并抛出 :class:`WafBlocked`（当前入口不可用）。
+
+    issue #73：默认**只标记实际返回 501 + 挑战页的入口**，同一轮里其余入口
+    继续可用。``TENCENT_WAF_SHARED_BACKEND=1`` 时恢复旧策略（一次确认 →
+    全部入口标记）；无法定位入口时同样保守地全标记。
+    """
     host = _tencent_host_for(url) or _tencent_host_for(
         getattr(response, "url", ""))
     seconds = waf_cooldown_seconds()
-    # 实测三个入口同时 501（issue #69）；一个确认的挑战页即判定整条个股 K 线
-    # 路径被 WAF 拦截，给全部入口记长冷却，避免下一个进程再逐个撞三次。
-    mark_waf(seconds=seconds, reason=f"HTTP {WAF_STATUS_CODE} + JS challenge")
+    shared = waf_shared_backend() or not host
+    hosts = None if shared else [host]
+    reason = f"HTTP {WAF_STATUS_CODE} + JS challenge"
+    if shared:
+        reason += "（共享后端/无法定位入口：全标记）"
+    mark_waf(hosts=hosts, seconds=seconds, reason=reason)
     raise WafBlocked(
         "腾讯 K 线 WAF 封锁（HTTP 501 挑战页"
         + (f"：{host}" if host else "")
-        + f"），已进入 {int(seconds)}s 长冷却") from cause
+        + f"），该入口进入 {int(seconds)}s 长冷却") from cause
+
+
+def _warn_200_challenge(url, response) -> None:
+    """200 状态码但响应体是挑战页：只记 warning，不判 WAF（issue #73）。"""
+    host = _tencent_host_for(url) or str(url)
+    print(f"[WARN] 腾讯 K 线入口 {host} 返回 HTTP 200 但响应体疑似 WAF 挑战页"
+          f"（仅告警，不判 WAF、不写长冷却）", file=sys.stderr)
 
 
 def wrap_http_for_waf(http_call):
@@ -465,7 +535,8 @@ def wrap_http_for_waf(http_call):
 
     * 429 / 空响应 / 普通 5xx 原样返回或原样重抛，仍走上游的 120s 限流冷却；
     * 挑战页可能以 501 响应返回（``allow_status`` 场景），也可能被
-      ``_v39_http`` 的 ``raise_for_status`` 包装成 RuntimeError —— 两种都识别。
+      ``_v39_http`` 的 ``raise_for_status`` 包装成 RuntimeError —— 两种都识别；
+    * 200 + 挑战页只打 ``[WARN]``（stderr），不判 WAF（issue #73）。
     """
     def _wrapped(url, *args, **kwargs):
         # 只对腾讯 K 线入口做 WAF 判定：同一个上下文里还可能调新浪复权因子
@@ -478,10 +549,20 @@ def wrap_http_for_waf(http_call):
             if is_kline_host and _response_is_waf(response):
                 _enter_waf(url, response, cause=exc)
             raise
-        if is_kline_host and _response_is_waf(response):
-            _enter_waf(url, response)
+        if is_kline_host:
+            if _response_is_waf(response):
+                _enter_waf(url, response)
+            else:
+                try:
+                    status = int(getattr(response, "status_code", None))
+                except (TypeError, ValueError):
+                    status = None
+                if status == 200 and has_waf_challenge_markers(
+                        getattr(response, "text", "")):
+                    _warn_200_challenge(url, response)
         return response
 
+    _wrapped.__waf_wrapper__ = True
     return _wrapped
 
 
