@@ -15,16 +15,20 @@
   "instrument": [
     "board",
     "code",
+    "float_market_cap_yi",
     "is_st",
     "is_st_source",
     "is_suspended",
     "limit_down",
     "limit_up",
+    "market_cap_yi",
     "name",
     "one_word_limit",
     "price_limit_pct",
     "quote_stale",
-    "status_source"
+    "status_source",
+    "turnover_rate_pct",
+    "volume_ratio"
   ],
   "data": [
     "bars",

@@ -1,5 +1,34 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-15 · R11 T8：腾讯报价的量比 / 换手 / 市值（缺口表 #11）
+
+- **分支**：`task/quote-fields`（父 `origin/main` `31b4c9f`）；关联 issue #1，
+  **未合并**。未改 `decision/*` 的决策逻辑（`decision/schema.py` 仅补错误路径
+  同构键）；未引入依赖；无新增逐票请求。
+- **字段取证（钉死 commit `f215349` 的 §1.1，不凭记忆）**：
+  `vendor/a-stock-data/SKILL.md`「腾讯财经字段索引速查」1161-1193 行 ——
+  `vals[38]` 换手率（**已是百分数**，4.55 = 4.55%）；`vals[49]` 量比（无量纲）；
+  `vals[44]` 流通市值 / `vals[45]` 总市值（单位**亿元**，44/45 曾全网标反，
+  以实测校准为准）。新增用例用四个互不相同的哨兵值（2.34 / 1.56 / 111.11 /
+  222.22）实测上游解析器，下标错位或 44-45 互换必红。
+- **实现**：`TradingStatus` 新增 `turnover_rate_pct` / `volume_ratio` /
+  `market_cap_yi` / `float_market_cap_yi`，由 `resolve_trading_status` 从
+  **P0-3 同一次** `astock.fetch_quote` 的响应解析（`status.py`）。`cli.py`
+  `instrument.*` additive 输出，单位写进字段名；错误路径
+  `decision/schema.py` 同构补 null。报价定格 / 字段缺失 / ≤0 一律 null。
+- **渲染**：`advice_render._turnover_line` 输出
+  `换手 {t}%｜量比 {v}（上一交易日口径）`；`quote_stale=True`、任一字段
+  缺失或 ≤0、场外基金 → **整句消失**，绝不输出 0/空值。
+- **证据（本机 Linux，`~/.venv` Python 3.12）**：
+  - `~/.venv/bin/python -m pytest tests/test_quote_fields.py -q` → **18 passed**
+    （正常 / 字段缺失 / 零值 / stale / 基金 / 单位边界 / 请求次数）。
+  - `~/.venv/bin/python -m pytest tests/ -q` → **1081 passed, 1 failed**；
+    唯一失败 `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    为解释器/依赖版本不符（基线同样失败），与本改动无关。
+  - 请求次数：`test_cli_quote_request_count_does_not_increase` 实测整轮个股建议
+    `astock.fetch_quote` 调用 **恰好 1 次**（`calls == ["600519"]`）。
+- **未验证**：本机无 `pwsh`，`tools/check_gates.ps1` 未执行。
+
 ## 2026-11-15 · issue #73：WAF 按入口标记 + 并发包装隔离
 
 - **分支**：`TF-Leo/waf-per-host`（远程 `task/waf-per-host`，父 `origin/main`

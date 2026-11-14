@@ -13,6 +13,8 @@ T5        资金流方向 + 口径标签（``evidence.flow``）
 T6        交易所重点监控池命中（``evidence.market_watch``）—— 硬风险告警
 T7        事件风险（``evidence.events``）：解禁 / 股东增减持 / 业绩预告 /
           股权质押 —— 只报 20 日内且达到阈值的重大事件
+T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
+          ``volume_ratio``）—— 只报**上一交易日口径**，定格/缺失整句消失
 ========  ==========================================================
 
 设计边界（硬约束）
@@ -380,6 +382,38 @@ def _freshness(payload: Dict[str, Any]):
     date_mismatch = bool(end and expected and end < expected)
     stale = quote_stale or data_stale or lagging or date_mismatch
     return stale, lag_days, quote_stale, data_stale, end, expected, date_mismatch
+
+
+# ---------------------------------------------------------------------------
+# T8：量比 / 换手（腾讯报价，上一交易日口径）
+# ---------------------------------------------------------------------------
+def _turnover_line(payload: Dict[str, Any]) -> Optional[str]:
+    """``换手 {t}%｜量比 {v}（上一交易日口径）``；不适用时整行消失。
+
+    语义坑：盘前（本项目每天 09:15 运行）当日尚无成交，腾讯报价的换手 /
+    量比恒为 0，且报价定格（``quote_stale=True``）。因此本行有两个硬闸门：
+
+    * ``quote_stale is True`` → 不输出（定格报价是上一交易日的冻结快照，
+      不能冒充今日活跃度）；
+    * 换手 / 量比任一缺失或 ≤ 0 → 整行消失（绝不输出 ``0`` 或空值）。
+
+    通过闸门时，数值来自最近一个**有成交**的交易日，所以句尾必须显式标注
+    「上一交易日口径」——否则用户会把盘前看到的量比当成今天的。
+
+    单位：``turnover_rate_pct`` 已是百分数（0.26 → ``0.26%``，不再乘 100）；
+    ``volume_ratio`` 是无量纲倍数，原样输出。场外基金不适用，整行消失。
+    """
+    if _is_fund(payload):
+        return None
+    inst = _dict(payload.get("instrument"))
+    if inst.get("quote_stale") is True:
+        return None
+    turnover = _num(inst.get("turnover_rate_pct"))
+    ratio = _num(inst.get("volume_ratio"))
+    if turnover is None or ratio is None or turnover <= 0 or ratio <= 0:
+        return None
+    return (f"换手 {_fmt_num(turnover)}%｜量比 {_fmt_num(ratio)}"
+            "（上一交易日口径）")
 
 
 def _paren_pairs(text: str):
@@ -1374,6 +1408,12 @@ def render_advice(payload: dict, compact: bool = False) -> str:
         lines.append(event_line)
 
     lines.append(_price_line(document))
+
+    # T8：上一交易日口径的换手 / 量比（复用 CLI 已有的报价字段）；缺失/定格/
+    # 基金 → 整行消失，不输出 0。
+    turnover = _turnover_line(document)
+    if turnover:
+        lines.append(turnover)
 
     action = _action_line(rec)
     if action:

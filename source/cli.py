@@ -551,6 +551,16 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             # 渲染层优先读它，diagnostics.warnings 文案匹配只作兜底。
             'one_word_limit': None if trading is None else trading.one_word_limit,
             'status_source': 'fund_static' if trading is None else trading.status_source,
+            # T8 additive：腾讯报价的量比 / 换手 / 市值 —— 与 P0-3 的报价
+            # **同一次** ``fetch_quote``，不新增任何请求。单位写进字段名：
+            # ``turnover_rate_pct`` 是百分数（0.26 = 0.26%），``volume_ratio``
+            # 无量纲，市值一律**亿元**（上游 vals[44]=流通 / vals[45]=总）。
+            # 报价定格（盘前/停牌）或字段缺失 → 显式 null，不是 0。
+            'turnover_rate_pct': None if trading is None else trading.turnover_rate_pct,
+            'volume_ratio': None if trading is None else trading.volume_ratio,
+            'market_cap_yi': None if trading is None else trading.market_cap_yi,
+            'float_market_cap_yi': (None if trading is None
+                                    else trading.float_market_cap_yi),
         },
         'data': {
             'bars': len(df),

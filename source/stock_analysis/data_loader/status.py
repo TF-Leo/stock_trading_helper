@@ -104,6 +104,18 @@ def _maybe_num(value) -> Optional[float]:
     return round(number, 2)
 
 
+def _positive_num(value) -> Optional[float]:
+    """报价数值 → 有限**正**数；0 / 空 / NaN / bool 一律 None。
+
+    T8 的量比 / 换手在盘前恒为 0（当日尚无成交），0 不是有效观测值 ——
+    必须 None 掉，绝不让下游把「没有成交」写成「量比 0」。
+    """
+    number = _num(value)
+    if number is None or number <= 0:
+        return None
+    return number
+
+
 def _offline() -> bool:
     for key in (OFFLINE_ENV, "ASTOCK_DISABLE_NETWORK"):
         if str(os.getenv(key, "")).strip().lower() in ("1", "true", "yes", "on"):
@@ -738,6 +750,13 @@ class TradingStatus:
     one_word_limit: Optional[str] = None  # 'up' / 'down' / None
     delisted_suspect: bool = False
     warnings: List[str] = field(default_factory=list)
+    # T8 additive：腾讯报价的量比 / 换手 / 市值，全部复用**同一次**
+    # ``astock.fetch_quote``（零额外请求）。口径见 :func:`resolve_trading_status`
+    # 内的字段取证；报价定格 / 字段缺失 / 非正 → None。
+    turnover_rate_pct: Optional[float] = None   # 已是百分数（0.26 = 0.26%）
+    volume_ratio: Optional[float] = None        # 无量纲倍数
+    market_cap_yi: Optional[float] = None       # 总市值，单位亿元
+    float_market_cap_yi: Optional[float] = None  # 流通市值，单位亿元
 
     def execution_block(self, pending, expectancy_ok: bool, holding: bool) -> Optional[str]:
         """P0-3 可执行性硬约束；返回 None 表示不拦截。
@@ -958,6 +977,27 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
             f"实时报价不可用且行情已滞后 {int(data_lag_days)} 个交易日"
             f"（阈值 {DELIST_LAG_DAYS}），疑似退市/长期停牌，判定不可交易")
 
+    # ---- T8：量比 / 换手 / 市值（复用同一次腾讯报价，零额外请求） ---------
+    # 字段位置按**钉死 commit f215349** 的 §1.1 核对，不凭记忆下标
+    # （``vendor/a-stock-data/SKILL.md``「腾讯财经字段索引速查」1161-1193 行，
+    # 取值见 1116-1136 行）：
+    #   vals[38] 换手率 —— **已经是百分数**（4.55 表示 4.55%，不要再乘 100）
+    #   vals[49] 量比   —— 无量纲倍数
+    #   vals[44] 流通市值 / vals[45] 总市值 —— 单位均为**亿元**（1e8 元），
+    #             不再换算；44/45 网上常被标反（多数票两者相等看不出来），
+    #             SKILL.md:1189-1193 实测校准为 44=流通、45=总（中船特气
+    #             688146 差 3.65 倍）。
+    # 报价定格（``is_stale``）时这些字段是上一交易日的冻结快照，盘前量比
+    # 恒为 0；本项目硬口径：定格报价「不得用于估值」（astock.fetch_quote
+    # docstring），因此一律置 None —— 渲染层整句消失，绝不输出 0 冒充今日。
+    turnover_rate_pct = volume_ratio = None
+    market_cap_yi = float_market_cap_yi = None
+    if quote_ok and not quote_stale:
+        turnover_rate_pct = _positive_num(quote.get("turnover_pct"))
+        volume_ratio = _positive_num(quote.get("vol_ratio"))
+        market_cap_yi = _positive_num(quote.get("mcap_yi"))
+        float_market_cap_yi = _positive_num(quote.get("float_mcap_yi"))
+
     # ---- 一字板 -----------------------------------------------------------
     one_word = None
     if quote_ok and not is_suspended and limit_up and limit_down:
@@ -981,4 +1021,8 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
         one_word_limit=one_word,
         delisted_suspect=delisted_suspect,
         warnings=warnings,
+        turnover_rate_pct=turnover_rate_pct,
+        volume_ratio=volume_ratio,
+        market_cap_yi=market_cap_yi,
+        float_market_cap_yi=float_market_cap_yi,
     )

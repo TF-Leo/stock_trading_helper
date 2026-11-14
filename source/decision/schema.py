@@ -344,6 +344,10 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
                        'one_word_limit': None,
                        # issue #106 additive：ST 判定来源；错误路径不可得。
                        'is_st_source': 'unavailable',
+                       # T8 additive：量比 / 换手 / 市值。取数阶段即失败，
+                       # 腾讯报价未解析 → 显式 null（键集合与成功路径同构）。
+                       'turnover_rate_pct': None, 'volume_ratio': None,
+                       'market_cap_yi': None, 'float_market_cap_yi': None,
                        'status_source': 'unavailable'},
         'data': {
             # bars/start/end/last_close 在"数据太短"时是**已知的真实值**，
