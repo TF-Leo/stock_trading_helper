@@ -1,5 +1,43 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-15 · issue #105 台账四项残留
+
+- **分支**：`task/ledger-p3-cleanup`（父 = `origin/main` `aeb1d04`）；未改
+  `source/decision/*`，未引入依赖，schema 仅 additive。
+- **#105-1 文案常量**：结算阶段 3 处内联字面量（记录价源 / 老记录兜底 /
+  重判前缀）全部改用 `BASIS_CONFIRMED_SUFFIX` / `BASIS_UNCERTAIN_SUFFIX` /
+  新增 `BASIS_REJUDGED_PREFIX`；去掉差一字的「结算不再更改」。
+- **#105-2 已结算判据**：新增 `has_settlement()`（非 null + dict + 必需字段
+  `ret_20d/entry_date/settle_date/entry_open/exit_open` 齐全），替换
+  `rejudge_record` / `infer_settle_status` / `_record_price_source` /
+  `build_report` 里的 `isinstance(dict)`；自报 `settle_status="settled"` 但
+  结算块为空 / 半截时按事实重推，空 dict 不再虚增「已到期」。
+- **#105-3 legacy 换口径**：选**显式 `basis_uncertain` 标记**而非伪造历史判定。
+  未结算且无 `price_source` 的老记录由 `_migrate_legacy_record()`
+  **一次性**补标（`basis_uncertain_source=legacy_record_without_price_source`），
+  交给既有单向重判在首次能确定口径时钉住，之后缓存再变也不换源；幂等，已结算
+  记录不迁移。已结算老记录沿用 `settled.price_source`，避免重算换口径。
+- **#105-4 rejudged 推断**：重判成功写显式 `basis_rejudged=true` /
+  `basis_rejudged_at`；`settle_all()` 只认本次新写入的标记，不再比对四个口径
+  字段。
+- **测试**：`source/tests/test_forward_ledger.py` 新增 6 项（常量引用、空/半截
+  结算块、legacy 迁移幂等+钉住、已结算老记录沿用结算块价源、已结算老记录零
+  漂移、显式重判标记），仅用 600519 / 600000；`_settled` 夹具补必需字段。
+- **证据（本机 Linux，`~/.venv` Python 3.12）**：
+  - `~/.venv/bin/python -m pytest tests/test_forward_ledger.py -q` →
+    **65 passed**；
+  - `~/.venv/bin/python -m pytest tests/ -q` → **1029 passed, 1 failed**；
+    唯一失败 `test_probe_requirements.py::test_current_environment_passes_via_probe`
+    是父 commit 基线已有的解释器/依赖版本不符（akshare/requests/numpy/pandas/
+    pytest），与本改动无关。
+  - 迁移对比（离线 600519，缓存 10.0→12.0）：首次 `settle_all` →
+    `rejudged=['600519']`、`price_source=local_qfq_cache`、
+    `basis_uncertain_source=legacy_record_without_price_source`、
+    `basis_rejudged_at=2026-12-01T18:00:00`、`ret_20d=0.2`；第二次 →
+    `rejudged=[]`、`settled` 整块逐键相等、标记时间不变。
+- **未验证**：本机无 `pwsh`，`tools/check_gates.ps1` 未执行；未用真实生产台账
+  跑迁移（离线构造等价夹具覆盖）。
+
 ## 2026-11-15 · PR #107 P1：ST 名单改为收盘后预计算 + 盘前只读缓存
 
 - **分支**：`task/st-list-robust`（PR #107，父 = `origin/main` `ab7d435`）；
