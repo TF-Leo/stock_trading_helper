@@ -41,8 +41,10 @@ T5        资金流方向 + 口径标签（``evidence.flow``）
   同时有值时视为「混源」，只输出方向、不输出净额。
 * ``evidence.valuation`` 的 ``percentile_samples`` 小于 3 年窗口（756）时，
   文案标注「样本 N 日」。
-* ``compact=True`` 只压缩 ``diagnostics.warnings``：去掉 URL、异常类名/堆栈、
-  内部代号，保留首句与关键事实；默认输出逐字节不变。
+* ``compact=True`` 只压缩 ``diagnostics.warnings``，且**只做整段删除**：结果
+  必为原文的删除子序列（不改写、不截句、不重排、不删斜杠枚举中的单项）。
+  可删片段仅三类：URL、堆栈/回溯段、**配对完整**的内部引用括号；括号不配对
+  时不删括号，删除后若括号失衡则退回原文。默认输出逐字节不变。
 """
 from __future__ import annotations
 
@@ -77,12 +79,28 @@ _ONE_WORD_MARKERS = {
 }
 
 #: --compact 的告警压缩规则（只作用 ``diagnostics.warnings``）。
-_COMPACT_URL_RE = re.compile(r"https?://[^\s，。；、（）()]+")
-_COMPACT_INTERNAL_RE = re.compile(
-    r"（[^）]*(?:Traceback|Error|Exception|\.py\b|line \d+)[^）]*）")
-_COMPACT_CODE_RE = re.compile(
-    r"（(?:[A-Z]{1,2}\d{1,2}[a-z]?(?:-\d+)?|issue #\d+)）")
-_COMPACT_PATH_RE = re.compile(r"(?:/[\w.\-]+){2,}")
+#: 硬约束：只删整段，不做任何句内改写 —— 因此这里**没有**路径/空白/标点
+#: 归一化规则，也**不**截断句子。历史上的 ``(?:/[\w.\-]+){2,}`` 会把中文
+#: 斜杠枚举「停牌/退市/代码无效无法区分」当成路径删掉，把「无法判断」写成
+#: 事实「停牌」，已删除该类规则。
+_COMPACT_URL_RE = re.compile(r"https?://[^\s，。；、（）()<>\"']+")
+
+#: 堆栈/回溯中的独立片段（``File "…", line N`` / ``During handling of…``）。
+_COMPACT_STACK_SEGMENT_RES = (
+    re.compile(r'File\s+"[^"]*",\s*line\s+\d+[^\n]*'),
+    re.compile(r"During handling of the above exception[^\n]*"),
+)
+
+#: 括号内容命中这些标记即视为「内部引用 / 内部诊断」，整对括号连同内容删除。
+#: 只作用于**配对完整**的括号；配对由 :func:`_internal_paren_deletions` 保证。
+_COMPACT_INTERNAL_MARKERS_RE = re.compile(
+    r"issue\s*#\d+"
+    r"|^\s*(?:参见|详见|见)"
+    r"|Traceback|Error|Exception|\.py\b|\bline\s+\d+"
+    r"|During handling of"
+    r"|\b(?:p_positive|trigger\.current|is_st|action|confidence)\b"
+    r"|[A-Z]{1,2}\d{1,2}[a-z]?(?:-\d+)?"
+)
 
 #: regime 标签的相对强弱（只用于判断「逆风/顺风」，不参与任何决策）。
 _REGIME_RANK = {"Bull": 2, "Shock": 1, "Bear": 0}
@@ -206,30 +224,99 @@ def _freshness(payload: Dict[str, Any]):
     return stale, lag_days, quote_stale, data_stale, end, expected, date_mismatch
 
 
+def _paren_pairs(text: str):
+    """扫描括号配对，返回 ``(spans, balanced)``。
+
+    ``spans`` 为 ``(start, end)``（含两侧括号）；只认同种括号（``（）`` /
+    ``()``）配对，其它情况视为不配对。``balanced=False`` 时调用方不得删除
+    任何括号，避免留下孤立括号。
+    """
+    stack: List[tuple] = []
+    spans: List[tuple] = []
+    balanced = True
+    for index, char in enumerate(text):
+        if char in ("（", "("):
+            stack.append((char, index))
+        elif char in ("）", ")"):
+            opener = "（" if char == "）" else "("
+            if stack and stack[-1][0] == opener:
+                _, start = stack.pop()
+                spans.append((start, index + 1))
+            else:
+                balanced = False
+    if stack:
+        balanced = False
+    return spans, balanced
+
+
+def _parens_balanced(text: str) -> bool:
+    """括号计数平衡（深度不为负且最终归零）。"""
+    depth = 0
+    for char in text:
+        if char in ("（", "("):
+            depth += 1
+        elif char in ("）", ")"):
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _internal_paren_deletions(text: str) -> List[tuple]:
+    """返回可整对删除的内部引用括号区间；括号不配对时返回空列表。"""
+    spans, balanced = _paren_pairs(text)
+    if not balanced:
+        return []
+    return [(start, end) for start, end in spans
+            if _COMPACT_INTERNAL_MARKERS_RE.search(text[start + 1:end - 1])]
+
+
+def _apply_deletions(text: str, deletions: List[tuple]) -> str:
+    """按区间删除后拼接；区间可重叠/相邻。"""
+    if not deletions:
+        return text
+    merged: List[list] = []
+    for start, end in sorted(deletions):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    parts: List[str] = []
+    cursor = 0
+    for start, end in merged:
+        parts.append(text[cursor:start])
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
 def _compact_warning(text: str) -> str:
-    """压缩单条 warning：去 URL / 异常堆栈 / 内部代号，保留首句与关键事实。"""
+    """压缩单条 warning —— **只做整段删除**，结果必为原文的删除子序列。
+
+    只允许三类删除：URL、堆栈/回溯段、配对完整的内部引用括号。不改写措辞、
+    不截断句子、不删斜杠枚举中的单项、不做单侧去括号；括号不配对时不删。
+    删除后若括号失衡，整条退回原文。返回空字符串表示整条都是内部细节，
+    调用方应丢弃该行（空串仍是原文的子序列）。
+    """
     original = text
+    deletions: List[tuple] = []
+
+    for match in _COMPACT_URL_RE.finditer(original):
+        deletions.append((match.start(), match.end()))
+
     # 堆栈从 Traceback 起整段丢弃（前面若有可读事实则保留）。
-    if "Traceback" in text:
-        text = text.split("Traceback", 1)[0]
-    text = _COMPACT_URL_RE.sub("", text)
-    text = _COMPACT_INTERNAL_RE.sub("", text)
-    text = _COMPACT_PATH_RE.sub("", text)
-    text = _COMPACT_CODE_RE.sub("", text)
+    traceback_at = original.find("Traceback")
+    if traceback_at != -1:
+        deletions.append((traceback_at, len(original)))
+    for pattern in _COMPACT_STACK_SEGMENT_RES:
+        for match in pattern.finditer(original):
+            deletions.append((match.start(), match.end()))
 
-    # 只保留首句（中文句号）；不在小数点/英文缩写上切分。
-    if "。" in text:
-        text = text.split("。", 1)[0] + "。"
+    deletions.extend(_internal_paren_deletions(original))
 
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\s+([，。；、）])", r"\1", text)
-    text = re.sub(r"([（])\s+", r"\1", text)
-    text = text.strip(" ；，、")
-    if not text:
-        return "内部错误详情已省略"
-    # 压缩后若把原文的事实全删光（只剩标点），回退到首句原文。
-    if not re.search(r"[一-鿿A-Za-z0-9]", text):
-        return original.split("。", 1)[0].strip() or "内部错误详情已省略"
+    text = _apply_deletions(original, deletions).strip()
+    if not _parens_balanced(text):
+        return original.strip()
     return text
 
 
@@ -538,8 +625,9 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     纯函数：不改入参、不读文件、不触网。缺失字段对应的句子/段落整体消失，
     输出中不会出现 ``None``。
 
-    ``compact=True`` 只压缩 ``diagnostics.warnings``（去 URL / 堆栈 / 内部代号，
-    保留首句与关键事实）；其余行与默认输出完全一致。
+    ``compact=True`` 只压缩 ``diagnostics.warnings``，且只做整段删除（URL /
+    堆栈回溯段 / 配对完整的内部引用括号）；其余行与默认输出完全一致。
+    整条 warning 都是内部细节时该行整体消失，绝不改写原文措辞。
     """
     document = _dict(payload)
     rec = _dict(document.get("recommendation"))
@@ -550,7 +638,9 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     # T2（前置）：数据问题必须先于建议报告。
     for warning in _warnings(document):
         shown = _compact_warning(warning) if compact else warning
-        lines.append(f"⚠️ 数据: {shown}")
+        # 整条都是内部细节（如纯堆栈）时整行不出现；空串仍是原文的子序列。
+        if shown:
+            lines.append(f"⚠️ 数据: {shown}")
     if lines:
         lines.append("")
 

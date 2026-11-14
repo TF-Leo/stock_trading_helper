@@ -366,14 +366,64 @@ def test_t5_stale_has_date_and_no_buy_wording():
 
 
 # ---------------------------------------------------------------------------
-# --compact：只压缩 warnings
+# --compact：只压缩 warnings，且只做整段删除
 # ---------------------------------------------------------------------------
+REAL_WARNINGS_FIXTURE = FIXTURES / "compact_real_warnings.json"
+REAL_WARNINGS = json.loads(
+    REAL_WARNINGS_FIXTURE.read_text(encoding="utf-8"))["diagnostics"]["warnings"]
+
+
+def _compact_warning_lines(text: str):
+    prefix = "⚠️ 数据: "
+    return [line[len(prefix):] for line in text.splitlines()
+            if line.startswith(prefix)]
+
+
+def _compact_single(warning: str) -> str:
+    """把单条 warning 放进最小 payload 渲染；整行消失时返回空串。"""
+    payload = _payload("minimal_missing")
+    payload["diagnostics"] = {"warnings": [warning]}
+    lines = _compact_warning_lines(render_advice(payload, compact=True))
+    return lines[0] if lines else ""
+
+
+def _is_deletion_subsequence(shorter: str, longer: str) -> bool:
+    """``shorter`` 的字符是否按序出现在 ``longer`` 中（允许中间有删除）。"""
+    iterator = iter(longer)
+    return all(char in iterator for char in shorter)
+
+
+def _parens_balanced(text: str) -> bool:
+    depth = 0
+    for char in text:
+        if char in "（(":
+            depth += 1
+        elif char in "）)":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+COMPACT_SAFETY_WARNINGS = (
+    *REAL_WARNINGS,
+    "接口失败 https://example.com/a?b=1（RuntimeError: timeout）；已回退旧缓存（P0-3）",
+    "状态未知：停牌/退市/代码无效无法区分",
+    "统计证据不足（p_positive=0.42，n=12）",
+    "两条独立事实。第二句不得被截断。",
+    "括号不配对（issue #1 决策",
+    "括号不配对 issue #1 决策）",
+    "During handling of the above exception, another exception occurred: boom",
+    'File "/tmp/x.py", line 12, in f',
+)
+
+
 def test_compact_warnings_strip_urls_stacks_and_codes():
     payload = _payload("one_word_up")
     payload["diagnostics"]["warnings"] = [
         "接口失败 https://example.com/a?b=1（RuntimeError: timeout）；已回退旧缓存（P0-3）",
         "Traceback (most recent call last): File \"/tmp/x.py\", line 1 ValueError: boom",
-        "ST 名单为空。后续还有一句不该出现",
+        "ST 名单为空。后续还有一句必须保留",
     ]
     normal = render_advice(payload)
     compact = render_advice(payload, compact=True)
@@ -384,8 +434,9 @@ def test_compact_warnings_strip_urls_stacks_and_codes():
         assert token not in compact
     assert "接口失败" in compact
     assert "已回退旧缓存" in compact
+    # 只删整段：不得再按句号截断，第二句原样保留。
     assert "ST 名单为空。" in compact
-    assert "后续还有一句" not in compact
+    assert "后续还有一句必须保留" in compact
 
     # 非 warning 行逐行不变。
     normal_lines = [line for line in normal.splitlines()
@@ -393,14 +444,70 @@ def test_compact_warnings_strip_urls_stacks_and_codes():
     compact_lines = [line for line in compact.splitlines()
                      if not line.startswith("⚠️ 数据:")]
     assert normal_lines == compact_lines
-    assert len([line for line in compact.splitlines()
-                if line.startswith("⚠️ 数据:")]) == 3
+    # 纯堆栈那条整段删除后为空，整行不出现；其余两条保留。
+    assert len(_compact_warning_lines(compact)) == 2
+
+
+def test_compact_real_warning_keeps_unknown_status():
+    """复验缺陷 (a)：不得把「无法判断是否停牌」压成事实「停牌」。"""
+    payload = json.loads(REAL_WARNINGS_FIXTURE.read_text(encoding="utf-8"))
+    normal = render_advice(payload)
+    compact = render_advice(copy.deepcopy(payload), compact=True)
+
+    for warning in REAL_WARNINGS:
+        assert f"⚠️ 数据: {warning}" in normal
+    assert normal == render_advice(payload, compact=False)
+
+    lines = _compact_warning_lines(compact)
+    status_line = next(line for line in lines if "无法获取实时交易状态" in line)
+    assert "停牌/退市/代码无效无法区分" in status_line
+    assert "无法区分" in status_line
+    assert not status_line.endswith("：停牌")
+
+    # 复验缺陷 (b)：嵌套括号整对删除，不得残留内部引用或孤立括号。
+    st_line = next(line for line in lines if "ST 名单接口失败" in line)
+    assert "issue #1" not in st_line
+    assert "RuntimeError" not in st_line
+    assert "且无本地缓存" in st_line
+    assert _parens_balanced(st_line)
+
+
+@pytest.mark.parametrize("warning", COMPACT_SAFETY_WARNINGS)
+def test_compact_output_is_deletion_subsequence(warning):
+    """compact 结果必须是原文按序删除若干整段后的结果。"""
+    assert _is_deletion_subsequence(_compact_single(warning), warning)
+
+
+@pytest.mark.parametrize("warning", COMPACT_SAFETY_WARNINGS)
+def test_compact_never_breaks_parentheses(warning):
+    compacted = _compact_single(warning)
+    if _parens_balanced(warning):
+        assert _parens_balanced(compacted)
+    else:
+        # 原文本身括号不配对：不得单侧删除，必须原样返回。
+        assert compacted == warning
+
+
+def test_compact_does_not_truncate_or_rewrite():
+    warning = "第一条事实。第二条事实（issue #1 决策）。"
+    assert _compact_single(warning) == "第一条事实。第二条事实。"
+
+
+def test_compact_leaves_unbalanced_parentheses_untouched():
+    warning = "状态无法判断（issue #1 决策"
+    assert _compact_single(warning) == warning
+
+
+def test_compact_internal_parenthetical_is_deleted_whole():
+    assert _compact_single("统计证据不足（p_positive=0.42，n=12）") == "统计证据不足"
 
 
 def test_compact_does_not_change_default_output():
     for name in FIXTURE_NAMES:
         payload = _payload(name)
         assert render_advice(payload) == render_advice(payload, compact=False)
+    payload = json.loads(REAL_WARNINGS_FIXTURE.read_text(encoding="utf-8"))
+    assert render_advice(payload) == render_advice(payload, compact=False)
 
 
 # ---------------------------------------------------------------------------
