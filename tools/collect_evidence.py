@@ -46,6 +46,12 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "source"
 OUT = ROOT / "evidence" / datetime.now().strftime("%Y%m%d-%H%M%S")
 
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+# 休市退出码只认 ``market_state`` 的唯一定义（P3-3：不再散落硬编码 50）。
+from market_state import MARKET_CLOSED_EXIT_CODE as EXIT_MARKET_CLOSED  # noqa: E402
+
 PY = sys.executable
 ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
 # as-of 取证标的：与 VERIFICATION_HANDOFF.md 的 Hermes 交接票一致。
@@ -152,6 +158,17 @@ def step_idempotent():
     c2, o2, e2, s2 = run(cmd, cwd=SRC, timeout=900)
     write("idem_a.json", o1 or e1)
     write("idem_b.json", o2 or e2)
+    # issue #119：休市日两次都返回 exit 50（今日休市），不是幂等失败。
+    # 跳过该步、不计失败；仍记录退出码与输出摘要供人读。
+    if c1 == c2 == EXIT_MARKET_CLOSED:
+        write("idem_result.json",
+              json.dumps({"identical": None, "exit": [c1, c2],
+                          "seconds": [s1, s2], "skipped": "market_closed"},
+                         ensure_ascii=False, indent=2))
+        return {"name": "idempotent", "ok": True, "skipped": "market_closed",
+                "note": (f"今日休市（exit {EXIT_MARKET_CLOSED}），"
+                         "跳过幂等校验，不计失败"),
+                "file": "idem_result.json"}
     try:
         a = _strip_volatile(json.loads(o1))
         b = _strip_volatile(json.loads(o2))
@@ -175,7 +192,7 @@ def step_asof():
         cmd = [PY, "cli.py", ASOF_CODE, "--json", "--fast", "--as-of", day]
         code, out, err, sec = run(cmd, cwd=SRC, timeout=900)
         write(f"asof_{day}.json", out or err)
-        if code == 50:
+        if code == EXIT_MARKET_CLOSED:
             # issue #119：exit 50 = 今日休市（非交易日）。--as-of 只截断行情，
             # 不改变「今天是否交易日」的判定，所以休市日两天都会返回 50。
             # 跳过该步、不计失败；仍记录 status 供人读。
@@ -217,7 +234,8 @@ def step_asof():
                            for k, v in rows.items()}}
     if skipped:
         result["skipped"] = "market_closed"
-        result["note"] = "今日休市（exit 50），跳过 as-of 校验，不计失败"
+        result["note"] = (f"今日休市（exit {EXIT_MARKET_CLOSED}），"
+                          "跳过 as-of 校验，不计失败")
     return result
 
 
@@ -228,6 +246,13 @@ def step_timing():
         code, _, err, sec = run(cmd, cwd=SRC, timeout=1800)
         out[label] = {"exit": code, "seconds": sec, "error": (err or "")[:200]}
     write("timing.json", json.dumps(out, ensure_ascii=False, indent=2))
+    # issue #119：休市日两条路径都返回 exit 50，视为「今日休市」跳过、不计失败。
+    if all(v["exit"] == EXIT_MARKET_CLOSED for v in out.values()):
+        return {"name": "timing", "ok": True, "skipped": "market_closed",
+                "note": (f"今日休市（exit {EXIT_MARKET_CLOSED}），"
+                         "跳过耗时校验，不计失败"),
+                "observed": {k: v["seconds"] for k, v in out.items()},
+                "file": "timing.json"}
     return {"name": "timing", "ok": all(v["exit"] in (0, 10) for v in out.values()),
             "observed": {k: v["seconds"] for k, v in out.items()}, "file": "timing.json"}
 

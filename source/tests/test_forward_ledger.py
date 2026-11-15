@@ -1544,19 +1544,93 @@ def test_tool_record_trading_day_writes(tmp_path, monkeypatch):
     assert fl.load_day("2026-11-12", ledger_dir)["records"]["600000"]["action"] == "buy"
 
 
-def test_tool_record_calendar_unavailable_warns_but_writes(
+def test_tool_record_calendar_unavailable_refuses_by_default(
         tmp_path, monkeypatch, capsys):
-    """日历不可用 = 无法判定，不是「确认休市」：告警后按旧行为写入。"""
+    """日历不可用 = 无法确认 as_of 落在哪天：默认拒绝，且零落盘（P2 复验反例）。"""
     tool = _load_forward_log(trading_day=None)
     monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
     monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
     ledger_dir = tmp_path / "forward"
 
-    written = tool.record(["600000"], ledger_dir=ledger_dir,
-                          runner=_runner(_cli_payload(code="600000")))
+    with pytest.raises(tool.NonTradingDayError, match="日历不可用"):
+        tool.record(["600000"], ledger_dir=ledger_dir,
+                    runner=_runner(_cli_payload(code="600000")))
+
+    # 拒绝必须发生在任何落盘之前：JSON 台账与 CSV 都不存在。
+    assert not ledger_dir.exists()
+    assert not tool.LOG.exists()
+
+
+def test_tool_record_calendar_unavailable_cli_exits_50(
+        tmp_path, monkeypatch, capsys):
+    tool = _load_forward_log(trading_day=None)
+    monkeypatch.setattr(sys, "argv", [
+        "forward_log.py", "record", "--codes", "600000",
+        "--ledger-dir", str(tmp_path / "forward")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        tool.main()
+
+    assert excinfo.value.code == tool.EXIT_MARKET_STATE_UNKNOWN == 50
+    err = capsys.readouterr().err
+    assert "日历不可用" in err
+    assert "--allow-non-trading-day" in err
+
+
+def test_tool_record_calendar_unavailable_allow_warns_overwrite(
+        tmp_path, monkeypatch, capsys):
+    """显式放行时写入，但必须醒目提示可能覆盖台账里最近一天的既有记录。"""
+    tool = _load_forward_log(trading_day=None)
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+    fl.write_records({"2026-11-12": {"600000": {"code": "600000"}}},
+                     ledger_dir=ledger_dir)
+
+    written = tool.record(
+        ["600000"], ledger_dir=ledger_dir, allow_non_trading_day=True,
+        day=date(2026, 11, 15),
+        runner=_runner(_cli_payload(code="600000", as_of="2026-11-12")))
 
     assert list(written) == ["2026-11-12"]
-    assert "无法判定今日是否交易日" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "警告" in err and "可能覆盖 2026-11-12 的既有记录" in err
+
+
+def test_tool_record_non_trading_day_allow_warns_overwrite(
+        tmp_path, monkeypatch, capsys):
+    """休市日显式放行同样打印「可能覆盖 {date}」警告。"""
+    tool = _load_forward_log(trading_day=False)
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+    fl.write_records({"2026-11-12": {"600519": {"code": "600519"}}},
+                     ledger_dir=ledger_dir)
+
+    tool.record(["600519"], ledger_dir=ledger_dir, allow_non_trading_day=True,
+                day=date(2026, 11, 15),
+                runner=_runner(_cli_payload(code="600519", as_of="2026-11-12",
+                                            status="market_closed")))
+
+    err = capsys.readouterr().err
+    assert "休市" in err and "可能覆盖 2026-11-12 的既有记录" in err
+
+
+def test_tool_record_non_trading_day_allow_writes_without_ledger(
+        tmp_path, monkeypatch):
+    """台账为空时放行仍写入，警告退化为「上一交易日」。"""
+    tool = _load_forward_log(trading_day=False)
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+
+    written = tool.record(
+        ["600519"], ledger_dir=ledger_dir, allow_non_trading_day=True,
+        day=date(2026, 11, 15),
+        runner=_runner(_cli_payload(code="600519", status="market_closed")))
+
+    assert list(written) == ["2026-11-12"]
+    assert tool.LOG.exists()
 
 
 def test_tool_record_survives_cli_failure(tmp_path, monkeypatch):

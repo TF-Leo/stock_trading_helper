@@ -19,7 +19,7 @@ confidence 分箱校准与按 ``flow.caliber`` / 估值分位的分层命中率�
     python tools/forward_log.py record
     python tools/forward_log.py record --codes 002415,600519   # 只记两只
     python tools/forward_log.py record --ledger-only           # 只写 JSON 台账
-    python tools/forward_log.py record --allow-non-trading-day # 休市日强制写入
+    python tools/forward_log.py record --allow-non-trading-day # 休市/日历不可用时强制写入（打印覆盖警告）
     python tools/forward_log.py evaluate                       # CSV + JSON 台账结算
     python tools/forward_log.py report                         # 汇总（可加 --json）
 
@@ -45,14 +45,18 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from stock_analysis import forward_ledger as ledger  # noqa: E402
+from market_state import MARKET_CLOSED_EXIT_CODE  # noqa: E402
 
 EVID = ROOT / "evidence"
 LOG = EVID / "forward_log.csv"
 EVAL = EVID / "forward_eval.csv"
 
 # issue #119：休市日 CLI 返回 status=market_closed，其 as_of 仍是上一交易日，
-# 直接写入会覆盖那一天的 CSV / JSON 台账（含已结算数据）。沿用休市退出码 50。
-EXIT_NON_TRADING_DAY = 50
+# 直接写入会覆盖那一天的 CSV / JSON 台账（含已结算数据）。退出码只在这里定义
+# 一次，且与 ``market_state.MARKET_CLOSED_EXIT_CODE`` 同源（P3-3）。
+EXIT_NON_TRADING_DAY = MARKET_CLOSED_EXIT_CODE
+# 日历不可用时同样拒绝写入，复用同一退出码（PR #120 复验 P2）。
+EXIT_MARKET_STATE_UNKNOWN = EXIT_NON_TRADING_DAY
 
 
 class NonTradingDayError(RuntimeError):
@@ -86,26 +90,51 @@ def _market_day_state(day=None):
     return _status.market_day_state(day or datetime.now().date())
 
 
-def _check_trading_day(allow_non_trading_day=False, day=None):
-    """非交易日拒绝 ``record``；显式放行或日历不可用时返回状态。
+def _overwrite_date_hint(ledger_dir=None, day=None):
+    """台账里今天之前最近的一天：休市日/日历不可用时写入最可能覆盖的就是它。"""
+    today = str(day or datetime.now().date())[:10]
+    days = [d for d in ledger.list_days(ledger_dir) if d < today]
+    return max(days) if days else None
+
+
+def _check_trading_day(allow_non_trading_day=False, day=None, ledger_dir=None):
+    """休市**或日历不可用**时拒绝 ``record``；显式放行时打印覆盖警告。
 
     * ``closed is True``  → 抛 :class:`NonTradingDayError`（退出码 50）；
-    * ``closed is None``  → 官方日历不可用，**无法判定**：告警后继续写入
-      （此时 CLI 也不会把记录标成 ``market_closed``，不会触发覆盖故障）；
+    * ``closed is None``  → 官方日历不可用，**无法确认是否交易日**：同样默认
+      拒绝（退出码 50）。写入目标由 ``as_of`` 决定、不由 status 决定，而
+      ``as_of`` 在休市/日历缺失时通常是上一交易日，继续写会覆盖那天的真实
+      记录（settled 消失、字段变 null）——PR #120 复验 P2 的反例；
     * ``closed is False`` → 交易日，正常写入。
+
+    只有显式 ``--allow-non-trading-day`` 才放行；放行时打印醒目警告，提示
+    可能覆盖哪一天的既有记录。
     """
-    if allow_non_trading_day:
-        return None
     state = _market_day_state(day)
-    if state.closed is True:
+    if state.closed is False:
+        return state
+    if not allow_non_trading_day:
+        if state.closed is True:
+            raise NonTradingDayError(
+                "今日休市（官方交易日历：非交易日"
+                f"，来源 {state.source}），record 已拒绝写入：休市日产生的 "
+                "status=market_closed 记录会以上一交易日为 as_of 覆盖既有台账"
+                "（含已结算数据）。如确需写入，请显式加 --allow-non-trading-day。")
         raise NonTradingDayError(
-            "今日休市（官方交易日历：非交易日"
-            f"，来源 {state.source}），record 已拒绝写入：休市日产生的 "
-            "status=market_closed 记录会以上一交易日为 as_of 覆盖既有台账"
+            "日历不可用，无法确认是否交易日"
+            f"（{state.warning or state.source}），record 已拒绝写入：无法确认 "
+            "as_of 会落在哪一天，继续写可能覆盖上一交易日的既有台账"
             "（含已结算数据）。如确需写入，请显式加 --allow-non-trading-day。")
-    if state.closed is None:
-        print(f"[forward_log] 警告：{state.warning or '无法判定今日是否交易日'}"
-              "；按「未确认休市」继续写入。", file=sys.stderr)
+
+    overwrite = _overwrite_date_hint(ledger_dir, day)
+    target = (f"可能覆盖 {overwrite} 的既有记录"
+              if overwrite else "可能覆盖上一交易日的既有记录")
+    reason = ("官方交易日历确认今日休市"
+              if state.closed is True
+              else f"交易日历不可用（{state.warning or state.source}）")
+    print(f"[forward_log] !!! 警告：{reason}，已按 --allow-non-trading-day "
+          f"强制写入；{target}——写入目标由 as_of 决定，休市/无法判定时通常是"
+          "上一交易日，会覆盖该日同 code 的台账与 CSV 行。", file=sys.stderr)
     return state
 
 
@@ -116,11 +145,13 @@ def record(codes, ledger_dir=None, ledger_only=False, runner=None,
     每只票只跑一次 CLI：``collect_record`` 同时返回台账记录与原始 payload，
     CSV 行从 payload 取旧字段，台账行取新字段。CSV 仍按 ``(as_of, code)`` 去重。
 
-    issue #119：默认先查官方交易日历，``closed is True`` 时抛
-    :class:`NonTradingDayError`（不开文件、不跑 CLI）；``allow_non_trading_day``
-    显式放行。``day`` 仅测试注入，生产路径不得传。
+    issue #119：默认先查官方交易日历，``closed is True``（休市）或
+    ``closed is None``（日历不可用、无法确认）都抛
+    :class:`NonTradingDayError`（不开文件、不跑 CLI）；只有
+    ``allow_non_trading_day`` 显式放行，并打印「可能覆盖 {date}」警告。
+    ``day`` 仅测试注入，生产路径不得传。
     """
-    _check_trading_day(allow_non_trading_day, day)
+    _check_trading_day(allow_non_trading_day, day, ledger_dir=ledger_dir)
     existing = set()
     if LOG.exists():
         with LOG.open(encoding="utf-8", newline="") as f:
@@ -284,7 +315,8 @@ def main():
     ap.add_argument("--ledger-only", action="store_true",
                     help="record 时只写 JSON 台账，不写 evidence/forward_log.csv")
     ap.add_argument("--allow-non-trading-day", action="store_true",
-                    help="record 在官方交易日历判定为休市时仍写入（默认拒绝，退出码 50）")
+                    help=("record 在休市或日历不可用时仍强制写入（默认拒绝，"
+                          f"退出码 {EXIT_NON_TRADING_DAY}），并打印覆盖警告"))
     ap.add_argument("--json", action="store_true", help="report 输出机读 JSON")
     a = ap.parse_args()
     codes = [c.strip() for c in a.codes.split(",") if c.strip()] or DEFAULT_CODES

@@ -79,3 +79,66 @@ def test_step_asof_other_exit_codes_still_fail(monkeypatch):
     assert len(calls) == 2, "非 50 失败不跳过次日"
     summary = json.loads(writes["asof_summary.json"])
     assert all(row["exit"] == 30 and row["error"] for row in summary.values())
+
+
+# ---------------------------------------------------------------------------
+# issue #119 P3：休市日的 idempotent / timing 也必须认 exit 50、跳过且不计失败
+# ---------------------------------------------------------------------------
+def _patch_all_runs(module, monkeypatch, exit_code=50,
+                    payload='{"recommendation": {"status": "market_closed"}}'):
+    writes = {}
+    monkeypatch.setattr(module, "run", lambda cmd, cwd=None, timeout=1800:
+                        (exit_code, payload, "", 0.1))
+    monkeypatch.setattr(module, "write",
+                        lambda name, text: writes.__setitem__(name, text))
+    return writes
+
+
+def test_step_idempotent_exit_50_is_skipped(monkeypatch):
+    module = _load_tool()
+    writes = _patch_all_runs(module, monkeypatch)
+
+    result = module.step_idempotent()
+
+    assert result["ok"] is True
+    assert result["skipped"] == "market_closed"
+    assert "休市" in result["note"]
+    saved = json.loads(writes["idem_result.json"])
+    assert saved["exit"] == [50, 50] and saved["skipped"] == "market_closed"
+
+
+def test_step_idempotent_other_exit_codes_still_fail(monkeypatch):
+    module = _load_tool()
+    _patch_all_runs(module, monkeypatch, exit_code=30, payload="boom")
+
+    result = module.step_idempotent()
+
+    assert result["ok"] is False
+    assert "skipped" not in result
+
+
+def test_step_timing_exit_50_is_skipped(monkeypatch):
+    module = _load_tool()
+    _patch_all_runs(module, monkeypatch)
+
+    result = module.step_timing()
+
+    assert result["ok"] is True
+    assert result["skipped"] == "market_closed"
+    assert "休市" in result["note"]
+    assert set(result["observed"]) == {"full", "fast"}
+
+
+def test_step_timing_mixed_50_and_ok_still_fails(monkeypatch):
+    """只有两条路径都 50（今日休市）才跳过；混合退出码仍是失败。"""
+    module = _load_tool()
+    codes = iter([50, 0])
+
+    monkeypatch.setattr(module, "run", lambda cmd, cwd=None, timeout=1800:
+                        (next(codes), "", "", 0.1))
+    monkeypatch.setattr(module, "write", lambda name, text: None)
+
+    result = module.step_timing()
+
+    assert result["ok"] is False
+    assert "skipped" not in result
