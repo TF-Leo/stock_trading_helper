@@ -49,7 +49,10 @@ REQUIRED_DATA_KEYS = [
 ]
 
 EXIT_CODES = {"ok": 0, "no_edge": 10, "insufficient_data": 20,
-              "data_source_error": 30, "untradeable": 40}
+              "data_source_error": 30, "untradeable": 40,
+              # issue #117：非交易日（休市）独立退出码；decision/* 未改动，
+              # 映射由 market_state.exit_code_for_status 提供，README 已登记。
+              "market_closed": 50}
 
 _CLI_CACHE = {}
 
@@ -124,7 +127,11 @@ def sh(args, timeout=300):
 
 
 def run_cli_json(args, cache=True, timeout=300):
-    """真跑 CLI 并要求 stdout 是纯 JSON（C1 契约）。退出码必须是契约五码之一。"""
+    """真跑 CLI 并要求 stdout 是纯 JSON（C1 契约）。退出码必须是契约集合之一。
+
+    2026-11-15（issue #117）：契约新增 ``market_closed``=50。非交易日所有
+    股票运行都会走该状态；这不是失败，而是「今日休市」的明确结论。
+    """
     key = tuple(args)
     if cache and key in _CLI_CACHE:
         # 必须返回深拷贝：各 check 会往 rec 里写 status/reason，
@@ -135,7 +142,7 @@ def run_cli_json(args, cache=True, timeout=300):
     rec = {"cmd": "python cli.py " + " ".join(args), "exit": r["exit"], "sec": r["sec"]}
     if r["exit"] not in EXIT_CODES.values():
         rec["status"] = "FAIL"
-        rec["reason"] = f"退出码 {r['exit']} 不在契约集合 {{0,10,20,30,40}}: {r['err'].strip()[:300]}"
+        rec["reason"] = f"退出码 {r['exit']} 不在契约集合 {sorted(set(EXIT_CODES.values()))}: {r['err'].strip()[:300]}"
         rec["data"] = None
     else:
         try:
@@ -273,8 +280,16 @@ def check_fund_contract(code="510300", fast=True):
     if len(ev) < 10:
         problems.append(f"基金 evidence 仅 {len(ev)} 键")
     status = (data.get("recommendation") or {}).get("status")
-    if status not in ("ok", "no_edge"):
-        problems.append(f"基金 status={status}（期望 ok/no_edge；缓存缺失请先联网预热，见 README）")
+    inst = data.get("instrument") or {}
+    if status == "market_closed":
+        # issue #117：休市日基金同样输出 market_closed / 50（不再是 ok/no_edge）。
+        # 只接受与 instrument.market_closed=true 交叉自洽的 50。
+        if rec["exit"] != 50 or inst.get("market_closed") is not True:
+            problems.append(
+                f"基金 status=market_closed 但 exit={rec['exit']} / "
+                f"market_closed={inst.get('market_closed')!r}（应 50 + true）")
+    elif status not in ("ok", "no_edge"):
+        problems.append(f"基金 status={status}（期望 ok/no_edge/market_closed；缓存缺失请先联网预热，见 README）")
     elif rec["exit"] != EXIT_CODES[status]:
         problems.append(f"基金退出码 {rec['exit']} 与 status={status} 不一致")
     rec["status"] = "PASS" if not problems else "FAIL"
@@ -571,7 +586,7 @@ def check_type_hint():
 def check_old_args():
     """G29：D6 旧参数**端到端真跑**（subprocess，非进程内 parse_args）。
 
-    契约 D6 要求"真跑并断言 returncode ∈ {0,10,20,30,40}"。旧实现只做进程内
+    契约 D6 要求"真跑并断言 returncode ∈ 契约集合"。旧实现只做进程内
     `build_parser().parse_args()` —— 只能证明 argparse **认识**该参数，不能证明参数
     被接线到行为（argparse 收下却无人使用也照样 PASS），是判定强度的实质弱化。
 
@@ -588,7 +603,7 @@ def check_old_args():
     base = ["600519", "--start", "20260701"]
     cases = [["--detail"], ["--no-regime"], ["--opt-iters", "8"], ["--jobs", "2"],
              ["--opt", "grid"], ["-t", "stock"], ["--json"], ["--fast"]]
-    allowed = {0, 10, 20, 30, 40}
+    allowed = set(EXIT_CODES.values())
     problems, rc_map, stdout_map = [], {}, {}
     for extra in cases:
         key = " ".join(extra)
@@ -1448,8 +1463,13 @@ def check_otc_fund():
         obs[code] = {"exit": rec.get("exit"), "bars": bars,
                      "type": typ, "status": st,
                      "source": (d.get("data") or {}).get("source")}
+        closed = (d.get("instrument") or {}).get("market_closed")
         if rec.get("exit") not in (0, 10):
-            problems.append(f"{code} --type fund 退出码 {rec.get('exit')}（期望 0 或 10）")
+            # issue #117：休市日同样 50=market_closed（必须与 instrument 交叉自洽）。
+            if not (rec.get("exit") == 50 and st == "market_closed" and closed is True):
+                problems.append(
+                    f"{code} --type fund 退出码 {rec.get('exit')}（期望 0/10，"
+                    f"或休市 50=market_closed+instrument.market_closed=true）")
         if bars < 100:
             problems.append(f"{code} --type fund 仅 {bars} 根")
     # auto 判定：0/1 段场外基金必须识别为 fund
@@ -1679,8 +1699,29 @@ def check_as_of(code="002415"):
             problems.append(f"{day}: request.as_of 未回显")
         if not str(dd.get("window_note") or "").startswith("--as-of"):
             problems.append(f"{day}: window_note={dd.get('window_note')!r} 未说明 as-of")
-        if rec.get("exit") not in (0, 10):
-            problems.append(f"{day}: 退出码 {rec.get('exit')}（期望 0 或 10）")
+        # issue #117：非交易日股票运行会返回 market_closed=50（今日休市），
+        # 与数据截断语义无关。P3-3：退出码必须与 instrument.market_closed
+        # **交叉校验** —— 50 只能配 market_closed=true + 日历来源；0/10 不得
+        # 与 market_closed=true 同时出现（否则「休市却报正常」）。
+        status = ((d.get("recommendation") or {}).get("status"))
+        inst = d.get("instrument") or {}
+        closed = inst.get("market_closed")
+        source = inst.get("market_state_source")
+        obs[day]["market_closed"] = closed
+        obs[day]["market_state_source"] = source
+        exit_code = rec.get("exit")
+        if exit_code == 50:
+            if status != "market_closed":
+                problems.append(f"{day}: 退出码 50 但 status={status!r}（应为 market_closed）")
+            if closed is not True:
+                problems.append(f"{day}: 退出码 50 但 instrument.market_closed={closed!r}（应为 true）")
+            if source not in ("astock_calendar", "calendar_unavailable"):
+                problems.append(f"{day}: 退出码 50 但 market_state_source={source!r} 不是日历来源")
+        elif exit_code in (0, 10):
+            if closed is True:
+                problems.append(f"{day}: 退出码 {exit_code} 但 instrument.market_closed=true（休市日必须 50）")
+        else:
+            problems.append(f"{day}: 退出码 {exit_code}（期望 0 或 10，非交易日允许 50=market_closed）")
     return {"status": "PASS" if not problems else "FAIL",
             "reason": "; ".join(problems), "observed": obs}
 

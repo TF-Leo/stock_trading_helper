@@ -672,6 +672,11 @@ def _gate_reason(payload: Dict[str, Any]) -> Optional[str]:
     data = _dict(payload.get("data"))
     warnings = _warnings(payload)
 
+    # issue #117：非交易日是「今日休市」，不是停牌/不可交易。
+    # 必须排在停牌闸门之前，否则 is_suspended=None 的休市日会被说成别的状态。
+    if inst.get("market_closed") is True or _text(rec.get("status")) == "market_closed":
+        return "今日休市（非交易日），不产生可执行建议（不作停牌判定）"
+
     if inst.get("is_suspended") is True:
         if any("疑似退市" in warning for warning in warnings):
             return "疑似退市/长期停牌（行情与报价同时停滞），今日不可执行"
@@ -702,17 +707,26 @@ def _gate_reason(payload: Dict[str, Any]) -> Optional[str]:
 
 
 def _status_note(inst: Dict[str, Any]) -> Optional[str]:
-    """``is_suspended=None`` 时区分「盘前无法判断」与「报价不可用」。
+    """``is_suspended=None`` 时区分「休市 / 盘前无法判断 / 报价不可用」。
 
     T2 的硬要求：盘前（集合竞价前）腾讯报价定格是正常现象，不能把正常标的
     误标成停牌。因此这里只输出**状态说明**，不输出「不建议执行」。
+
+    issue #117：官方日历确认休市时明确写「今日休市」；日历不可用时写
+    「无法判定今日是否休市」，不得把「无法判定」说成停牌。
     """
+    if inst.get("market_closed") is True:
+        # 「今日休市」已由可执行性闸门首行给出；这里不重复，也不让它落到
+        # 「盘前无法判断是否停牌」的措辞里。
+        return None
     if inst.get("is_suspended") is not None:
         return None
     source = _text(inst.get("status_source")) or ""
     if source.startswith("fund"):
         return None
     quote_stale = inst.get("quote_stale")
+    if quote_stale is True and _text(inst.get("market_state_source")) == "calendar_unavailable":
+        return "交易状态：交易日历不可用，无法判定今日是否休市（报价定格，未确认停牌）"
     if quote_stale is True:
         return "交易状态：盘前无法判断是否停牌（报价定格，未确认停牌）"
     if quote_stale is False:

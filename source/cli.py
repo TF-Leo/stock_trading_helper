@@ -92,11 +92,10 @@ from decision.schema import (  # noqa: E402
     create_error_response as _create_error_response,
 )
 from decision.schema import empty_metrics as _empty_metrics  # noqa: E402
+import market_state  # noqa: E402  issue #117 休市闸门层，decision/* 不动
 
-# T6/T7：错误路径也必须带键同构的 ``evidence.market_watch`` /
-# ``evidence.events``（G35），不改 decision/*。
-create_error_response = with_events_block(
-    with_market_watch_block(_create_error_response))
+create_error_response = with_events_block(with_market_watch_block(
+    market_state.with_market_state_error_keys(_create_error_response)))  # T6/T7/G35 键同构
 
 
 def _stability_score(consensus):
@@ -550,6 +549,7 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             # issue #92 additive：一字板显式字段（'up'/'down'/null）。
             # 渲染层优先读它，diagnostics.warnings 文案匹配只作兜底。
             'one_word_limit': None if trading is None else trading.one_word_limit,
+            **market_state.market_instrument_fields(trading),  # issue #117 additive（今日是否休市）
             'status_source': 'fund_static' if trading is None else trading.status_source,
             # T8 additive：腾讯报价的量比 / 换手 / 市值 —— 与 P0-3 的报价
             # **同一次** ``fetch_quote``，不新增任何请求。单位写进字段名：
@@ -654,7 +654,7 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
         'disclaimer': '本结果不构成投资建议，市场有风险，投资需谨慎。'
     }
     
-    return _jsonable(response)
+    return _jsonable(market_state.apply_market_state_gate(response))
 
 
 # 参数定义与日期校验已迁至 cli_args.py（契约 D4：cli.py ≤ 700 行）。
@@ -700,8 +700,8 @@ def main():
                 rnd_mod.print_detail(response)
             print(f"\n免责声明：本结果不构成投资建议。")
 
-        # F05/C5: status -> 退出码一一对应（0/10/20/30/40）
-        sys.exit(exit_code_for(rec['status']))
+        # F05/C5: status -> 退出码一一对应（0/10/20/30/40 + issue #117 的 50）
+        sys.exit(market_state.exit_code_for_status(rec['status']))
 
     except SystemExit:
         raise

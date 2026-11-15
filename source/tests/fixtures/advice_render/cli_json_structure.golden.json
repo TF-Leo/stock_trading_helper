@@ -22,6 +22,8 @@
     "limit_down",
     "limit_up",
     "market_cap_yi",
+    "market_closed",
+    "market_state_source",
     "name",
     "one_word_limit",
     "price_limit_pct",

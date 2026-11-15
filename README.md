@@ -42,8 +42,10 @@ python cli.py 600519 --start 20200101 --json
 | --no-regime | bool | False | 跳过市场环境计算，输出 `Unknown` + `definition=disabled`（不假装 Bull） |
 | --opt-iters | int | 30 | `--opt bayes` 的迭代次数；`--fast` 时上限 12 |
 
-> 退出码：`0`=ok、`10`=no_edge、`20`=insufficient_data、`30`=data_source_error、`40`=untradeable。
-> 进程退出码由 `recommendation.status` 唯一决定（`decision/schema.py::EXIT_CODES`），**不是**"ok 就 0、其他都 10"。
+> 退出码：`0`=ok、`10`=no_edge、`20`=insufficient_data、`30`=data_source_error、`40`=untradeable、`50`=market_closed（非交易日/休市）。
+> 进程退出码由 `recommendation.status` 唯一决定（`ok/no_edge/insufficient_data/data_source_error/untradeable`
+> 走 `decision/schema.py::EXIT_CODES`；`market_closed` 是 issue #117 新增的独立状态，映射见
+> `market_state.py::exit_code_for_status`，`decision/*` 未改动），**不是**"ok 就 0、其他都 10"。
 
 ## JSON Schema
 
@@ -56,11 +58,12 @@ python cli.py 600519 --start 20200101 --json
 | 20 | insufficient_data | 数据条数不足（< 100 根） |
 | 30 | data_source_error | 渠道池全失败且无可用缓存 |
 | 40 | untradeable | 诊断显示无法正常成交，结果不可信 |
+| 50 | market_closed | 今日休市（官方交易日历确认非交易日），不产生可执行建议 |
 | 2 | — | 参数/用法错误（argparse 默认） |
 
 ### 枚举值
 
-- **status**: `ok` / `no_edge` / `insufficient_data` / `data_source_error` / `untradeable`
+- **status**: `ok` / `no_edge` / `insufficient_data` / `data_source_error` / `untradeable` / `market_closed`
 - **action**: `buy` / `sell` / `hold` / `avoid` / `insufficient_data`
 - **trigger.state**: `buy_triggered` / `near_buy` / `neutral` / `near_sell` / `sell_triggered`
 
@@ -312,7 +315,9 @@ python cli.py 600519 --start 20200101 --json
 - **price_limit_pct**: 涨跌停幅度（0.10 表示 10%）。有实时报价时以腾讯 `limit_up/last_close` 推算为准；否则按板块静态规则（主板 10%、创业板/科创板 20%、北交所 30%）。**2026-07-06 起沪深主板 ST/*ST 已由 5% 并轨为 10%**（交易所《交易规则（2026 年修订）》），故不再对主板 ST 做 5% 修正；创业板/科创板 ST 仍 20%，北交所 ST 30%
 - **is_st**: 是否 ST/*ST（**真实值**：收盘后预计算的东财 §6.8 名单优先，其次腾讯报价名称前缀；两者都不可用时，若本地名称带 ST 前缀则判 `true` 并在 `diagnostics.warnings` 注明「仅依据名称」，否则为 `null`，不再默认 `false`）。**基金不参与 ST 判定**：恒为 `null`，且 `is_st_source=not_applicable`（issue #109）
 - **is_st_source**: `is_st` 的判定来源（issue #106 additive）：`exchange_list`（交易所/东财 ST 名单）、`quote_name`（腾讯实时报价名称）、`local_name`（本地名称）、`unavailable`（三者都不可用，`is_st` 为 `null`）、`not_applicable`（基金不参与 ST 判定，`is_st` 为 `null`，issue #109）。名单与名称冲突时按「是 ST」保守处理并告警；**`unavailable` 只表示未知，渲染层写「ST 状态未知」，绝不显示成「非 ST」**。取数失败 / 数据不足的错误响应（`recommendation.status` 为 `data_source_error` / `insufficient_data`）**不渲染**「ST 状态未知」：ST 状态根本没解析，属于「未尝试」而非「尝试后未知」
-- **is_suspended**: 是否停牌。判据是「交易日 10:00 后 / 已收盘 / 非交易日」腾讯报价定格（`is_stale=true` 且当日成交量为 0）；**盘前（<10:00）返回 `null`**，不把集合竞价前的正常定格误判为停牌
+- **is_suspended**: 是否停牌。判据是「交易日 10:00 后 / 已收盘」腾讯报价定格（`is_stale=true` 且当日成交量为 0）；**盘前（<10:00）返回 `null`**，不把集合竞价前的正常定格误判为停牌。**非交易日（周末/法定节假日）恒为 `null`**：休市日报价定格是常态，不是停牌（issue #117）
+- **market_closed**: 今日是否休市（issue #117 additive）。`true` = 官方交易日历确认非交易日（周末/法定节假日）；`false` = 交易日；`null` = 交易日历不可用，**无法判定**。为 `true` 时 `recommendation.status=market_closed`、退出码 `50`，`action` 固定为 `avoid`
+- **market_state_source**: `market_closed` 的判定来源（issue #117 additive）：`astock_calendar`（深交所官方整月日历，磁盘缓存或接口）、`calendar_unavailable`（日历读不到，**不回退**「周一至周五=交易日」）、`unavailable`（错误响应，未查询）。**个股与基金同源**：基金路径也按官方日历判定（2026-11-15 复验后修正，此前基金恒为 `fund_static`/`null`，导致法定节假日仍输出 `ok`）
 - **limit_up / limit_down**: 腾讯实时快照给出的当日涨停价 / 跌停价（元）；报价不可用时为 `null`
 - **quote_stale**: 腾讯报价是否定格（`is_stale`）。**它本身不等于停牌**，只是"报价非当日真实成交"的信号
 - **one_word_limit**: 一字板方向（`"up"` / `"down"` / `null`）。腾讯实时快照满足 `最高=最低=涨停价`（或跌停价）时给出；`null` 表示当日不是一字板或报价不可用。渲染层优先读取本字段，`diagnostics.warnings` 里的「一字涨停/一字跌停」文案仅作兜底。**仅成功路径存在**：错误响应由 `decision/*` 构造，本次改动未触碰该目录，故错误响应缺此键，消费方须按「缺失」处理
@@ -337,6 +342,41 @@ python cli.py 600519 --start 20200101 --json
 > `recommendation.status` 升为 `untradeable`（退出码 40）、`action=avoid`，
 > 并在 `diagnostics.warnings` 写明原因。**不修改 `decision/actions.py` 的决策表**——
 > 只拦截"今天这笔成交不了"的场景。
+>
+> **非交易日与停牌分开（2026-11-15，issue #117）。** 休市日腾讯报价对所有标的
+> 定格，旧逻辑据此判停牌并 `exit 40`，运维/Hermes 会把「大面积休市」误读成
+> 「大面积停牌」。现在只用**官方交易日历**判定「今天是不是交易日」：
+> * 非交易日 → `recommendation.status=market_closed`（退出码 **50**）、
+>   `action=avoid`、`instrument.market_closed=true`、`is_suspended` 保持 `null`，
+>   渲染层首行写「今日休市（非交易日）」，**不再伪装成 40**；
+> * 交易日真实停牌 → 仍是 `untradeable` / 退出码 40（行为不变）；
+> * 交易日盘前（09:15–10:00）报价定格 → 仍不判停牌（行为不变）；
+> * 日历/缓存不可用 → `market_closed=null` + `market_state_source=calendar_unavailable`，
+>   并显式告警「无法判定今日是否交易日」，**绝不回退「周一至周五=交易日」**；
+>   此时报价定格按「无法判定」处理，`is_suspended` 不判 `true`。
+> * **基金（场外/ETF）走同一闸门**（2026-11-15 复验）：休市日同样输出
+>   `status=market_closed` / 退出码 50 / 渲染「今日休市」，不再返回 `ok`/0。
+>   基金 `is_suspended` 恒为 `null`（不查腾讯报价）；`status_source` 仍为
+>   `fund_static`，但 `market_state_source` 是日历来源。
+>
+> 状态优先级：`insufficient_data` / `data_source_error`（数据本身的问题，
+> 退出码 20/30）优先于 `market_closed`；其余状态（`ok` / `no_edge` /
+> `untradeable`）在休市日统一改为 `market_closed`。
+>
+> **分层**：休市覆盖是**闸门层**（`source/market_state.py::apply_market_state_gate`），
+> 不是决策层：`decision/actions.py::decide('market_closed', 'entry')` 仍返回
+> `buy`，`decision/*` 未改动；`cli.py` 只调用闸门。退出码映射的唯一出口是
+> `market_state.exit_code_for_status`。
+>
+> **需要同步 50 的消费方清单（只列清单与建议，`~/.hermes` 未改）**：
+> * `tools/collect_evidence.py`：`timing` 检查把 `exit ∈ (0,10)` 当成功
+>   （第 163、210 行），休市日全项变红。建议按「50 且 status=market_closed」
+>   视为正常产出（与 `probe.py::run_cli_json` 的契约集合一致）。
+> * `tools/validation_snapshot.py`：文档模板写死「10/20/30/40 按 status 映射」
+>   （第 226–227 行）与「F05 退出码」行（第 267 行）。建议补 50 并注明休市。
+> * `~/.hermes` 脚本/文档：`trade_preopen_alert.py` 已按交易日门控且只对
+>   `status=ok` 出声，预期无需改动；其余「非 0 一律失败」的调度脚本需把 50
+>   识别为「今日休市（无建议）」而非「停牌/故障」。本 PR 不改 `~/.hermes`。
 >
 > **ST 名单：收盘后预计算 + 盘前只读缓存（2026-11-15，issue #107 P1）。**
 > 东财 push2/push2delay 对出口 IP 触发 nginx 444 反爬，盘前逐票拉全市场名单会
@@ -1116,7 +1156,7 @@ CLI 向后兼容所有旧参数（`probe.py::check_old_args` 与 `tools/check_ga
 
 语义变更：
 - `--type` 以前被忽略（只按代码前缀猜），现在真正生效；`request.type` 回显**实际判定值**，`request.type_hint` 回显入参
-- 退出码以前只有 0/10（所有非 ok 状态都被压成 10），现在严格按 `status` 映射到 0/10/20/30/40
+- 退出码以前只有 0/10（所有非 ok 状态都被压成 10），现在严格按 `status` 映射到 0/10/20/30/40；issue #117 起非交易日另立 `market_closed=50`（与停牌 40 区分）
 
 ## 性能（D5 两档实测）
 

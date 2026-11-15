@@ -38,6 +38,11 @@ from stock_analysis.data_sources import eastmoney_guard as em_guard
 __all__ = [
     "OFFLINE_ENV",
     "DELIST_LAG_DAYS",
+    "MARKET_STATE_CALENDAR",
+    "MARKET_STATE_UNAVAILABLE",
+    "MARKET_STATE_INJECTED",
+    "MarketDayState",
+    "market_day_state",
     "ST_LIST_RETRY",
     "ST_LIST_STATE_DIR_ENV",
     "ST_LIST_COOLDOWN_PATH_ENV",
@@ -81,6 +86,69 @@ ST_LIST_CACHE_SCHEMA = 2
 _GEM_BOARDS = ("sz_gem", "sh_star")
 _TRADING_DAY_LOOKBACK = 30
 _ST_MEMO: Dict[tuple, "StListSnapshot"] = {}
+
+# issue #117：交易状态判定必须只认**官方交易日历**。
+# 旧实现 `_is_trading_day` 在日历不可用时回退「周一至周五」——周末没问题，
+# 但法定节假日的周一至周五会被当成交易日，于是「休市」被误判成「停牌」。
+# 下面这三个常量 + `MarketDayState` 把「今天是不是交易日」独立成三态事实。
+MARKET_STATE_CALENDAR = "astock_calendar"
+MARKET_STATE_UNAVAILABLE = "calendar_unavailable"
+MARKET_STATE_INJECTED = "injected"
+_AUTO_TRADING_DAY = object()
+
+
+@dataclass(frozen=True)
+class MarketDayState:
+    """今日是否交易日（issue #117）。
+
+    ``closed`` 三态：
+    * ``True``  —— 官方日历确认**非交易日**（周末 / 法定节假日）；
+    * ``False`` —— 官方日历确认交易日；
+    * ``None``  —— 日历不可用，**无法判定**。此时绝不回退「工作日=交易日」，
+      否则节假日会被当成交易日并进一步误判停牌。
+    """
+    closed: Optional[bool] = None
+    source: str = MARKET_STATE_UNAVAILABLE
+    warning: Optional[str] = None
+
+
+def _calendar_unavailable_warning(detail: Optional[str] = None) -> str:
+    reason = f"（{detail}）" if detail else ""
+    return (f"交易日历不可用{reason}：无法判定今日是否为交易日；"
+            "不把「工作日」当成交易日，停牌状态按「无法判定」处理")
+
+
+def market_day_state(day: _dt.date,
+                     trading_day=_AUTO_TRADING_DAY) -> MarketDayState:
+    """判定 ``day`` 是否交易日；只用官方日历，日历读不到就是「无法判定」。
+
+    ``trading_day`` 仅供测试注入（``True``/``False``/``None``），与
+    ``resolve_trading_status`` 的 ``quote`` / ``quote_error`` 同一约定；
+    生产路径不得传。
+
+    读日历本身由 ``astock.is_trading_day`` 完成：先查磁盘缓存（不触网），
+    缺失时才请求深交所整月文件（与既有 ``_assessment_phase`` 同源同量）。
+    """
+    if trading_day is not _AUTO_TRADING_DAY:
+        if trading_day is None:
+            return MarketDayState(closed=None, source=MARKET_STATE_INJECTED,
+                                  warning=_calendar_unavailable_warning("injected"))
+        return MarketDayState(closed=not bool(trading_day),
+                              source=MARKET_STATE_INJECTED)
+
+    if isinstance(day, _dt.datetime):
+        day = day.date()
+    try:
+        is_open = astock.is_trading_day(day)
+    except Exception as exc:  # 日历是辅助信号：永不阻断主流程
+        return MarketDayState(
+            closed=None, source=MARKET_STATE_UNAVAILABLE,
+            warning=_calendar_unavailable_warning(f"{type(exc).__name__}: {exc}"))
+    if is_open is None:
+        return MarketDayState(
+            closed=None, source=MARKET_STATE_UNAVAILABLE,
+            warning=_calendar_unavailable_warning(astock.calendar_last_error()))
+    return MarketDayState(closed=not bool(is_open), source=MARKET_STATE_CALENDAR)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +202,11 @@ def _looks_delisted(name: str) -> bool:
 
 
 def _is_trading_day(day: _dt.date) -> bool:
+    """**仅**供 ST 名单快照日期回退使用（取「上一交易日」这类松散用途）。
+
+    issue #117：休市/停牌的判定不得使用本函数——它带有「周一至周五」回退，
+    法定节假日会被判成交易日。交易状态判定一律走 :func:`market_day_state`。
+    """
     try:
         value = astock.is_trading_day(day)
         if value is not None:
@@ -159,9 +232,14 @@ def _snapshot_session_date(now: _dt.datetime) -> _dt.date:
     return _previous_trading_day(today)
 
 
-def _assessment_phase(now: _dt.datetime) -> str:
-    """报价定格能否用于停牌判定：盘前 ``preopen``，其余 ``session``。"""
-    if _is_trading_day(now.date()) and (now.hour, now.minute) < (10, 0):
+def _assessment_phase(now: _dt.datetime, market_closed: Optional[bool]) -> str:
+    """报价定格能否用于停牌判定：交易日盘前 ``preopen``，其余 ``session``。
+
+    ``market_closed`` 来自 :func:`market_day_state`：只有官方日历确认
+    **交易日**（``False``）才可能进入 ``preopen``；非交易日或日历不可用
+    都不得把定格报价当成「盘前正常现象」或「停牌」的判据（issue #117）。
+    """
+    if market_closed is False and (now.hour, now.minute) < (10, 0):
         return "preopen"
     return "session"
 
@@ -746,6 +824,11 @@ class TradingStatus:
     limit_down: Optional[float] = None
     quote_stale: Optional[bool] = None
     status_source: str = "unavailable"
+    # issue #117 additive：今日是否非交易日。True=官方日历确认休市，
+    # False=交易日，None=日历不可用/无法判定。非交易日时 ``is_suspended``
+    # 必须保持 None（报价定格是休市常态，不是停牌）。
+    market_closed: Optional[bool] = None
+    market_state_source: str = MARKET_STATE_UNAVAILABLE
     price_limit_pct: Optional[float] = None
     one_word_limit: Optional[str] = None  # 'up' / 'down' / None
     delisted_suspect: bool = False
@@ -801,11 +884,13 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
                            now: Optional[_dt.datetime] = None,
                            st_snapshot: Optional[StListSnapshot] = None,
                            quote: Optional[dict] = None,
-                           quote_error: Optional[str] = None) -> TradingStatus:
+                           quote_error: Optional[str] = None,
+                           trading_day=_AUTO_TRADING_DAY) -> TradingStatus:
     """汇总单票交易状态。**永不抛异常**：任何来源失败都降级并写 warning。
 
-    ``quote`` / ``quote_error`` 仅供测试注入；生产路径由本函数自行调用
-    ``astock.fetch_quote``。
+    ``quote`` / ``quote_error`` / ``trading_day`` 仅供测试注入；生产路径由本
+    函数自行调用 ``astock.fetch_quote`` 与官方交易日历。``trading_day`` 的
+    三态语义见 :func:`market_day_state`。
     """
     now = now or _dt.datetime.now()
     warnings: List[str] = []
@@ -945,13 +1030,35 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
                     f"静态规则 {static_pct:.0%}（以报价为准）")
             price_limit_pct = implied
 
+    # ---- 今日是否交易日（issue #117） ------------------------------------
+    # 只认官方交易日历：非交易日（周末 / 法定节假日）报价定格是常态，
+    # 不是停牌；日历不可用时显式「无法判定」，绝不回退「工作日=交易日」。
+    market = market_day_state(now.date(), trading_day=trading_day)
+    market_closed = market.closed
+    if market.warning:
+        warnings.append(market.warning)
+    if market_closed is True:
+        warnings.append(
+            "今日休市（官方交易日历：非交易日）：报价定格属正常现象，"
+            "不作停牌判定；本结论仅基于历史数据，今日不可执行")
+
     # ---- 停牌 / 退市 ------------------------------------------------------
     quote_stale = bool(quote.get("is_stale")) if quote_ok else None
     is_suspended: Optional[bool] = None
     delisted_suspect = False
     if quote_ok:
         if quote_stale:
-            if _assessment_phase(now) == "preopen":
+            if market_closed is True:
+                # 休市日：定格报价是正常现象，is_suspended 必须保持 null。
+                is_suspended = None
+            elif market_closed is None:
+                # 日历不可用：报价定格无法区分「盘前 / 停牌 / 休市」，
+                # 按「无法判定」处理，绝不判 true（issue #117 降级口径）。
+                is_suspended = None
+                warnings.append(
+                    "报价定格但交易日历不可用：无法确认是盘前、停牌还是休市，"
+                    "停牌状态按「无法判定」处理（不判 true）")
+            elif _assessment_phase(now, market_closed) == "preopen":
                 is_suspended = None  # 集合竞价前定格是正常现象，不判停牌
             else:
                 is_suspended = True
@@ -963,7 +1070,9 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
                         f"报价定格且名称含退市标记（{quote_name}），疑似退市/退市整理{detail}")
                 warnings.append(f"腾讯报价定格且无当日成交，判定停牌/无成交{detail}")
         else:
-            is_suspended = False
+            # issue #117：休市日「报价未定格」不等于「已确认未停牌」——今天
+            # 根本没有撮合，`false` 会被下游读成「确认可交易」。必须保持 null。
+            is_suspended = None if market_closed is True else False
 
     if quote_error and not quote_ok:
         warnings.append(
@@ -971,11 +1080,17 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
             "停牌/退市/代码无效无法区分")
     if (not quote_ok and data_lag_days is not None
             and int(data_lag_days) >= DELIST_LAG_DAYS):
-        delisted_suspect = True
-        is_suspended = True
-        warnings.append(
-            f"实时报价不可用且行情已滞后 {int(data_lag_days)} 个交易日"
-            f"（阈值 {DELIST_LAG_DAYS}），疑似退市/长期停牌，判定不可交易")
+        if market_closed is True:
+            # issue #117：休市日不做停牌/退市判定（节假日会拉长自然日间隔）。
+            warnings.append(
+                f"行情已滞后 {int(data_lag_days)} 个交易日"
+                f"（阈值 {DELIST_LAG_DAYS}），但今日休市：非交易日不作停牌/退市判定")
+        else:
+            delisted_suspect = True
+            is_suspended = True
+            warnings.append(
+                f"实时报价不可用且行情已滞后 {int(data_lag_days)} 个交易日"
+                f"（阈值 {DELIST_LAG_DAYS}），疑似退市/长期停牌，判定不可交易")
 
     # ---- T8：量比 / 换手 / 市值（复用同一次腾讯报价，零额外请求） ---------
     # 字段位置按仓库内 vendored 快照核对，不凭记忆下标：快照为
@@ -1005,7 +1120,8 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
 
     # ---- 一字板 -----------------------------------------------------------
     one_word = None
-    if quote_ok and not is_suspended and limit_up and limit_down:
+    # issue #117：休市日没有撮合，不得用定格快照判「一字板」。
+    if quote_ok and not is_suspended and market_closed is not True and limit_up and limit_down:
         if (high is not None and low is not None and high > 0 and low > 0
                 and abs(high - low) < 0.005):
             if price is not None and abs(price - limit_up) < 0.005:
@@ -1022,6 +1138,8 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
         limit_down=limit_down,
         quote_stale=quote_stale,
         status_source=status_source,
+        market_closed=market_closed,
+        market_state_source=market.source,
         price_limit_pct=price_limit_pct,
         one_word_limit=one_word,
         delisted_suspect=delisted_suspect,
