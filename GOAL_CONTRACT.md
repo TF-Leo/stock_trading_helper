@@ -32,23 +32,25 @@ v1.0 解决的是"数字可不可信"——数据泄漏、资金基准、多重�
 | C 可消费性（C1–C8） | 已交付 | 同上（G02/G07/G35） |
 | D 收敛与工程（D1–D6） | 已交付 | 同上（G10/G11/G29/G30） |
 
-**以下 v1.0 条款继续有效，不得违反**：输出契约的顶层结构与字段名、五个退出码、五档 `status`、`position_fraction ≤ 0.30` 且只输出比例、错误路径与成功路径键集合同构、幂等确定性、门禁只加强不放宽、离线测试全绿、`cli.py ≤ 700` 行。
+**以下 v1.0 条款继续有效，不得违反**：输出契约的顶层结构与字段名、退出码语义（v1.0 的 0/10/20/30/40；issue #117 起另加 50，见下）、`status` 五档（另加 `market_closed`）、`position_fraction ≤ 0.30` 且只输出比例、错误路径与成功路径键集合同构、幂等确定性、门禁只加强不放宽、离线测试全绿、`cli.py ≤ 700` 行。
 
 **v1.0 中被本轮显式替换的条款只有两条**，替换理由见 §3、§8：
 
 - v1.0 B6 验证一"三窗口 `recommendation.action` 必须完全一致" → 由 §8 的新不变式替换（原判据正是 15 根过滤器的成因）。
 - v1.0 输出规格中 `trigger.current` 的语义（未写明是价格还是指标值）→ 由 §6.1 明确为**指标值**，价格另设 `last_close`。
 
-> **issue #117 增补（2026-11-15）**：在既有五个退出码 / 五档 `status` 之外**新增**
-> `market_closed`（退出码 **50**），仅表示「官方交易日历确认今天不是交易日」。
-> 原五码/五档语义不变，`decision/*` 未改动。**完整退出码清单**：
+> **issue #117 增补（2026-11-15）**：在 v1.0 的五个退出码 / 五档 `status` 之外
+> **新增** `market_closed`（退出码 **50**），仅表示「官方交易日历确认今天不是交易日」。
+> 原五码/五档语义不变，`decision/*` 未改动。**现行完整退出码清单（六个）**：
 > `0`=ok、`10`=no_edge、`20`=insufficient_data、`30`=data_source_error、
-> `40`=untradeable、`50`=market_closed。映射的唯一出口是
+> `40`=untradeable、`50`=market_closed（非交易日/休市）。映射的唯一出口是
 > `source/market_state.py::exit_code_for_status`（`cli.py` 只调用；其余五码仍由
 > `decision/schema.py::exit_code_for` 决定）。休市覆盖属**闸门层**
 > （`market_state.apply_market_state_gate`），与决策层
-> `decision/actions.py::decide` 分开——`decide('market_closed', 'entry')` 仍返回
-> `buy`，覆盖只发生在响应构造完成后。**基金路径同样适用**：场外基金在休市日
+> `decision/actions.py::decide` 分开——`decide('market_closed', 'entry')`（两参）
+> 返回 `hold`（`decide` 不认识 `market_closed`；仅当 `expectancy_ok=True`、
+> `holding=False` 时才返回 `buy`），覆盖只发生在响应构造完成后。**基金路径同样适用**：
+> 场外基金在休市日
 > 也输出 `market_closed` / 50，不再输出 `ok` / 0。新增字段
 > `instrument.market_closed` / `instrument.market_state_source` 均为 additive，
 > `schema_version` 仍为 `1.0`；字段与消费方影响见 README「退出码」与

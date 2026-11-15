@@ -364,14 +364,17 @@ python cli.py 600519 --start 20200101 --json
 > `untradeable`）在休市日统一改为 `market_closed`。
 >
 > **分层**：休市覆盖是**闸门层**（`source/market_state.py::apply_market_state_gate`），
-> 不是决策层：`decision/actions.py::decide('market_closed', 'entry')` 仍返回
-> `buy`，`decision/*` 未改动；`cli.py` 只调用闸门。退出码映射的唯一出口是
+> 不是决策层：`decision/actions.py::decide('market_closed', 'entry')`（两参）
+> 返回 `hold` —— `decide` 不认识 `market_closed`，只有
+> `expectancy_ok=True` 且 `holding=False` 时才返回 `buy`；`decision/*` 未改动，
+> `cli.py` 只调用闸门。退出码映射的唯一出口是
 > `market_state.exit_code_for_status`。
 >
 > **需要同步 50 的消费方清单（只列清单与建议，`~/.hermes` 未改）**：
-> * `tools/collect_evidence.py`：`timing` 检查把 `exit ∈ (0,10)` 当成功
->   （第 163、210 行），休市日全项变红。建议按「50 且 status=market_closed」
->   视为正常产出（与 `probe.py::run_cli_json` 的契约集合一致）。
+> * `tools/collect_evidence.py`：`asof` 步自 issue #119 起把 `exit 50` 记为
+>   「今日休市」并跳过、不计失败；`timing` 检查仍把 `exit ∈ (0,10)` 当成功，
+>   休市日全项变红。建议按「50 且 status=market_closed」视为正常产出
+>   （与 `probe.py::run_cli_json` 的契约集合一致）。
 > * `tools/validation_snapshot.py`：文档模板写死「10/20/30/40 按 status 映射」
 >   （第 226–227 行）与「F05 退出码」行（第 267 行）。建议补 50 并注明休市。
 > * `~/.hermes` 脚本/文档：`trade_preopen_alert.py` 已按交易日门控且只对
