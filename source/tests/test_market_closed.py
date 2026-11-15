@@ -92,6 +92,25 @@ def test_holiday_quote_unavailable_does_not_escalate_to_delisted():
     assert out.delisted_suspect is False
 
 
+def test_holiday_fresh_quote_keeps_is_suspended_null():
+    """P2-1 实测回归：休市日报价**未定格**时旧实现会给 ``is_suspended=false``。
+
+    `false` 的语义是「已确认未停牌 / 可交易」，休市日根本没有撮合，只能是
+    ``null``（issue #117 要求）。这里用 is_stale=false 的报价锁定该行为。
+    """
+    out = _resolve(_quote("quote_normal.json"), HOLIDAY, trading_day=False)
+    assert out.market_closed is True
+    assert out.quote_stale is False
+    assert out.is_suspended is None, "休市日即使报价未定格也必须保持 null"
+
+
+def test_trading_day_fresh_quote_is_suspended_false():
+    """回归：交易日正常报价仍应明确 false（不能把休市修复扩大成永久 null）。"""
+    out = _resolve(_quote("quote_normal.json"), TRADING, trading_day=True)
+    assert out.market_closed is False
+    assert out.is_suspended is False
+
+
 # ---------------------------------------------------------------------------
 # 3) 回归：交易日真实停牌 / 盘前定格，两条行为都不能变
 # ---------------------------------------------------------------------------
@@ -164,8 +183,71 @@ def _run_cli(monkeypatch, trading, code="600519"):
     return cli.advise_internal(code, fast=True, no_regime=True)
 
 
-def test_cli_market_closed_exit_code_50(monkeypatch):
+def _run_cli_fund(monkeypatch, code="510300"):
+    """基金路径（P2-2）：data_type=fund 时也必须过休市闸门。"""
     import cli
+    import stock_analysis.data_loader.meta as meta
+    from stock_analysis.backtest.engine import BacktestResult
+
+    df = _toy()
+    monkeypatch.setattr(meta, "resolve_and_fetch", lambda *a, **k: (df, "fund", None))
+    monkeypatch.setattr(cli, "last_fetch_info",
+                        lambda: {"source": "cache", "from_cache": True,
+                                 "degraded": None, "lag_days": None})
+
+    def _no_status(*a, **k):
+        raise AssertionError("基金不查询个股交易状态（但休市判定必须走日历）")
+
+    monkeypatch.setattr(cli, "resolve_trading_status", _no_status)
+
+    names = list(cli.build_fund_strategy_signals().keys())[:3]
+    comp = pd.DataFrame(
+        [{"评分": 1.0 - i * 0.1, "评分IS": 1.0 - i * 0.1, "评分OOS": 0.9 - i * 0.1,
+          "年化收益": "10.00%", "最大回撤": "5.00%", "胜率": "60.00%", "交易次数": 20}
+         for i, _ in enumerate(names)],
+        index=names,
+    )
+    res = BacktestResult(trade_count=20, win_rate=0.6, annual_return=0.1,
+                         max_drawdown=0.05, unaffordable_lot_events=0)
+    res.equity_curve = [100000.0] * 50
+    monkeypatch.setattr(cli, "run_strategy_tournament",
+                        lambda *a, **k: (names[0], res, comp))
+    return cli.advise_internal(code, fast=True, no_regime=True)
+
+
+def test_fund_holiday_is_market_closed_exit_50(monkeypatch):
+    """P2-2 实测回归：周日/法定节假日场外基金旧实现 exit 0 / status=ok。"""
+    import market_state
+    from stock_analysis.advice_render import render_advice
+    from stock_analysis.data_loader import status as st
+
+    monkeypatch.setattr(st.astock, "is_trading_day", lambda day: False)
+    out = _run_cli_fund(monkeypatch)
+
+    assert out["request"]["type"] == "fund"
+    inst = out["instrument"]
+    assert inst["market_closed"] is True
+    assert inst["market_state_source"] == "astock_calendar"
+    assert inst["is_suspended"] is None
+    assert out["recommendation"]["status"] == "market_closed"
+    assert out["recommendation"]["action"] == "avoid"
+    assert market_state.exit_code_for_status(out["recommendation"]["status"]) == 50
+    text = render_advice(out)
+    assert "【今日不建议执行】今日休市" in text
+
+
+def test_fund_trading_day_not_market_closed(monkeypatch):
+    """回归：交易日基金不得被误改成 market_closed。"""
+    from stock_analysis.data_loader import status as st
+
+    monkeypatch.setattr(st.astock, "is_trading_day", lambda day: True)
+    out = _run_cli_fund(monkeypatch)
+    assert out["instrument"]["market_closed"] is False
+    assert out["recommendation"]["status"] != "market_closed"
+
+
+def test_cli_market_closed_exit_code_50(monkeypatch):
+    import market_state
     from stock_analysis.data_loader.status import TradingStatus
 
     trading = TradingStatus(
@@ -181,12 +263,12 @@ def test_cli_market_closed_exit_code_50(monkeypatch):
     assert out["recommendation"]["action"] == "avoid"
     assert any("今日休市" in r for r in out["recommendation"]["action_reason"])
     assert not any("结果不可信" in r for r in out["recommendation"]["action_reason"])
-    assert cli.exit_code_for_status(out["recommendation"]["status"]) == 50
+    assert market_state.exit_code_for_status(out["recommendation"]["status"]) == 50
     assert any("今日休市" in w for w in out["diagnostics"]["warnings"])
 
 
 def test_cli_real_suspension_exit_code_40_unchanged(monkeypatch):
-    import cli
+    import market_state
     from stock_analysis.data_loader.status import TradingStatus
 
     trading = TradingStatus(
@@ -197,19 +279,66 @@ def test_cli_real_suspension_exit_code_40_unchanged(monkeypatch):
 
     assert out["recommendation"]["status"] == "untradeable"
     assert out["recommendation"]["action"] == "avoid"
-    assert cli.exit_code_for_status(out["recommendation"]["status"]) == 40
+    assert market_state.exit_code_for_status(out["recommendation"]["status"]) == 40
     assert out["instrument"]["market_closed"] is False
 
 
 def test_exit_code_mapping_keeps_decision_contract():
-    import cli
+    import market_state
     from decision.schema import EXIT_CODES, exit_code_for
 
     for status, code in EXIT_CODES.items():
-        assert cli.exit_code_for_status(status) == code
-    assert cli.exit_code_for_status("market_closed") == 50
-    assert cli.exit_code_for_status("unknown_status") == 30
+        assert market_state.exit_code_for_status(status) == code
+    assert market_state.exit_code_for_status("market_closed") == 50
+    assert market_state.exit_code_for_status("unknown_status") == 30
     assert 50 not in EXIT_CODES.values(), "decision/* 未被本次改动触碰"
+
+
+# ---------------------------------------------------------------------------
+# 5b) 闸门层与决策层分开（P2-3）
+# ---------------------------------------------------------------------------
+def test_gate_layer_overrides_without_touching_decision():
+    """``decide()`` 不认识 market_closed；覆盖只发生在 ``apply_market_state_gate``。"""
+    import market_state
+    from decision.actions import decide
+
+    assert decide("market_closed", "entry", True, False) == "buy", \
+        "decision 层不得被休市改动（单一真源）"
+
+    payload = {
+        "instrument": {"market_closed": True, "market_state_source": "astock_calendar"},
+        "recommendation": {"status": "ok", "action": "buy", "target_position": 1.0,
+                           "position_fraction": 0.3, "no_edge": False,
+                           "action_reason": ["买入"]},
+        "diagnostics": {"warnings": []},
+    }
+    out = market_state.apply_market_state_gate(payload)
+    rec = out["recommendation"]
+    assert rec["status"] == "market_closed"
+    assert rec["action"] == "avoid"
+    assert rec["target_position"] == 0.0
+    assert rec["position_fraction"] == 0.0
+    assert rec["no_edge"] is False
+    assert any("今日休市" in r for r in rec["action_reason"])
+
+
+def test_gate_layer_keeps_data_error_priority():
+    import market_state
+
+    payload = {
+        "instrument": {"market_closed": True, "market_state_source": "astock_calendar"},
+        "recommendation": {"status": "data_source_error", "action": "insufficient_data"},
+        "diagnostics": {"warnings": []},
+    }
+    out = market_state.apply_market_state_gate(payload)
+    assert out["recommendation"]["status"] == "data_source_error"
+
+
+def test_cli_line_budget_not_increased_by_issue_117():
+    """P2-3：cli.py 行数不得高于本 PR 之前的 714 行（issue #117 只许调用闸门）。"""
+    cli_path = SRC / "cli.py"
+    lines = cli_path.read_text(encoding="utf-8").count("\n")
+    assert lines <= 714, f"cli.py 涨到 {lines} 行（基线 714）"
 
 
 # ---------------------------------------------------------------------------

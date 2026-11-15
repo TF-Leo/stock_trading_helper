@@ -1070,7 +1070,9 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
                         f"报价定格且名称含退市标记（{quote_name}），疑似退市/退市整理{detail}")
                 warnings.append(f"腾讯报价定格且无当日成交，判定停牌/无成交{detail}")
         else:
-            is_suspended = False
+            # issue #117：休市日「报价未定格」不等于「已确认未停牌」——今天
+            # 根本没有撮合，`false` 会被下游读成「确认可交易」。必须保持 null。
+            is_suspended = None if market_closed is True else False
 
     if quote_error and not quote_ok:
         warnings.append(
@@ -1118,7 +1120,8 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
 
     # ---- 一字板 -----------------------------------------------------------
     one_word = None
-    if quote_ok and not is_suspended and limit_up and limit_down:
+    # issue #117：休市日没有撮合，不得用定格快照判「一字板」。
+    if quote_ok and not is_suspended and market_closed is not True and limit_up and limit_down:
         if (high is not None and low is not None and high > 0 and low > 0
                 and abs(high - low) < 0.005):
             if price is not None and abs(price - limit_up) < 0.005:

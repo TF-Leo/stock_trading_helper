@@ -41,10 +41,18 @@ v1.0 解决的是"数字可不可信"——数据泄漏、资金基准、多重�
 
 > **issue #117 增补（2026-11-15）**：在既有五个退出码 / 五档 `status` 之外**新增**
 > `market_closed`（退出码 **50**），仅表示「官方交易日历确认今天不是交易日」。
-> 原五码/五档语义不变，`decision/*` 未改动；映射见
-> `source/cli.py::exit_code_for_status`，字段与消费方影响见 README「退出码」与
-> 「非交易日与停牌分开」两节。新增字段 `instrument.market_closed` /
-> `instrument.market_state_source` 均为 additive，`schema_version` 仍为 `1.0`。
+> 原五码/五档语义不变，`decision/*` 未改动。**完整退出码清单**：
+> `0`=ok、`10`=no_edge、`20`=insufficient_data、`30`=data_source_error、
+> `40`=untradeable、`50`=market_closed。映射的唯一出口是
+> `source/market_state.py::exit_code_for_status`（`cli.py` 只调用；其余五码仍由
+> `decision/schema.py::exit_code_for` 决定）。休市覆盖属**闸门层**
+> （`market_state.apply_market_state_gate`），与决策层
+> `decision/actions.py::decide` 分开——`decide('market_closed', 'entry')` 仍返回
+> `buy`，覆盖只发生在响应构造完成后。**基金路径同样适用**：场外基金在休市日
+> 也输出 `market_closed` / 50，不再输出 `ok` / 0。新增字段
+> `instrument.market_closed` / `instrument.market_state_source` 均为 additive，
+> `schema_version` 仍为 `1.0`；字段与消费方影响见 README「退出码」与
+> 「非交易日与停牌分开」两节。
 
 ---
 
