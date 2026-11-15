@@ -3,7 +3,7 @@
 ## 2026-11-15 · ST 名单交易所官方备胎（东财长时间封禁兜底）
 
 - **分支**：`TF-Leo/st-exchange-fallback`（父 `origin/main` `b77d509`）；
-  关联 issue #1；**PR 待创建，不合并**。未改 `decision/*`，未引入依赖
+  关联 issue #1；**PR #122，不合并**。未改 `decision/*`，未引入依赖
   （只用既有 `requests` / `pandas`），盘前仍只读缓存、零联网。
 - **端点取证（本机 curl，2026-11-15；协调者授权每所 3 次含页面发现）**：
   - 上交所风险警示板页面 `GET https://www.sse.com.cn/disclosure/listedinfo/riskplate/`
