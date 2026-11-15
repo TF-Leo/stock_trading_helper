@@ -1,5 +1,73 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-15 · ST 名单交易所官方备胎（东财长时间封禁兜底）
+
+- **分支**：`TF-Leo/st-exchange-fallback`（父 `origin/main` `b77d509`）；
+  关联 issue #1；**PR #122，不合并**。未改 `decision/*`，未引入依赖
+  （只用既有 `requests` / `pandas`），盘前仍只读缓存、零联网。
+- **端点取证（本机 curl，2026-11-15；协调者授权每所 3 次含页面发现）**：
+  - 上交所风险警示板页面 `GET https://www.sse.com.cn/disclosure/listedinfo/riskplate/`
+    → **HTTP 200**（数据不在 HTML，由 JS 拉取）；数据 API
+    `GET https://query.sse.com.cn/sseQuery/commonQuery.do`
+    （`sqlId=COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L`，`STOCK_TYPE=1,8`）
+    → **HTTP 200 / 2,293,163 B JSON**；`pageHelp.total=2319`、单页上限
+    **2000**（请求 10000 仍回 2000）；字段 `A_STOCK_CODE` / `SEC_NAME_CN` /
+    `STATE_CODE`。实测 `STATE_CODE=7` 恰为全部名称带 ST/*ST 的风险警示股
+    （当次 78 条，含 10 只 688 科创板）。首猜页面 URL 404，未重试。
+  - 深交所风险警示板页面 `GET https://www.szse.cn/disclosure/listed/warn/index.html`
+    → **HTTP 200**，页面 `data-s-catalog-id="fxjsb"`；数据 API
+    `GET https://www.szse.cn/api/report/ShowReport/data`
+    （`SHOWTYPE=JSON&CATALOGID=fxjsb&TABKEY=tab1`）
+    → **HTTP 200 / 3,915 B JSON**；`metadata`：`name=风险警示股票`、
+    `subname=2026-11-13`、`pagesize=20`（**`PAGESIZE` 被忽略**）、
+    `pagecount=6`、`recordcount=115`；行字段 `zqdm` / `gsjc`
+    （`gsjc` 值含 `<a><u>…</u></a>` HTML）。首猜页面 URL 404，未重试。
+- **实现**：
+  - 新增 `source/stock_analysis/data_sources/st_exchange.py`：
+    `fetch_sse_st_list()` 用 `COMPANY_STATUS=7` 取风险警示状态，并校验
+    `len(result)==pageHelp.total` + 每行 `STATE_CODE=7`（过滤未生效会拿到
+    2000/2319 截断全表 → 显式失败）；`fetch_szse_st_list()` 按官方
+    `pagecount` 串行翻页并校验 `sum(rows)==recordcount`；空表 / 非 2xx /
+    非 JSON / 结构变化一律 `StExchangeError`（不返回空）。
+  - `status.py`：`StListSnapshot` 新增 additive `merged_from`；缓存写入 / 读回
+    该字段；`status_source` 对官方缓存标注 `exchange_st_list`（不再误标东财）；
+    新增公开 `snapshot_from_frame` 给工具复用。
+  - `tools/precompute_st_list.py`：东财优先 → 官方两所串行 →
+    合并/冲突 → 本地缓存。缓存 `source` = `eastmoney`（含合并）/
+    `exchange`（官方单独兜底），`merged_from` 记明细；`stats.sources` 记录
+    每源 state/count/requests；`--no-official` 用于维护/对照。
+- **合并策略**：以东财为基准（含北交所）与官方名单按代码**取并集**
+  （任一源说是 ST 就是 ST）；沪深重叠范围内一边有一边无、或同码名称不一致
+  都算冲突，写 `stats.conflicts` / 缓存 warning / stderr（`CONFLICT`），
+  `*ST` 名称优先；北交所不在官方覆盖内，不算冲突。官方单独落盘时
+  `coverage=沪深A（官方，不含北交所/B股）`，warning 明示缺口。
+- **不覆盖好缓存**：东财失败 + 官方仅一所成功 / 官方空表 / 任一结构异常 →
+  不写缓存（逐字节断言旧缓存不变）；官方成功**不清**东财冷却（东财可能仍封）。
+- **冷却语义**：东财冷却期内东财 **0 请求**，但仍尝试官方两所（不同主机）；
+  两所都成功则照常落盘、退出码 0。退出码 3 仅保留给
+  `--no-official` + 冷却中（0 请求）。
+- **证据（本机 Linux，`/tmp/sth-venv` Python 3.14.7 / pytest 8.3.5）**：
+  - `python -m pytest tests/ -q` → **1140 passed**（含新增
+    `test_st_exchange.py` 15 项、`test_st_precompute.py` 多源 7 项）。
+  - `python tools/probe.py all` → **41/41 PASS**（`tools/check_gates.ps1`
+    需要 pwsh，本机无；以 probe 为运行时裁定器，静态项 G09/G11/G13 手工复验
+    通过；**G10 `cli.py` 714 行 > 700 是基线既有**，`b77d509` 同长，本改动
+    未触碰 `cli.py`）。
+  - **真实预计算（实现自检，非打桩）**：东财 444 → 官方兜底
+    `OK count=195 requests=8 source=exchange merged_from=sse+szse`
+    （沪 80 + 深 115，`st_list.json` 原子落盘）。官方请求量 = 沪 1 + 深 6。
+  - 盘前零请求：`test_cli_main_path_makes_zero_st_list_requests` 打桩
+    `EM_SESSION.get` / `fetch_st_list` / `fetch_official_st_lists` 全部 0 调用。
+- **风险（如实）**：
+  1. 官方覆盖**不含北交所/B股**；东财长期封禁期间这些标的退化为报价名称。
+  2. 上交所 `COMPANY_STATUS=7` 的过滤语义、深交所 `fxjsb` 的字段/分页均为
+     2026-11-15 单次实测；任一端点结构变化会**显式失败**（不静默空表），
+     需人工复核后更新。
+  3. 官方每轮约 7 个 GET（沪 1 + 深 6），串行、不重试；深交所 `PAGESIZE`
+     被忽略，无法压成 1 次。
+  4. 预计算会**同时**取东财与官方做交叉校验（东财可用时也取官方），
+     以启用「两源冲突取并集」；若只想要纯备胎语义可用 `--no-official`。
+
 ## 2026-11-15 · R11 T8：腾讯报价的量比 / 换手 / 市值（缺口表 #11）
 
 - **分支**：`task/quote-fields`（父 `origin/main` `31b4c9f`）；关联 issue #1，

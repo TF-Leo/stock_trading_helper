@@ -324,6 +324,7 @@ python cli.py 600519 --start 20200101 --json
 - **status_source**: 本次状态的数据来源，`+` 分隔的组合值：
   - `tencent_quote`：实时报价（涨跌停价 / 名称 / is_stale）
   - `eastmoney_st_list`：收盘后预计算的东财 §6.8 ST 名单（缓存覆盖最近交易日）
+  - `exchange_st_list`：东财不可用时，来自交易所官方（上交所 / 深交所）风险警示名单的缓存（2026-11-15 additive；覆盖沪深 A，不含北交所/B股，warning 会写明）
   - `st_cache`：ST 名单缓存过期或取数失败后回退的旧缓存（同时 `diagnostics.warnings` 有说明）
   - `quote_unavailable`：腾讯报价取数失败或字段异常
   - `offline`：显式离线（`ASTOCK_STATUS_OFFLINE=1` 或 `ASTOCK_DISABLE_NETWORK=1`）
@@ -381,16 +382,25 @@ python cli.py 600519 --start 20200101 --json
 >   `status=ok` 出声，预期无需改动；其余「非 0 一律失败」的调度脚本需把 50
 >   识别为「今日休市（无建议）」而非「停牌/故障」。本 PR 不改 `~/.hermes`。
 >
-> **ST 名单：收盘后预计算 + 盘前只读缓存（2026-11-15，issue #107 P1）。**
+> **ST 名单：收盘后预计算 + 盘前只读缓存（2026-11-15，issue #107 P1；多源备胎同日起）。**
 > 东财 push2/push2delay 对出口 IP 触发 nginx 444 反爬，盘前逐票拉全市场名单会
 > 反复撞封禁。`tools/precompute_st_list.py` 在收盘后（18:30–18:40）**一次**取
 > 全市场名单，原子写入 `source/stock_analysis/data/state/st_list.json`
-> （含 `fetched_at` / `count` / `sha256` / `codes[]` / `source`，已 gitignore）；
-> `cli.py` 主路径只读该缓存（`get_st_list_cached`），盘前对 push2/push2delay
-> 的请求数为 0。缓存覆盖最近交易日 → `is_st_source=exchange_list`；缓存过期 →
-> 仍使用但 `stale=true` 并在 warning 写明日期；无缓存 → `unavailable`，由报价
-> 名称兜底。预计算命中 444 / 零字节 FIN 时立即中止并写
-> `st_list_cooldown.json`（默认 1800s），冷却期内不再请求。
+> （含 `fetched_at` / `count` / `sha256` / `codes[]` / `source` /
+> `merged_from`，已 gitignore）；`cli.py` 主路径只读该缓存
+> （`get_st_list_cached`），盘前对 push2/push2delay 的请求数为 0。缓存覆盖最近
+> 交易日 → `is_st_source=exchange_list`；缓存过期 → 仍使用但 `stale=true` 并在
+> warning 写明日期；无缓存 → `unavailable`，由报价名称兜底。
+>
+> **多源（2026-11-15 additive）**：东财为主源；每轮同时串行取交易所官方
+> 风险警示名单（`data_sources/st_exchange.py`：上交所 `commonQuery`
+> `COMPANY_STATUS=7` 1 个请求；深交所 `ShowReport/data` `CATALOGID=fxjsb`
+> 按官方分页串行取，当前 6 页）做**交叉校验**——东财可用时按代码取并集
+> （任一源说是 ST 就是 ST），冲突写 `CONFLICT` 告警；东财 444/冷却/失败时
+> 官方两所即作为兜底名单落盘。官方备胎覆盖沪深 A、不含北交所/B股。预计算命中
+> 444 / 零字节 FIN 时立即中止**东财**并写 `eastmoney_cooldown.json`（默认
+> 1800s）；冷却期内不再请求东财，但仍会尝试官方备胎（若两所都成功，照常
+> 落盘）。任一所需源异常都**不覆盖已有好缓存**。
 >
 > issue #106 起区分三态：名单正常 / **名单为空（可疑）** / 请求失败。空表或
 > 重复代码会先重试一次；仍异常则**不覆盖已有好缓存**，只告警；无缓存时
@@ -558,9 +568,11 @@ python cli.py 600519 --start 20200101 --json
 nginx 444 / 零字节 FIN 时，预计算立即熔断并写
 `source/stock_analysis/data/state/eastmoney_cooldown.json`（默认 1800s，
 `EASTMONEY_COOLDOWN_SECONDS` 可覆盖；与 ST 名单的预计算**共用同一份文件**）。
-冷却期内资金流 / ST 名单 / 监控池**一个请求都不发**，预计算直接跳过
-（资金流退出码 3）。每轮预计算对同一域名的请求数有硬上限（默认 60，
-`EASTMONEY_REQUEST_BUDGET` 可覆盖）；超限提前退出并告警，不落半截缓存。
+冷却期内资金流 / ST 名单 / 监控池对**东财**一个请求都不发，预计算直接跳过
+（资金流退出码 3）。2026-11-15 起 ST 预计算在这个窗口仍会尝试**交易所官方
+备胎**（不同主机，7 次左右 GET），官方成功则照常落盘。每轮预计算对同一域名
+的请求数有硬上限（默认 60，`EASTMONEY_REQUEST_BUDGET` 可覆盖）；超限提前退出
+并告警，不落半截缓存。
 
 **只展示、不改决策**：`evidence.flow` 不参与 `action`、`status`、`position_fraction`、
 `entry_zone`、`target_position` 的任何计算；A/B 对照中 `recommendation` 逐键一致。

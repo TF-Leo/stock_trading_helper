@@ -64,6 +64,7 @@ __all__ = [
     "get_st_list_cached",
     "resolve_trading_status",
     "reset_cache",
+    "snapshot_from_frame",
     "write_st_list_cache",
 ]
 
@@ -315,6 +316,9 @@ class StListSnapshot:
     # 取数失败时的原始原因（``Type: message``）。三态判定只看 ``state``；本字段
     # 供 get_st_list / 预计算复用告警文案，不改变任何决策口径。
     reason: Optional[str] = None
+    # 2026-11-15 多源预计算：本快照合并了哪些源（"eastmoney" / "sse" /
+    # "szse"）。写入缓存供事后审计；空列表表示旧调用点未标注。
+    merged_from: List[str] = field(default_factory=list)
 
     @property
     def codes(self):
@@ -358,6 +362,13 @@ def _st_failure_kind(exc: BaseException,
     return "failed"
 
 
+def _merged_from(payload) -> List[str]:
+    raw = payload.get("merged_from") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if str(item).strip()]
+
+
 def _snapshot_from_payload(payload, degraded=False, warning=None,
                            state="ok", stale=False) -> StListSnapshot:
     stocks = {}
@@ -386,6 +397,7 @@ def _snapshot_from_payload(payload, degraded=False, warning=None,
         warning=warning,
         state=state,
         stale=stale,
+        merged_from=_merged_from(payload),
     )
 
 
@@ -455,6 +467,8 @@ def write_st_list_cache(snapshot: StListSnapshot,
         "codes": codes,
         "stocks": snapshot.stocks,
         "state": "ok",
+        # additive（schema 2 内）：多源预计算审计字段；旧读盘方忽略即可。
+        "merged_from": list(snapshot.merged_from or []),
     }
     path = cache_path()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -517,6 +531,16 @@ def _snapshot_from_frame(frame, allow_clean: bool = False) -> StListSnapshot:
     return StListSnapshot(available=True, stocks=stocks, coverage=coverage,
                           source=source or "eastmoney", warning=warning,
                           state="ok", cleaned_duplicates=cleaned)
+
+
+def snapshot_from_frame(frame, allow_clean: bool = False) -> StListSnapshot:
+    """公开入口：把上游（东财 / 交易所官方）DataFrame 转成 ST 快照。
+
+    与 :func:`_snapshot_from_frame` 同一套三态判定（空表 / 重复代码报错），
+    供 ``tools/precompute_st_list.py`` 的官方备胎复用，避免在工具里直接调
+    私有函数。
+    """
+    return _snapshot_from_frame(frame, allow_clean=allow_clean)
 
 
 def _fetch_st_list(allow_clean: bool = False) -> StListSnapshot:
@@ -921,7 +945,13 @@ def resolve_trading_status(code: str, board: str, name: Optional[str] = None,
 
     status_source_parts = []
     if snapshot.available:
-        status_source_parts.append("st_cache" if snapshot.degraded else "eastmoney_st_list")
+        if snapshot.degraded:
+            status_source_parts.append("st_cache")
+        elif str(snapshot.source or "") == "exchange":
+            # 2026-11-15 多源：名单可能来自交易所官方备胎，不能仍标成东财。
+            status_source_parts.append("exchange_st_list")
+        else:
+            status_source_parts.append("eastmoney_st_list")
     if quote_ok:
         status_source_parts.append("tencent_quote")
     elif quote_error or quote is not None:
