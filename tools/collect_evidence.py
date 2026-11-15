@@ -48,6 +48,8 @@ OUT = ROOT / "evidence" / datetime.now().strftime("%Y%m%d-%H%M%S")
 
 PY = sys.executable
 ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+# as-of 取证标的：与 VERIFICATION_HANDOFF.md 的 Hermes 交接票一致。
+ASOF_CODE = "002415"
 
 
 def run(cmd, cwd=None, timeout=1800):
@@ -168,10 +170,24 @@ def step_idempotent():
 def step_asof():
     rows = {}
     ok = True
+    skipped = False
     for day in ("2026-10-22", "2026-10-23"):
-        cmd = [PY, "cli.py", "002415", "--json", "--fast", "--as-of", day]
+        cmd = [PY, "cli.py", ASOF_CODE, "--json", "--fast", "--as-of", day]
         code, out, err, sec = run(cmd, cwd=SRC, timeout=900)
         write(f"asof_{day}.json", out or err)
+        if code == 50:
+            # issue #119：exit 50 = 今日休市（非交易日）。--as-of 只截断行情，
+            # 不改变「今天是否交易日」的判定，所以休市日两天都会返回 50。
+            # 跳过该步、不计失败；仍记录 status 供人读。
+            status = None
+            try:
+                status = json.loads(out)["recommendation"]["status"]
+            except Exception:  # noqa: BLE001
+                pass
+            rows[day] = {"exit": code, "skipped": "market_closed",
+                         "status": status}
+            skipped = True
+            break
         try:
             d = json.loads(out)
             rec, dd, sg = d["recommendation"], d["data"], d["recommendation"]["signal"]
@@ -196,8 +212,13 @@ def step_asof():
             rows[day] = {"exit": code, "error": str(e)}
             ok = False
     write("asof_summary.json", json.dumps(rows, ensure_ascii=False, indent=2))
-    return {"name": "asof", "ok": ok, "file": "asof_summary.json",
-            "observed": {k: {"action": v.get("action"), "bars": v.get("bars")} for k, v in rows.items()}}
+    result = {"name": "asof", "ok": ok, "file": "asof_summary.json",
+              "observed": {k: {"action": v.get("action"), "bars": v.get("bars")}
+                           for k, v in rows.items()}}
+    if skipped:
+        result["skipped"] = "market_closed"
+        result["note"] = "今日休市（exit 50），跳过 as-of 校验，不计失败"
+    return result
 
 
 def step_timing():

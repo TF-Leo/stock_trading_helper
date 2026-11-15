@@ -19,6 +19,7 @@ confidence 分箱校准与按 ``flow.caliber`` / 估值分位的分层命中率�
     python tools/forward_log.py record
     python tools/forward_log.py record --codes 002415,600519   # 只记两只
     python tools/forward_log.py record --ledger-only           # 只写 JSON 台账
+    python tools/forward_log.py record --allow-non-trading-day # 休市日强制写入
     python tools/forward_log.py evaluate                       # CSV + JSON 台账结算
     python tools/forward_log.py report                         # 汇总（可加 --json）
 
@@ -49,6 +50,14 @@ EVID = ROOT / "evidence"
 LOG = EVID / "forward_log.csv"
 EVAL = EVID / "forward_eval.csv"
 
+# issue #119：休市日 CLI 返回 status=market_closed，其 as_of 仍是上一交易日，
+# 直接写入会覆盖那一天的 CSV / JSON 台账（含已结算数据）。沿用休市退出码 50。
+EXIT_NON_TRADING_DAY = 50
+
+
+class NonTradingDayError(RuntimeError):
+    """官方交易日历确认今日休市时，``record`` 拒绝写入。"""
+
 DEFAULT_CODES = ["000858", "002270", "002371", "002415", "002594", "300476",
                  "300750", "600036", "600519", "600522", "601318", "601398",
                  "603259", "688981"]
@@ -67,12 +76,51 @@ def _append_csv(row, new_file):
         writer.writerow(row)
 
 
-def record(codes, ledger_dir=None, ledger_only=False, runner=None):
+def _market_day_state(day=None):
+    """今日交易日状态（issue #119）。测试通过 monkeypatch 本函数离线注入。
+
+    生产路径只认官方交易日历（``status.market_day_state``：先读磁盘缓存，
+    缺失时才请求深交所整月文件），不回退「周一至周五 = 交易日」。
+    """
+    from stock_analysis.data_loader import status as _status
+    return _status.market_day_state(day or datetime.now().date())
+
+
+def _check_trading_day(allow_non_trading_day=False, day=None):
+    """非交易日拒绝 ``record``；显式放行或日历不可用时返回状态。
+
+    * ``closed is True``  → 抛 :class:`NonTradingDayError`（退出码 50）；
+    * ``closed is None``  → 官方日历不可用，**无法判定**：告警后继续写入
+      （此时 CLI 也不会把记录标成 ``market_closed``，不会触发覆盖故障）；
+    * ``closed is False`` → 交易日，正常写入。
+    """
+    if allow_non_trading_day:
+        return None
+    state = _market_day_state(day)
+    if state.closed is True:
+        raise NonTradingDayError(
+            "今日休市（官方交易日历：非交易日"
+            f"，来源 {state.source}），record 已拒绝写入：休市日产生的 "
+            "status=market_closed 记录会以上一交易日为 as_of 覆盖既有台账"
+            "（含已结算数据）。如确需写入，请显式加 --allow-non-trading-day。")
+    if state.closed is None:
+        print(f"[forward_log] 警告：{state.warning or '无法判定今日是否交易日'}"
+              "；按「未确认休市」继续写入。", file=sys.stderr)
+    return state
+
+
+def record(codes, ledger_dir=None, ledger_only=False, runner=None,
+           allow_non_trading_day=False, day=None):
     """记录当日建议：JSON 台账（issue #56）+ CSV（旧行为，同一份 CLI 输出派生）。
 
     每只票只跑一次 CLI：``collect_record`` 同时返回台账记录与原始 payload，
     CSV 行从 payload 取旧字段，台账行取新字段。CSV 仍按 ``(as_of, code)`` 去重。
+
+    issue #119：默认先查官方交易日历，``closed is True`` 时抛
+    :class:`NonTradingDayError`（不开文件、不跑 CLI）；``allow_non_trading_day``
+    显式放行。``day`` 仅测试注入，生产路径不得传。
     """
+    _check_trading_day(allow_non_trading_day, day)
     existing = set()
     if LOG.exists():
         with LOG.open(encoding="utf-8", newline="") as f:
@@ -235,11 +283,18 @@ def main():
                     help="JSON 台账目录（默认 source/stock_analysis/data/forward）")
     ap.add_argument("--ledger-only", action="store_true",
                     help="record 时只写 JSON 台账，不写 evidence/forward_log.csv")
+    ap.add_argument("--allow-non-trading-day", action="store_true",
+                    help="record 在官方交易日历判定为休市时仍写入（默认拒绝，退出码 50）")
     ap.add_argument("--json", action="store_true", help="report 输出机读 JSON")
     a = ap.parse_args()
     codes = [c.strip() for c in a.codes.split(",") if c.strip()] or DEFAULT_CODES
     if a.mode == "record":
-        record(codes, ledger_dir=a.ledger_dir, ledger_only=a.ledger_only)
+        try:
+            record(codes, ledger_dir=a.ledger_dir, ledger_only=a.ledger_only,
+                   allow_non_trading_day=a.allow_non_trading_day)
+        except NonTradingDayError as exc:
+            print(f"[forward_log] {exc}", file=sys.stderr)
+            sys.exit(EXIT_NON_TRADING_DAY)
     elif a.mode == "evaluate":
         evaluate(ledger_dir=a.ledger_dir)
     else:

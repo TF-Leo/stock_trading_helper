@@ -1437,11 +1437,17 @@ def test_report_ignores_unsettled_records(ledger_tmp):
 # ---------------------------------------------------------------------------
 # tools/forward_log.py 兼容
 # ---------------------------------------------------------------------------
-def _load_forward_log():
+def _load_forward_log(trading_day=True):
     spec = importlib.util.spec_from_file_location(
         "forward_log_tool", TOOLS / "forward_log.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # issue #119：``record`` 默认查官方交易日历。测试离线注入确定事实，
+    # 不依赖运行日与网络；拒绝路径的用例再 monkeypatch 覆盖本函数。
+    from stock_analysis.data_loader.status import MarketDayState
+    module._market_day_state = lambda day=None: MarketDayState(
+        closed=(None if trading_day is None else not trading_day),
+        source="injected")
     return module
 
 
@@ -1474,6 +1480,83 @@ def test_tool_record_ledger_only_skips_csv(tmp_path, monkeypatch):
                 runner=_runner(_cli_payload()))
     assert not tool.LOG.exists()
     assert fl.load_day("2026-11-12", ledger_dir)["records"]
+
+
+# ---------------------------------------------------------------------------
+# issue #119：休市日 record 默认拒绝写入（防止覆盖上一交易日的真实台账）
+# ---------------------------------------------------------------------------
+def test_tool_record_refuses_on_non_trading_day(tmp_path, monkeypatch):
+    tool = _load_forward_log(trading_day=False)
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+
+    with pytest.raises(tool.NonTradingDayError, match="休市"):
+        tool.record(["600519"], ledger_dir=ledger_dir,
+                    runner=_runner(_cli_payload(code="600519")))
+
+    # 拒绝必须发生在任何落盘之前：JSON 台账与 CSV 都不存在。
+    assert not ledger_dir.exists()
+    assert not tool.LOG.exists()
+
+
+def test_tool_record_non_trading_day_cli_exits_50(tmp_path, monkeypatch, capsys):
+    tool = _load_forward_log(trading_day=False)
+    monkeypatch.setattr(sys, "argv", [
+        "forward_log.py", "record", "--codes", "600519",
+        "--ledger-dir", str(tmp_path / "forward")])
+
+    with pytest.raises(SystemExit) as excinfo:
+        tool.main()
+
+    assert excinfo.value.code == tool.EXIT_NON_TRADING_DAY == 50
+    err = capsys.readouterr().err
+    assert "休市" in err
+    assert "--allow-non-trading-day" in err
+
+
+def test_tool_record_allow_non_trading_day_writes(tmp_path, monkeypatch):
+    tool = _load_forward_log(trading_day=False)
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+
+    written = tool.record(
+        ["600519"], ledger_dir=ledger_dir, allow_non_trading_day=True,
+        runner=_runner(_cli_payload(code="600519", status="market_closed")))
+
+    assert list(written) == ["2026-11-12"]
+    record = fl.load_day("2026-11-12", ledger_dir)["records"]["600519"]
+    assert record["status"] == "market_closed"
+    assert tool.LOG.exists()
+
+
+def test_tool_record_trading_day_writes(tmp_path, monkeypatch):
+    tool = _load_forward_log(trading_day=True)
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+
+    written = tool.record(["600000"], ledger_dir=ledger_dir,
+                          runner=_runner(_cli_payload(code="600000")))
+
+    assert list(written) == ["2026-11-12"]
+    assert fl.load_day("2026-11-12", ledger_dir)["records"]["600000"]["action"] == "buy"
+
+
+def test_tool_record_calendar_unavailable_warns_but_writes(
+        tmp_path, monkeypatch, capsys):
+    """日历不可用 = 无法判定，不是「确认休市」：告警后按旧行为写入。"""
+    tool = _load_forward_log(trading_day=None)
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+
+    written = tool.record(["600000"], ledger_dir=ledger_dir,
+                          runner=_runner(_cli_payload(code="600000")))
+
+    assert list(written) == ["2026-11-12"]
+    assert "无法判定今日是否交易日" in capsys.readouterr().err
 
 
 def test_tool_record_survives_cli_failure(tmp_path, monkeypatch):

@@ -75,8 +75,10 @@ def apply_market_state_gate(payload: dict) -> dict:
     """**闸门层**：休市日把可执行状态统一改成 ``market_closed``（退出码 50）。
 
     ``cli.py`` 只在响应构造完成后调用本函数一次；``decide()`` 不动，所以
-    ``decide('market_closed', 'entry')`` 仍返回 ``buy`` —— 覆盖发生在闸门层，
-    不是决策层，这是刻意的分层（见模块 docstring）。
+    ``decide('market_closed', 'entry')``（两参）返回 ``hold`` —— ``decide``
+    不认识 ``market_closed``，只有 ``expectancy_ok=True, holding=False`` 时才
+    返回 ``buy``。覆盖发生在闸门层，不是决策层，这是刻意的分层（见模块
+    docstring）。
 
     优先级：``insufficient_data`` / ``data_source_error``（数据本身的问题）
     优先保留；其余（``ok`` / ``no_edge`` / ``untradeable``）在官方日历确认
