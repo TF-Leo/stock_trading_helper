@@ -29,6 +29,7 @@ for _path in (SRC, SRC.parent / "tools"):
 
 from stock_analysis.data_loader import status  # noqa: E402
 from stock_analysis.data_sources import _astock_generated as _g  # noqa: E402
+from stock_analysis.data_sources import st_exchange  # noqa: E402
 
 import precompute_st_list as pre  # noqa: E402
 
@@ -40,6 +41,45 @@ PREV_TRADE_DAY = "2026-11-13"
 # ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _official_offline(monkeypatch):
+    """默认不触交易所官方接口：本文件的老用例只描述东财路径。
+
+    需要官方备胎的用例自行覆盖 ``st_exchange.fetch_official_st_lists``。
+    """
+    def _offline(*args, **kwargs):
+        return st_exchange.OfficialListsResult(
+            lists=[], requests=0,
+            errors=[{"source": "sse", "error": "test offline", "requests": 0},
+                    {"source": "szse", "error": "test offline", "requests": 0}])
+
+    monkeypatch.setattr(st_exchange, "fetch_official_st_lists", _offline)
+
+
+def _official_lists(sse_rows=None, szse_rows=None):
+    sse = st_exchange.ExchangeStList(
+        source="sse", rows=sse_rows or [
+            {"code": "600001", "name": "*ST示例", "st_type": "*ST",
+             "market": "sh", "source": "sse"}],
+        url="https://query.sse.com.cn/", coverage=st_exchange.SSE_COVERAGE,
+        requests=1, fetched_at=NOW_CLOSE.isoformat())
+    szse = st_exchange.ExchangeStList(
+        source="szse", rows=szse_rows or [
+            {"code": "000002", "name": "ST示例二", "st_type": "ST",
+             "market": "sz", "source": "szse"}],
+        url="https://www.szse.cn/", coverage=st_exchange.SZSE_COVERAGE,
+        requests=6, fetched_at=NOW_CLOSE.isoformat(),
+        session_date=PREV_TRADE_DAY)
+    return [sse, szse]
+
+
+def _patch_official(monkeypatch, lists=None, errors=None):
+    result = st_exchange.OfficialListsResult(
+        lists=list(lists or []), errors=list(errors or []),
+        requests=sum(item.requests for item in (lists or [])))
+    monkeypatch.setattr(st_exchange, "fetch_official_st_lists",
+                        lambda *a, **k: result)
+    return result
 def _st_frame(codes=("600001", "000002")):
     rows = [
         {"code": "600001", "name": "*ST示例", "st_type": "*ST", "market": "sh",
@@ -219,7 +259,8 @@ def test_http_444_aborts_after_one_request_and_cools(monkeypatch):
     assert Path(status.cooldown_path()).exists()
     assert not Path(status.cache_path()).exists(), "阻断窗口内不落半截名单"
 
-    cooled = pre.precompute(now=NOW_CLOSE + dt.timedelta(seconds=1))
+    cooled = pre.precompute(now=NOW_CLOSE + dt.timedelta(seconds=1),
+                            official=False)
     assert cooled["skipped_cooldown"] is True
     assert cooled["requests"] == 0
     assert calls["n"] == 1, "冷却期内不得再发请求"
@@ -253,9 +294,10 @@ def test_main_exit_codes_cooldown_and_failure(monkeypatch, capsys):
     monkeypatch.setattr(_g, "_em_last_call", [__import__("time").time()])
     monkeypatch.setattr(_g.time, "sleep", lambda seconds: None)
 
-    assert pre.main(["--now", NOW_CLOSE.isoformat()]) == pre.EXIT_FAILED
-    assert pre.main(["--now", (NOW_CLOSE + dt.timedelta(seconds=1)).isoformat()]) \
-        == pre.EXIT_COOLDOWN
+    assert pre.main(["--now", NOW_CLOSE.isoformat(),
+                     "--no-official"]) == pre.EXIT_FAILED
+    assert pre.main(["--now", (NOW_CLOSE + dt.timedelta(seconds=1)).isoformat(),
+                     "--no-official"]) == pre.EXIT_COOLDOWN
     assert pre.main(["--clear-cooldown"]) == pre.EXIT_OK
     assert not Path(status.cooldown_path()).exists()
 
@@ -271,6 +313,7 @@ def test_preopen_reads_fresh_cache_without_network(monkeypatch):
 
     monkeypatch.setattr(_g.EM_SESSION, "get", _boom)
     monkeypatch.setattr(status, "fetch_st_list", _boom)
+    monkeypatch.setattr(st_exchange, "fetch_official_st_lists", _boom)
 
     snap = status.get_st_list_cached(now=NOW_PREOPEN)
     assert snap.available is True
@@ -388,6 +431,8 @@ def test_cli_main_path_makes_zero_st_list_requests(monkeypatch, capsys):
     monkeypatch.setattr(_g, "st_stock_list", _boom)
     monkeypatch.setattr(status, "fetch_st_list", _boom)
     monkeypatch.setattr(status, "get_st_list", _boom)
+    monkeypatch.setattr(st_exchange, "fetch_official_st_lists", _boom)
+    monkeypatch.setattr(st_exchange.requests, "get", _boom)
 
     df = _toy()
     monkeypatch.setattr(cli, "get_stock_daily", lambda *a, **k: df)
@@ -412,3 +457,157 @@ def test_cli_main_path_makes_zero_st_list_requests(monkeypatch, capsys):
     assert out["instrument"]["is_st_source"] == "exchange_list"
     assert out["instrument"]["is_st"] is False
     assert calls["n"] == 0, "盘前路径对 push2 / 旧取数入口的请求数必须为 0"
+
+# ---------------------------------------------------------------------------
+# 6) 多源（2026-11-15）：官方备胎 / 合并 / 冲突 / 不覆盖
+# ---------------------------------------------------------------------------
+def test_official_fallback_writes_cache_when_eastmoney_blocked(monkeypatch):
+    monkeypatch.setattr(_g.EM_SESSION, "get",
+                        lambda *a, **k: _BlockedResponse())
+    monkeypatch.setattr(_g, "_em_last_call", [__import__("time").time()])
+    monkeypatch.setattr(_g.time, "sleep", lambda seconds: None)
+    _patch_official(monkeypatch, _official_lists())
+
+    stats = pre.precompute(now=NOW_CLOSE, force=True)
+
+    assert stats["ok"] is True
+    assert stats["source"] == "exchange"
+    assert stats["merged_from"] == ["sse", "szse"]
+    assert stats["count"] == 2
+    assert stats["requests"] == 8, "东财 1（444）+ SSE 1 + SZSE 6"
+    assert stats["blocked"] is True and stats["cooldown"]
+
+    payload = json.loads(Path(status.cache_path()).read_text(encoding="utf-8"))
+    assert payload["source"] == "exchange"
+    assert payload["merged_from"] == ["sse", "szse"]
+    assert payload["codes"] == ["000002", "600001"]
+    assert payload["coverage"].startswith("沪深A（官方")
+
+
+def test_incomplete_official_never_overwrites_good_cache(monkeypatch):
+    _seed_good_cache()
+    before = Path(status.cache_path()).read_bytes()
+
+    monkeypatch.setattr(_g, "st_stock_list", lambda: (_ for _ in ()).throw(
+        RuntimeError("东财 ST 名单不可达（push2 / push2delay 均不可达）")))
+    status.reset_cache()
+    _patch_official(monkeypatch, lists=[_official_lists()[0]],
+                    errors=[{"source": "szse", "error": "深交所挂了",
+                             "requests": 6}])
+
+    stats = pre.precompute(now=NOW_CLOSE + dt.timedelta(days=1))
+
+    assert stats["ok"] is False
+    assert "szse 官方源失败" in stats["reason"]
+    assert Path(status.cache_path()).read_bytes() == before, \
+        "官方只有一个所成功（沪深不完整）时不得覆盖好缓存"
+
+
+def test_official_empty_never_overwrites_good_cache(monkeypatch):
+    _seed_good_cache()
+    before = Path(status.cache_path()).read_bytes()
+
+    monkeypatch.setattr(_g, "st_stock_list", lambda: (_ for _ in ()).throw(
+        RuntimeError("东财 ST 名单不可达")))
+    status.reset_cache()
+    _patch_official(monkeypatch, lists=[], errors=[
+        {"source": "sse", "error": "上交所风险警示名单为空", "requests": 1},
+        {"source": "szse", "error": "深交所风险警示名单为空", "requests": 6},
+    ])
+
+    stats = pre.precompute(now=NOW_CLOSE + dt.timedelta(days=1))
+    assert stats["ok"] is False
+    assert Path(status.cache_path()).read_bytes() == before
+
+
+def test_eastmoney_and_official_merge_conflict_takes_union(monkeypatch):
+    frame = pd.DataFrame([
+        {"code": "600001", "name": "*ST示例", "st_type": "*ST", "market": "sh"},
+        {"code": "600003", "name": "ST东财独有", "st_type": "ST", "market": "sh"},
+        {"code": "830001", "name": "ST北交示例", "st_type": "ST", "market": "bj"},
+    ])
+    frame.attrs["coverage"] = "沪深京"
+    calls = []
+    _patch_st_list(monkeypatch, frame, calls)
+    _patch_official(monkeypatch, _official_lists(
+        sse_rows=[{"code": "600001", "name": "ST示例改名", "st_type": "ST",
+                   "market": "sh", "source": "sse"}],
+        szse_rows=[{"code": "000002", "name": "ST示例二", "st_type": "ST",
+                    "market": "sz", "source": "szse"}]))
+
+    stats = pre.precompute(now=NOW_CLOSE)
+
+    assert stats["ok"] is True
+    assert stats["source"] == "eastmoney"
+    assert stats["merged_from"] == ["eastmoney", "sse", "szse"]
+    assert stats["count"] == 4, "并集：600001/600003/830001 + 000002"
+    conflict = stats["conflicts"] or ""
+    for needle in ("两源冲突", "名称不一致", "东财独有", "官方独有", "是 ST"):
+        assert needle in conflict, (needle, conflict)
+    assert "830001" not in conflict, "北交所不在官方覆盖内，不算冲突"
+
+    payload = json.loads(Path(status.cache_path()).read_text(encoding="utf-8"))
+    assert payload["merged_from"] == ["eastmoney", "sse", "szse"]
+    assert set(payload["codes"]) == {"000002", "600001", "600003", "830001"}
+    assert payload["stocks"]["600001"]["st_type"] == "*ST", "*ST 优先"
+
+
+def test_eastmoney_cooldown_still_uses_official_backup(monkeypatch):
+    status.mark_cooldown("http_444", "旧封锁", seconds=1800, now=NOW_CLOSE)
+    calls = {"official": 0}
+
+    def fake_official(*args, **kwargs):
+        calls["official"] += 1
+        return st_exchange.OfficialListsResult(
+            lists=_official_lists(), errors=[], requests=7)
+
+    monkeypatch.setattr(st_exchange, "fetch_official_st_lists", fake_official)
+
+    def _east_boom(*args, **kwargs):
+        raise AssertionError("东财冷却期内不得请求东财")
+
+    monkeypatch.setattr(_g.EM_SESSION, "get", _east_boom)
+
+    stats = pre.precompute(now=NOW_CLOSE + dt.timedelta(seconds=1))
+
+    assert stats["eastmoney_skipped_cooldown"] is True
+    assert stats["skipped_cooldown"] is False, \
+        "官方备胎被尝试过，本轮不是「0 请求跳过」"
+    assert calls["official"] == 1
+    assert stats["ok"] is True and stats["source"] == "exchange"
+    assert stats["requests"] == 7, "冷却期内东财 0 请求，官方 7 次"
+
+
+def test_no_official_keeps_cooldown_exit_contract(monkeypatch):
+    status.mark_cooldown("http_444", "旧封锁", seconds=1800, now=NOW_CLOSE)
+    monkeypatch.setattr(st_exchange, "fetch_official_st_lists",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("--no-official 不得请求官方源")))
+
+    stats = pre.precompute(now=NOW_CLOSE + dt.timedelta(seconds=1),
+                           official=False)
+
+    assert stats["skipped_cooldown"] is True
+    assert stats["requests"] == 0
+    assert stats["sources"]["sse"]["state"] == "disabled"
+    assert stats["sources"]["szse"]["state"] == "disabled"
+
+
+def test_partial_official_does_not_flag_uncovered_market(monkeypatch):
+    """只有上交所成功时，不能把全部深市东财代码误报成「东财独有」。"""
+    frame = pd.DataFrame([
+        {"code": "600001", "name": "*ST示例", "st_type": "*ST", "market": "sh"},
+        {"code": "000002", "name": "ST示例二", "st_type": "ST", "market": "sz"},
+    ])
+    frame.attrs["coverage"] = "沪深京"
+    _patch_st_list(monkeypatch, frame, [])
+    _patch_official(monkeypatch, lists=[_official_lists()[0]])  # 仅 SSE
+
+    stats = pre.precompute(now=NOW_CLOSE)
+
+    assert stats["ok"] is True
+    assert stats["merged_from"] == ["eastmoney", "sse"]
+    assert stats["count"] == 2
+    conflict = stats["conflicts"] or ""
+    assert "东财独有" not in conflict, conflict
+    assert "两源冲突" not in conflict, conflict

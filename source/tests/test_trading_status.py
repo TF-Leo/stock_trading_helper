@@ -268,6 +268,21 @@ def test_normal_stock_status():
     assert "eastmoney_st_list" in out.status_source
 
 
+def test_exchange_official_list_has_its_own_status_source():
+    """2026-11-15：官方备胎落盘的缓存不能仍标成东财。"""
+    from stock_analysis.data_loader import status
+
+    snapshot = status.StListSnapshot(
+        available=True,
+        stocks={"600001": {"name": "*ST示例", "st_type": "*ST", "market": "sh"}},
+        coverage="沪深A（官方，不含北交所/B股）", source="exchange",
+        state="ok", merged_from=["sse", "szse"])
+    out = _resolve(_quote("quote_normal.json"), code="600001",
+                   snapshot=snapshot)
+    assert "exchange_st_list" in out.status_source
+    assert "eastmoney_st_list" not in out.status_source
+
+
 def test_st_main_board_limit_matches_2026_rule():
     """2026-07-06 起主板 ST 与普通主板同为 10%（旧 5% 规则已废止）。"""
     out = _resolve(_quote("quote_st_main.json"), code="600001",
