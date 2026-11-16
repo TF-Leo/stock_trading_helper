@@ -827,19 +827,28 @@ evidence.events = {
 python tools/forward_log.py record                 # 收盘后跑；默认 14 只自选
 python tools/forward_log.py record --codes 002415,601066 --ledger-only
 python tools/forward_log.py record --overwrite     # 显式允许覆盖同 (日期,标的) 记录
+python tools/forward_log.py record --as-of 2026-11-12  # 历史回放（透传 cli.py --as-of）
 python tools/forward_log.py evaluate               # 结算已到期记录（每日跑）
 python tools/forward_log.py report                 # 汇总；--json 输出机读
 ```
 
 写入 `source/stock_analysis/data/forward/<YYYY-MM-DD>.json`（`data/` 已在
-`.gitignore`）。**文件日期 = 建议日期**（issue #134）：优先 payload 的
-`request.as_of`（`cli.py --as-of` 回放），缺省为运行日；**不再取 `data.end`** ——
-场外基金 T 日净值约 20:45 才入库，18:55 跑时 `data.end` 仍是 T-1，按它落盘
-会把 T 日的建议写进 T-1 的文件，并静默覆盖那里的既有记录。同一
-(日期, 标的) 已有记录时**默认拒绝**（退出码 1、零落盘），需显式
-`--overwrite` 才覆盖；覆盖已结算记录会额外告警。`data.end` 落后于建议日期时，
-记录写 `data_end` / `data_lag_days`（additive），`record` 输出与 `report`
+`.gitignore`）。**文件日期 = 建议日期**（issue #134）：优先 `--as-of`
+（透传给 `cli.py --as-of`，行情截断到该日），其次 payload 的
+`request.as_of`，缺省为运行日；**不再取 `data.end`** —— 场外基金 T 日净值约
+20:45 才入库，18:55 跑时 `data.end` 仍是 T-1，按它落盘会把 T 日的建议写进
+T-1 的文件，并静默覆盖那里的既有记录。同一 (日期, 标的) 已有记录时**默认
+拒绝**（退出码 **6**、零落盘），需显式 `--overwrite` 才覆盖；覆盖时旧记录
+摘要（`recorded_at` / `action` / `confidence` / `status` / `degraded` 与降级
+原因，已结算记录还含 `settled` / `settle_status`）追加进新记录的
+`superseded[]`（additive），**不丢历史**。`data.end` 落后于建议日期时，记录写
+`data_end` / `data_lag_calendar_days`（additive，**自然日**；CLI payload 的
+`data.lag_days` 是**交易日**，两者刻意不同名），`record` 输出与 `report`
 汇总都会列出滞后条数与天数。
+
+`record` 的退出码：`0`=写入成功、`6`=同 (日期, 标的) 已存在且未加
+`--overwrite`（独立码，与未捕获异常/崩溃的 `1` 区分）、`50`=休市或交易日历
+不可用而拒绝写入（`--allow-non-trading-day` 可放行）。
 
 每条记录的键集合固定，取不到就写 `null` 并在 `missing` 里记原因
 （`cache_missing` / `cli_failed` / `field_absent_in_cli_output` 等），
@@ -852,8 +861,9 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 | 资金面 | `flow.{available,source,caliber,net_5d,net_20d,as_of,main_net_5d,main_net_20d}` |
 | 估值 | `valuation.{available,pe_percentile_3y,pb_percentile_3y,ps_percentile_3y,as_of}` |
 | 市况 | `market_regime.{label,confidence}` / `index_regime.{label,confidence}` |
-| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` `instrument_type` `price_source` `price_caliber` `instrument_basis` `basis_uncertain` `data_end` `data_lag_days` |
+| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` `instrument_type` `price_source` `price_caliber` `instrument_basis` `basis_uncertain` `data_end` `data_lag_calendar_days` `degraded` `degraded_reason` |
 | 结算 | `settled.{ret_20d,hit,settle_date,entry_date,entry_open,exit_open,horizon_days,price_source}` 或 `null` + `settle_reason`，外加 `settle_status` |
+| 覆盖留痕 | `superseded[]`（additive，仅在该记录被 `--overwrite` 替换后出现）：每次覆盖追加一条旧记录摘要，含 `recorded_at` `action` `confidence` `status` `cli_exit` `degraded` `degraded_reason` `settle_status` `superseded_at`；旧记录已结算时额外含 `settled` |
 
 结算口径：`open_{d+1+20} / open_{d+1} − 1`，其中 `d` 是记录的 `as_of`
 （**建议日期**）：净值迟到时仍从建议日期的下一根行情起算，不借用 `data.end`。

@@ -21,6 +21,7 @@ confidence 分箱校准与按 ``flow.caliber`` / 估值分位的分层命中率�
     python tools/forward_log.py record --ledger-only           # 只写 JSON 台账
     python tools/forward_log.py record --allow-non-trading-day # 休市/日历不可用时强制写入
     python tools/forward_log.py record --overwrite             # 显式允许覆盖同 (日期,标的) 既有记录
+    python tools/forward_log.py record --as-of 2026-11-12      # 历史回放：透传 cli.py --as-of
     python tools/forward_log.py evaluate                       # CSV + JSON 台账结算
     python tools/forward_log.py report                         # 汇总（可加 --json）
 
@@ -29,11 +30,13 @@ confidence 分箱校准与按 ``flow.caliber`` / 估值分位的分层命中率�
     forward_eval.csv    每次 evaluate 覆盖写，含已到期与未到期两种状态
 
 JSON 台账（``source/stock_analysis/data/forward/``，``data/`` 已 gitignore）
-    <date>.json         当日全部记录。**文件日期 = 建议日期**（``request.as_of``，
-                        缺省运行日；issue #134），不是 ``data.end``。同一
-                        (日期, 标的) 已有记录时**默认拒绝**并退出 1，需显式
-                        ``--overwrite`` 才覆盖；``data.end`` 落后于建议日期时
-                        记录里带 ``data_lag_days``，并在输出与 report 中可见。
+    <date>.json         当日全部记录。**文件日期 = 建议日期**（``--as-of`` >
+                        ``request.as_of`` > 运行日；issue #134），不是
+                        ``data.end``。同一 (日期, 标的) 已有记录时**默认拒绝**
+                        并退出 6，需显式 ``--overwrite`` 才覆盖；覆盖时旧记录
+                        摘要在新记录的 ``superseded`` 里留痕（不丢历史）。
+                        ``data.end`` 落后于建议日期时记录里带
+                        ``data_lag_calendar_days``，并在输出与 report 中可见。
 """
 from __future__ import annotations
 
@@ -41,7 +44,7 @@ import argparse
 import csv
 import json
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -62,10 +65,12 @@ EVAL = EVID / "forward_eval.csv"
 EXIT_NON_TRADING_DAY = MARKET_CLOSED_EXIT_CODE
 # 日历不可用时同样拒绝写入，复用同一退出码（PR #120 复验 P2）。
 EXIT_MARKET_STATE_UNKNOWN = EXIT_NON_TRADING_DAY
-# issue #134：同 (日期, 标的) 已有记录、未加 --overwrite 时拒绝写入。这不是
-# 既有退出码契约里的数据/市场状态，用通用的 1（与未捕获异常同值但语义明确，
-# 由 CLI 打印可读原因后返回）；不与 10/20/30/40/50 抢语义。
-EXIT_DUPLICATE_RECORD = 1
+# issue #134：同 (日期, 标的) 已有记录、未加 --overwrite 时拒绝写入。必须用
+# **独立退出码 6**：复用 1 会和「未捕获异常 / 崩溃」混同，消费脚本（
+# forward_ledger_daily.py）只能看到 ``record exit=1``，事后无法区分「已记录」
+# 与「真崩了」。10/20/30/40/50 是 cli.py 的状态码，6 落在它们之外且不与
+# 仓库既有约定冲突。
+EXIT_DUPLICATE_RECORD = 6
 
 
 class NonTradingDayError(RuntimeError):
@@ -99,6 +104,22 @@ def _market_day_state(day=None):
     return _status.market_day_state(day or datetime.now().date())
 
 
+def _as_date(value):
+    """``date`` / ``datetime`` / ``YYYYMMDD`` / ``YYYY-MM-DD`` → ``date``。
+
+    只用于交易日历闸门（``market_day_state`` 要 ``date``）。``--as-of`` 回放时
+    校验的是**目标写入日**，不是运行日：周末回放一个历史交易日不应被拒。
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value)
+    if len(text) == 8 and text.isdigit():
+        return datetime.strptime(text, "%Y%m%d").date()
+    return datetime.strptime(text[:10], "%Y-%m-%d").date()
+
+
 def _check_trading_day(allow_non_trading_day=False, day=None):
     """休市**或日历不可用**时拒绝 ``record``；显式放行时打印警告。
 
@@ -108,10 +129,11 @@ def _check_trading_day(allow_non_trading_day=False, day=None):
     * ``closed is False`` → 交易日，正常写入。
 
     只有显式 ``--allow-non-trading-day`` 才放行。issue #134 起写入日期是
-    **建议日期**（``request.as_of``，缺省运行日），休市日写入不再借用
-    ``data.end`` 落到上一交易日；但非交易日仍会写出一个 ``market_closed``
-    记录文件，故保留 #119 的默认拒绝。放行时打印醒目警告，并说明覆盖保护
-    仍由 (日期, 标的) 去重把关。
+    **建议日期**（``--as-of`` / ``request.as_of``，缺省运行日），休市日写入
+    不再借用 ``data.end`` 落到上一交易日；但非交易日仍会写出一个
+    ``market_closed`` 记录文件，故保留 #119 的默认拒绝。``day`` 是待校验的
+    **目标写入日**（``--as-of`` 优先），不是「今天」。放行时打印醒目警告，
+    并说明覆盖保护仍由 (日期, 标的) 去重把关。
     """
     state = _market_day_state(day)
     if state.closed is False:
@@ -134,24 +156,29 @@ def _check_trading_day(allow_non_trading_day=False, day=None):
               if state.closed is True
               else f"交易日历不可用（{state.warning or state.source}）")
     print(f"[forward_log] !!! 警告：{reason}，已按 --allow-non-trading-day "
-          f"强制写入；写入日期为建议日期（payload.request.as_of 优先，缺省为"
-          f"运行日 {write_day}）。同一 (日期, 标的) 已有记录时默认仍会拒绝，"
-          "需显式加 --overwrite。", file=sys.stderr)
+          f"强制写入；写入日期为建议日期（--as-of / payload.request.as_of "
+          f"优先，缺省为运行日 {write_day}）。同一 (日期, 标的) 已有记录时"
+          "默认仍会拒绝，需显式加 --overwrite。", file=sys.stderr)
     return state
 
 
 def record(codes, ledger_dir=None, ledger_only=False, runner=None,
-           allow_non_trading_day=False, day=None, overwrite=False):
+           allow_non_trading_day=False, day=None, overwrite=False,
+           as_of=None):
     """记录当日建议：JSON 台账（issue #56）+ CSV（旧行为，同一份 CLI 输出派生）。
 
     每只票只跑一次 CLI：``collect_record`` 同时返回台账记录与原始 payload，
     CSV 行从 payload 取旧字段，台账行取新字段。CSV 仍按 ``(as_of, code)`` 去重。
 
-    issue #134：落盘日期 = **建议日期**（``request.as_of``，缺省运行日），
-    不再取 ``data.end``；``data.end`` 更早时记录带 ``data_lag_days`` 并在输出
-    里打印。同一 ``(日期, 标的)`` 已有记录时默认抛
-    :class:`forward_ledger.DuplicateRecordError`（不写任何文件），只有
-    ``overwrite=True``（CLI ``--overwrite``）才替换；覆盖已结算记录会额外告警。
+    issue #134：落盘日期 = **建议日期**（``as_of`` > ``request.as_of`` >
+    运行日），不再取 ``data.end``；``data.end`` 更早时记录带
+    ``data_lag_calendar_days`` 并在输出里打印。同一 ``(日期, 标的)`` 已有记录
+    时默认抛 :class:`forward_ledger.DuplicateRecordError`（不写任何文件），
+    只有 ``overwrite=True``（CLI ``--overwrite``）才替换；被替换的旧记录摘要
+    保留在 ``superseded``，已结算数值也不丢。
+
+    ``as_of``（CLI ``--as-of``）同时透传给 ``cli.py --as-of``，让回放真正按
+    该日期截断行情，而不只是改文件名。
 
     issue #119：默认先查官方交易日历，``closed is True``（休市）或
     ``closed is None``（日历不可用、无法确认）都抛
@@ -159,7 +186,10 @@ def record(codes, ledger_dir=None, ledger_only=False, runner=None,
     ``allow_non_trading_day`` 显式放行并打印警告。
     ``day`` 仅测试注入（同时作为建议日期的兜底），生产路径不得传。
     """
-    _check_trading_day(allow_non_trading_day, day)
+    # 闸门校验的是**目标写入日**：`--as-of` 回放优先，否则 `day`（测试注入）
+    # 或运行日。回放历史交易日不应因为「今天恰好是周末」被拒。
+    _check_trading_day(allow_non_trading_day,
+                       _as_date(as_of) if as_of else day)
     existing = set()
     if LOG.exists():
         with LOG.open(encoding="utf-8", newline="") as f:
@@ -170,12 +200,14 @@ def record(codes, ledger_dir=None, ledger_only=False, runner=None,
 
     grouped, payloads = {}, {}
     for code in codes:
-        rec, payload = ledger.collect_record(code, runner=runner, now=day)
+        rec, payload = ledger.collect_record(code, as_of=as_of, runner=runner,
+                                             now=day)
         grouped.setdefault(rec["as_of"], {})[rec["code"]] = rec
         payloads[rec["code"]] = payload
 
     # issue #134：先整体检查冲突，再写任何文件。默认拒绝；显式 --overwrite
-    # 时对「已有已结算记录」逐条告警 —— 覆盖会连带丢掉历史结算数值。
+    # 时对「已有已结算记录」逐条告警 —— 旧结算数值会保留进 superseded[]，
+    # 但仍应让操作员知道本次替换掉了已结算结论。
     conflicts = ledger.find_conflicts(grouped, ledger_dir=ledger_dir)
     if conflicts and not overwrite:
         raise ledger.DuplicateRecordError(conflicts)
@@ -185,8 +217,8 @@ def record(codes, ledger_dir=None, ledger_only=False, runner=None,
                    or {}).get(code) or {}
             if ledger.has_settlement(old):
                 print(f"[forward_log] !!! 警告：{day_key}/{code} 已有已结算记录，"
-                      "--overwrite 将用本次结果替换，历史结算数值会丢失。",
-                      file=sys.stderr)
+                      "--overwrite 将用本次结果替换；旧记录（含结算数值）"
+                      "已保留在该记录的 superseded[]。", file=sys.stderr)
 
     written = ledger.write_records(grouped, ledger_dir=ledger_dir,
                                    overwrite=overwrite)
@@ -198,11 +230,11 @@ def record(codes, ledger_dir=None, ledger_only=False, runner=None,
     for day_key, recs in sorted(written.items()):
         for code, rec in sorted(recs.items()):
             missing = len(rec.get("missing") or {})
-            lag = rec.get("data_lag_days")
+            lag = rec.get("data_lag_calendar_days")
             lag_note = ""
             if isinstance(lag, int) and lag > 0:
                 lag_note = (f"（data_end={rec.get('data_end')}，"
-                            f"data_lag_days={lag}）")
+                            f"data_lag_calendar_days={lag}）")
                 lagged.append((day_key, code, lag))
             print(f"  {code}: {rec.get('action')} status={rec.get('status')} "
                   f"confidence={rec.get('confidence')} as_of={day_key}"
@@ -212,7 +244,7 @@ def record(codes, ledger_dir=None, ledger_only=False, runner=None,
         # issue #134：数据滞后必须可见 —— 否则「基金净值还没入库」只能靠
         # 事后翻台账发现（这正是这次误报成「只记了 2/10」的原因）。
         print(f"[forward_log] 数据滞后：{len(lagged)} 条记录的 data.end 早于建议"
-              f"日期（最大 {max(lag for _, _, lag in lagged)} 天）—— "
+              f"日期（最大 {max(lag for _, _, lag in lagged)} 个自然日）—— "
               "记录仍按建议日期落盘，不写进前一交易日。")
     if ledger_only:
         return written
@@ -350,6 +382,22 @@ def report(ledger_dir=None, as_json=False):
     return data
 
 
+def _as_of_arg(value):
+    """``--as-of`` 的入参校验（与 ``cli.py`` 同两种写法：YYYYMMDD / YYYY-MM-DD）。"""
+    text = str(value).strip()
+    shaped = ((len(text) == 10 and text[4] == "-" and text[7] == "-")
+              or (len(text) == 8 and text.isdigit()))
+    if shaped:
+        for fmt in ("%Y-%m-%d", "%Y%m%d"):
+            try:
+                datetime.strptime(text, fmt)
+                return text
+            except ValueError:
+                continue
+    raise argparse.ArgumentTypeError(
+        f"--as-of 需要 YYYY-MM-DD 或 YYYYMMDD 格式的有效日期，收到 {value!r}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["record", "evaluate", "report"])
@@ -363,15 +411,22 @@ def main():
                           f"退出码 {EXIT_NON_TRADING_DAY}），并打印警告"))
     ap.add_argument("--overwrite", action="store_true",
                     help=("record 时允许覆盖同 (日期, 标的) 既有记录"
-                          f"（默认拒绝，退出码 {EXIT_DUPLICATE_RECORD}）"))
+                          f"（默认拒绝，退出码 {EXIT_DUPLICATE_RECORD}）；"
+                          "被替换的旧记录摘要保留在 superseded[]"))
+    ap.add_argument("--as-of", dest="as_of", default=None, metavar="YYYY-MM-DD",
+                    type=_as_of_arg,
+                    help=("record 的历史回放日期：透传 cli.py --as-of（截断行情）"
+                          "并作为台账写入日期；缺省为运行日"))
     ap.add_argument("--json", action="store_true", help="report 输出机读 JSON")
     a = ap.parse_args()
+    if a.as_of and a.mode != "record":
+        ap.error("--as-of 只用于 record")
     codes = [c.strip() for c in a.codes.split(",") if c.strip()] or DEFAULT_CODES
     if a.mode == "record":
         try:
             record(codes, ledger_dir=a.ledger_dir, ledger_only=a.ledger_only,
                    allow_non_trading_day=a.allow_non_trading_day,
-                   overwrite=a.overwrite)
+                   overwrite=a.overwrite, as_of=a.as_of)
         except NonTradingDayError as exc:
             print(f"[forward_log] {exc}", file=sys.stderr)
             sys.exit(EXIT_NON_TRADING_DAY)
