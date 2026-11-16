@@ -38,6 +38,9 @@ from stock_analysis import advice_render as advice_render_module  # noqa: E402
 from stock_analysis.advice_render import (  # noqa: E402
     COMPACT_GLOSSARY,
     COMPACT_PHRASES,
+    CONFIDENCE_GRADE_LABELS,
+    CONFIDENCE_HIGH_MIN,
+    CONFIDENCE_MEDIUM_MIN,
     render_advice,
 )
 
@@ -265,9 +268,9 @@ def test_t2_gate_is_first_advice_line(name, reason):
 
 
 @pytest.mark.parametrize("name,action_line", [
-    ("suspended", "动作 avoid｜置信 0%"),
-    ("one_word_up", "动作 avoid｜置信 0%"),
-    ("st_warning", "动作 hold｜置信 66%"),
+    ("suspended", "动作 avoid｜置信 0%（低）"),
+    ("one_word_up", "动作 avoid｜置信 0%（低）"),
+    ("st_warning", "动作 hold｜置信 66%（中）"),
 ])
 def test_t2_action_and_confidence_are_not_rewritten(name, action_line):
     output = _render(name)
@@ -601,6 +604,148 @@ def test_t5_stale_has_date_and_no_buy_wording():
     assert "2026-11-10 数据" in flow_line
     assert "买入" not in flow_line
     assert "建议" not in flow_line
+
+
+# ---------------------------------------------------------------------------
+# 置信可读分级：只映射已有数值，不重算、缺失不编造
+# ---------------------------------------------------------------------------
+def _confidence_payload(confidence):
+    """最小 payload（600519 / 600000 范围内，不含任何真实持仓代码）。"""
+    return {
+        "instrument": {
+            "code": "600519", "name": "示例酒业",
+            "is_st": False, "is_suspended": None,
+            "quote_stale": False, "status_source": "tencent_quote",
+        },
+        "recommendation": {"action": "hold", "confidence": confidence},
+    }
+
+
+def _action_line_of(text: str) -> str:
+    return next(line for line in text.splitlines() if line.startswith("动作 "))
+
+
+def test_confidence_grade_thresholds_are_explicit():
+    """分级阈值写死在常量里，边界取「大于等于」。"""
+    assert (CONFIDENCE_HIGH_MIN, CONFIDENCE_MEDIUM_MIN) == (0.75, 0.5)
+    assert CONFIDENCE_GRADE_LABELS == {"high": "高", "medium": "中", "low": "低"}
+
+
+def test_confidence_grade_high_boundary_is_inclusive():
+    """0.75 属于「高」；0.749 仍属「中」。"""
+    assert _action_line_of(render_advice(
+        _confidence_payload(0.75))) == "动作 hold｜置信 75%（高）"
+    assert _action_line_of(render_advice(
+        _confidence_payload(0.749))) == "动作 hold｜置信 74.9%（中）"
+
+
+def test_confidence_grade_medium_boundary_is_inclusive():
+    """0.5 属于「中」；0.499 属于「低」。"""
+    assert _action_line_of(render_advice(
+        _confidence_payload(0.5))) == "动作 hold｜置信 50%（中）"
+    assert _action_line_of(render_advice(
+        _confidence_payload(0.499))) == "动作 hold｜置信 49.9%（低）"
+
+
+@pytest.mark.parametrize("confidence", [None, "abc", True])
+def test_confidence_missing_is_omitted_never_invented(confidence):
+    """confidence 缺失/不可用：整段「置信 …」消失，不编数值也不编分级。"""
+    line = _action_line_of(render_advice(_confidence_payload(confidence)))
+    assert line == "动作 hold"
+    assert "置信" not in line
+
+
+def test_confidence_grade_does_not_change_json_value():
+    """渲染不修改入参；等级只是对已有数值的映射。"""
+    payload = _confidence_payload(0.63)
+    original = copy.deepcopy(payload)
+    line = _action_line_of(render_advice(payload))
+    assert line == "动作 hold｜置信 63%（中）"
+    assert payload == original
+
+
+# ---------------------------------------------------------------------------
+# 可关闭的解释性文本：免责行 / regime 括注（数据告警与闸门不受影响）
+# ---------------------------------------------------------------------------
+def _tone_payload():
+    """600519 人设（虚构名称），同时带数据告警、可执行性闸门与 regime 冲突。"""
+    return {
+        "instrument": {
+            "code": "600519", "name": "示例酒业",
+            "is_st": True, "is_st_source": "exchange_list",
+            "is_suspended": None, "quote_stale": False,
+            "status_source": "tencent_quote",
+        },
+        "data": {
+            "last_close": 1500.0, "end": "2026-11-13",
+            "expected_date": "2026-11-13", "stale": False, "lag_days": 0,
+        },
+        "recommendation": {
+            "action": "hold", "confidence": 0.63,
+            "action_reason": ["示例依据"],
+        },
+        "market_regime": {
+            "label": "Bull", "confidence": 0.7,
+            "index": {"label": "Shock", "confidence": 0.5},
+        },
+        "diagnostics": {"warnings": ["示例数据告警（不影响判定）"]},
+        "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。",
+    }
+
+
+def _without(text: str, prefix: str):
+    return [line for line in text.splitlines() if not line.startswith(prefix)]
+
+
+def test_tone_defaults_match_explicit_true():
+    """默认值即 True；显式传参不得改变任何字节。"""
+    payload = _tone_payload()
+    default = render_advice(payload)
+    explicit = render_advice(payload, include_disclaimer=True,
+                             include_regime_note=True)
+    assert default == explicit
+    assert "免责声明：" in default
+    assert "⚠️ 大盘逆风" in default
+
+
+def test_tone_disclaimer_kept_regime_note_off():
+    """只关 regime 括注：免责行、数据告警与闸门原样保留。"""
+    payload = _tone_payload()
+    default = render_advice(payload)
+    output = render_advice(payload, include_regime_note=False)
+    assert "大盘逆风" not in output
+    assert "免责声明：" in output
+    assert "⚠️ 数据: 示例数据告警（不影响判定）" in output
+    assert "【今日不建议执行】ST 风险警示股" in output
+    assert _without(output, "⚠️ 大盘") == _without(default, "⚠️ 大盘")
+
+
+def test_tone_disclaimer_off_regime_note_kept():
+    """只关免责行：regime 括注、数据告警与闸门原样保留。"""
+    payload = _tone_payload()
+    default = render_advice(payload)
+    output = render_advice(payload, include_disclaimer=False)
+    assert "免责声明：" not in output
+    assert "⚠️ 大盘逆风" in output
+    assert "⚠️ 数据: 示例数据告警（不影响判定）" in output
+    assert "【今日不建议执行】ST 风险警示股" in output
+    assert _without(output, "免责声明：") == _without(default, "免责声明：")
+
+
+def test_tone_both_off_keeps_warnings_and_gate():
+    """两个开关都关：只少两类解释性文本，判定/告警/闸门逐行不变。"""
+    payload = _tone_payload()
+    default = render_advice(payload)
+    output = render_advice(payload, include_disclaimer=False,
+                           include_regime_note=False)
+    assert "免责声明：" not in output
+    assert "大盘逆风" not in output
+    assert "⚠️ 数据: 示例数据告警（不影响判定）" in output
+    assert "【今日不建议执行】ST 风险警示股" in output
+    assert "动作 hold｜置信 63%（中）" in output
+    expected = [line for line in _without(default, "免责声明：")
+                if not line.startswith("⚠️ 大盘")]
+    assert output.splitlines() == expected
 
 
 # ---------------------------------------------------------------------------
@@ -1336,6 +1481,24 @@ def test_tool_wrapper_compact_flag():
     assert normal.returncode == 0 and compact.returncode == 0
     assert "P0-3" in normal.stdout
     assert "P0-3" not in compact.stdout
+
+
+def test_tool_wrapper_tone_switches():
+    """--no-disclaimer / --no-regime-note 只去掉两类解释性文本。"""
+    payload = _tone_payload()
+    payload["instrument"]["code"] = "600000"
+    payload["instrument"]["name"] = "示例银行"
+    stdin = json.dumps(payload, ensure_ascii=False)
+    normal = _run_tool(stdin=stdin)
+    quiet = _run_tool("--no-disclaimer", "--no-regime-note", stdin=stdin)
+    assert normal.returncode == 0, normal.stderr
+    assert quiet.returncode == 0, quiet.stderr
+    assert "免责声明：" in normal.stdout
+    assert "大盘逆风" in normal.stdout
+    assert "免责声明：" not in quiet.stdout
+    assert "大盘逆风" not in quiet.stdout
+    assert "⚠️ 数据: 示例数据告警（不影响判定）" in quiet.stdout
+    assert "【今日不建议执行】ST 风险警示股" in quiet.stdout
 
 
 def test_tool_wrapper_rejects_invalid_json():

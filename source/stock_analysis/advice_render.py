@@ -22,7 +22,15 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
 * **纯函数**：``render_advice(payload)`` 不修改入参、不读写文件、**不发起任何
   网络请求**（本模块只 import 标准库）。
 * **只描述事实**：不重算 ``action`` / ``confidence`` / 价位，不把建议写成下单
-  指令；仓位一律写作「建议仓位」，并保留免责行。
+  指令；仓位一律写作「建议仓位」。
+* **可关闭的解释性文本**：``include_disclaimer`` / ``include_regime_note``
+  默认 ``True``（保持既有投递口径，向后兼容）；自用场景可关掉免责行与
+  「大盘逆风/顺风」括注。**数据正确性告警（``⚠️ 数据:``）与「今日不建议
+  执行」闸门不受这两个开关影响**。
+* 置信分级只是把 ``recommendation.confidence`` 的**已有数值**映射成可读标签：
+  ``>= 0.75`` 高、``>= 0.5`` 中、``< 0.5`` 低（常量见
+  :data:`CONFIDENCE_HIGH_MIN` / :data:`CONFIDENCE_MEDIUM_MIN`）。渲染层
+  **不重算、不调整**置信；置信缺失时整段「置信 …」消失，绝不编造。
 * **None 整段消失**：任何可选字段缺失时，对应句子/段落整体不出现，输出中
   不允许出现字符串 ``None``。
 * **零新依赖**。
@@ -117,6 +125,9 @@ __all__ = [
     "MARKET_WATCH_MARK",
     "PERCENTILE_WINDOW_DAYS",
     "DEFAULT_DISCLAIMER",
+    "CONFIDENCE_HIGH_MIN",
+    "CONFIDENCE_MEDIUM_MIN",
+    "CONFIDENCE_GRADE_LABELS",
 ]
 
 #: 与 ``data_loader.valuation.PERCENTILE_WINDOW_DAYS`` 保持同一口径。
@@ -130,6 +141,13 @@ CALIBER_LABELS = {
 }
 
 DEFAULT_DISCLAIMER = "本结果不构成投资建议，市场有风险，投资需谨慎。"
+
+#: 置信度分级阈值（边界取「大于等于」）：``>= 0.75`` 高、``>= 0.5`` 中、
+#: ``< 0.5`` 低。分级只对 ``recommendation.confidence`` 的**已有数值**做
+#: 查表映射，渲染层绝不自己另算置信。
+CONFIDENCE_HIGH_MIN = 0.75
+CONFIDENCE_MEDIUM_MIN = 0.5
+CONFIDENCE_GRADE_LABELS = {"high": "高", "medium": "中", "low": "低"}
 
 # ---------------------------------------------------------------------------
 # T7：事件风险阈值（写死在代码里；理由见 docs/EVENT_RISK.md）
@@ -792,14 +810,35 @@ def _price_line(payload: Dict[str, Any]) -> str:
     return head
 
 
+def _confidence_grade(value) -> Optional[str]:
+    """已有置信数值 → 分级标签；缺失 / 非有限数返回 ``None``（不编造）。"""
+    number = _num(value)
+    if number is None:
+        return None
+    if number >= CONFIDENCE_HIGH_MIN:
+        return CONFIDENCE_GRADE_LABELS["high"]
+    if number >= CONFIDENCE_MEDIUM_MIN:
+        return CONFIDENCE_GRADE_LABELS["medium"]
+    return CONFIDENCE_GRADE_LABELS["low"]
+
+
 def _action_line(rec: Dict[str, Any]) -> Optional[str]:
+    """``动作 {action}｜置信 {pct}（{分级}）``。
+
+    置信与分级都只展示 ``recommendation.confidence`` 的**已有数值**：分级是
+    常量阈值的查表映射（:data:`CONFIDENCE_HIGH_MIN` /
+    :data:`CONFIDENCE_MEDIUM_MIN`），渲染层不重算、不调整。置信缺失时整段
+    「置信 …」消失，绝不编造数值或分级。
+    """
     action = _text(rec.get("action"))
     confidence = _fmt_pct(rec.get("confidence"))
+    grade = _confidence_grade(rec.get("confidence"))
     parts = []
     if action:
         parts.append(f"动作 {action}")
     if confidence:
-        parts.append(f"置信 {confidence}")
+        parts.append(f"置信 {confidence}（{grade}）" if grade
+                     else f"置信 {confidence}")
     return "｜".join(parts) or None
 
 
@@ -1380,7 +1419,9 @@ def _events_lines(payload: Dict[str, Any]) -> List[str]:
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
-def render_advice(payload: dict, compact: bool = False) -> str:
+def render_advice(payload: dict, compact: bool = False, *,
+                  include_disclaimer: bool = True,
+                  include_regime_note: bool = True) -> str:
     """把 ``cli.py --json`` 的完整响应渲染成一段可直接投递的文本。
 
     纯函数：不改入参、不读文件、不触网。缺失字段对应的句子/段落整体消失，
@@ -1392,6 +1433,11 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     （词边界匹配、语序/标点变体、只吸收压缩引入的空格）；其余行与默认输出
     完全一致。整条 warning 都是内部细节时该行整体消失，绝不改写词表之外的
     原措辞。不变量见模块 docstring。
+
+    ``include_disclaimer=False``：不输出末尾免责行，其余行不变。
+    ``include_regime_note=False``：不输出「⚠️ 大盘逆风/顺风 …」括注行，其余
+    行（含判定、仓位、价位、数据告警与「今日不建议执行」闸门）一律不变。
+    两个开关都默认 ``True``，默认输出与显式传 ``True`` 逐字节一致。
     """
     document = _dict(payload)
     rec = _dict(document.get("recommendation"))
@@ -1456,9 +1502,10 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     if levels:
         lines.append(levels)
 
-    regime = _regime_line(document)
-    if regime:
-        lines.append(regime)
+    if include_regime_note:
+        regime = _regime_line(document)
+        if regime:
+            lines.append(regime)
 
     valuation = _valuation_line(document)
     if valuation:
@@ -1472,6 +1519,7 @@ def render_advice(payload: dict, compact: bool = False) -> str:
     if reason:
         lines.append(reason)
 
-    disclaimer = _text(document.get("disclaimer")) or DEFAULT_DISCLAIMER
-    lines.append(f"免责声明：{disclaimer}")
+    if include_disclaimer:
+        disclaimer = _text(document.get("disclaimer")) or DEFAULT_DISCLAIMER
+        lines.append(f"免责声明：{disclaimer}")
     return "\n".join(lines)

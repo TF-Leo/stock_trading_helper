@@ -479,8 +479,8 @@ def test_render_does_not_rewrite_action_or_confidence():
     with_events = _render(lockup=_section([_lockup_item()]),
                           pledge=_section([_pledge_item()]))
     without = _render()
-    assert "动作 buy｜置信 72%" in with_events
-    assert "动作 buy｜置信 72%" in without
+    assert "动作 buy｜置信 72%（中）" in with_events
+    assert "动作 buy｜置信 72%（中）" in without
     stripped = [line for line in with_events.splitlines()
                 if not line.startswith("⚠️ 解禁")
                 and not line.startswith("⚠️ 股权质押")]

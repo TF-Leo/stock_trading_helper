@@ -1105,6 +1105,35 @@ source/.venv/bin/python cli.py 600519 --json --fast \
 `source/stock_analysis/advice_render.py` 的模块 docstring。`--compact` 只压缩
 `diagnostics.warnings`，其余行与默认输出逐字节一致。
 
+### 置信分级（只映射已有数值）
+
+动作行输出 `动作 hold｜置信 63%（中）`。分级阈值是模块常量：
+
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `CONFIDENCE_HIGH_MIN` | `0.75` | `confidence >= 0.75` → **高** |
+| `CONFIDENCE_MEDIUM_MIN` | `0.5` | `confidence >= 0.5` → **中**；`< 0.5` → **低** |
+
+分级**只是**把 `recommendation.confidence` 的已有数值查表映射成可读标签，
+渲染层不重算、不调整置信；`confidence` 缺失或非有限数时整段「置信 …」消失，
+绝不编造数值或分级。
+
+### 可关闭的解释性文本
+
+自用场景可以关掉免责行与「大盘顺风/逆风」口径提示，两者默认仍输出：
+
+```bash
+# 两种都关；数据告警与「今日不建议执行」闸门不受影响
+source/.venv/bin/python cli.py 600519 --json --fast \
+  | source/.venv/bin/python tools/render_advice.py --no-disclaimer --no-regime-note
+```
+
+函数签名：`render_advice(payload, compact=False, *, include_disclaimer=True,
+include_regime_note=True)`；命令行对应 `--no-disclaimer` / `--no-regime-note`。
+`include_regime_note=False` 只去掉 `⚠️ 大盘逆风/顺风 …（仅提示口径差异，不改变建议）`
+这一行，**不影响**任何判定或其他行；`include_disclaimer=False` 只去掉末尾免责行；
+`⚠️ 数据:` 告警与「今日不建议执行」闸门**不受这两个开关影响**。
+
 渲染的上下文行：仓位/持有期/复审日（T1）、可执行性闸门（T2）、regime 冲突（T3）、
 估值分位（T4）、资金流方向（T5），以及**交易所重点监控命中（T6）**——
 `evidence.market_watch.hit.listed is True` 时输出

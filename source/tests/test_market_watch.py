@@ -604,8 +604,8 @@ def test_render_does_not_rewrite_action_or_confidence():
     """T6 只加一行事实，绝不改写 action / confidence。"""
     with_hit = render_advice(_payload())
     without = render_advice(_payload(hit=False))
-    assert "动作 buy｜置信 72%" in with_hit
-    assert "动作 buy｜置信 72%" in without
+    assert "动作 buy｜置信 72%（中）" in with_hit
+    assert "动作 buy｜置信 72%（中）" in without
     stripped = [line for line in with_hit.splitlines()
                 if MARKET_WATCH_MARK not in line]
     assert stripped == without.splitlines()
