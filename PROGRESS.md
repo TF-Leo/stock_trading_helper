@@ -58,7 +58,7 @@
     last_close 与缓存一致）；`python tools/probe.py error_shape` → PASS
     （600519 / 510300 错误路径 missing_paths=0）。首次 `probe.py all` 与全量
     pytest 并发跑，两项因此 BLOCKED/FAIL（读本地行情缓存争用）；串行重跑
-    单独 PASS，随后串行重跑 `probe.py all` 结果见 PR 描述。
+    `python tools/probe.py all` → **41/41 PASS**（退出码 0）。
 - **未验证**：`tools/check_gates.ps1` —— 本机无 `pwsh`（与前几轮同）；
   以全量 pytest + `tools/probe.py` 为运行时裁定器。未探测东财真实端点，
   全部用桩。
