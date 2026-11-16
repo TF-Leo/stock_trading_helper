@@ -45,7 +45,6 @@ import precompute_events as pe  # noqa: E402
 import precompute_flow as flow_tool  # noqa: E402
 import precompute_st_list as st_tool  # noqa: E402
 
-REF_DAY = "2026-11-13"
 NOW = dt.datetime(2026, 11, 13, 18, 35)
 NOW_TS = NOW.timestamp()
 
