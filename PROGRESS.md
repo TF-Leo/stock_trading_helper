@@ -30,7 +30,7 @@
   形态快照（买/未触发/卖风控/avoid/场外基金风控止盈）＋三种触发形态（风控
   止损、指标信号当日、无历史卖点）＋来源不可判定/无 signal 块两种兜底＋
   仓位三形态（空仓 hold 双列、0 仓位不重复、极小正仓位不重复、非 0 目标不
-  追加）。`test_advice_render.py` 同步更新 6 处旧文案断言与 1 份 fixture
+  追加）。`test_advice_render.py` 同步更新 4 处旧文案断言与 1 份 fixture
   `normal_buy.expected.txt`（**契约变更导致的文案变化，不是放宽判定**）。
   标的只用 600519 / 600000。
 - **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5，venv 取自
