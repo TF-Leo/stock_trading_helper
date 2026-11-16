@@ -17,15 +17,17 @@
     * ``GET https://query.sse.com.cn/sseQuery/commonQuery.do``
       （``sqlId=COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L``，``STOCK_TYPE=1,8``，
       ``COMPANY_STATUS=2,4,5,7,8``）→ **HTTP 200 / 2,293,163 B JSON**，
-      ``pageHelp.total=2319``、单页上限 **2000** 行；字段
+      未过滤全表 ``pageHelp.total=2319``、单页上限 **2000** 行；字段
       ``A_STOCK_CODE`` / ``SEC_NAME_CN`` / ``STATE_CODE`` / ``LIST_BOARD``。
-      实测 ``STATE_CODE=7``（``STATE_CODE_STOCK=8``）恰好等于名称带
-      ``ST``/``*ST`` 的 **78 行**（含 10 只科创板 688）。因此本模块用
-      ``COMPANY_STATUS=7`` 只取风险警示状态，并用
-      ``len(result)==pageHelp.total`` 与「每行 STATE_CODE 必须为 7」双重
-      校验：过滤若未生效（返回 2000/2319 的全表）就显式失败，绝不当成
-      完整名单。该过滤参数**未单独实测**（预算内只发了 1 次数据请求），
-      失败模式见 :func:`fetch_sse_st_list`。
+      2026-11-16 复核（``COMPANY_STATUS=7`` 过滤后）：``pageHelp.total=80``、
+      ``pageCount=1``、``pageSize=2000`` —— 单页装得下，**没有截断**；
+      80 行全部 ``STATE_CODE=7``，其中名称带 ``ST``/``*ST`` 的也是 **80 行**
+      （含 **12 只科创板 688**；2026-11-15 首测记的 78/10 是旧快照）。
+      因此本模块用 ``COMPANY_STATUS=7`` 只取风险警示状态，并用
+      ``len(result)==pageHelp.total``、``total<=pageSize``、
+      ``pageCount==1`` 与「每行 STATE_CODE 必须为 7」多重校验：过滤若未
+      生效（返回 2000/2319 的全表）或将来超过单页上限就显式失败，绝不当成
+      完整名单。
     * 覆盖：沪市 A 股（主板 600/601/603/605 + 科创板 688），不含 B 股。
 
 深交所（SZSE）
@@ -34,13 +36,22 @@
       data-s-catalog-id="fxjsb">``。
     * ``GET https://www.szse.cn/api/report/ShowReport/data``
       （``SHOWTYPE=JSON&CATALOGID=fxjsb&TABKEY=tab1&PAGENO=1``）→
-      **HTTP 200 / 3,915 B JSON**；``metadata`` 给出
-      ``name=风险警示股票``、``subname=2026-11-13``、``pagesize=20``、
-      ``pagecount=6``、``recordcount=115``；行字段只有 ``zqdm``（证券代码）
-      与 ``gsjc``（公司简称，值里含 ``<a><u>…</u></a>`` HTML）。``PAGESIZE``
-      参数被服务端忽略（仍固定 20/页），因此本模块**串行翻页**并在取完后
-      校验 ``sum(rows)==recordcount``；不完整就显式失败。
-    * 覆盖：深市 A 股（000/001/002/003/300），不含 B 股。
+      **HTTP 200 / 3,915 B JSON**；响应是**两个数据块**：
+      ``tab1`` = ``风险警示股票``、``tab2`` = ``退市整理股票``。``tab1`` 的
+      ``metadata`` 给出 ``pagesize=20``、``pagecount=6``、
+      ``recordcount=115``（2026-11-16 复核仍为 6 页/115 条）；行字段只有
+      ``zqdm``（证券代码）与 ``gsjc``（公司简称，值里含 ``<a><u>…</u></a>``
+      HTML）。``PAGESIZE`` 参数被服务端忽略（仍固定 20/页），因此本模块
+      **串行翻页**并在取完后校验 ``sum(rows)==recordcount``；不完整就显式失败。
+      取块时**必须**按 ``metadata.tabkey`` 命中 ``tab1``：早期实现在「顶层
+      只有一个块」时直接取 ``payload[0]``，若服务端只回 ``tab2`` 就会把
+      退市整理名单静默当成风险警示名单。
+    * 覆盖：深市 A 股（000/001/002/003/300/301）**加 B 股**
+      （``200xxx``，2026-11-16 实测 115 条中含 ``200056 *ST皇庭B``、
+      ``200488 ST晨鸣B`` 两只）。B 股在深交所风险警示板内，官方口径就是
+      「风险警示股票」，所以**保留**：它们被写进名单后 ``is_st`` 只会对这些
+      代码生效，而本项目当前只交易 A 股，B 股代码不会进入候选池；若将来纳入
+      B 股，``is_st=True`` 是正确语义（B 股同样适用风险警示）。
 
 设计约束
 --------
@@ -65,9 +76,10 @@ import requests
 SSE_URL = "https://query.sse.com.cn/sseQuery/commonQuery.do"
 SSE_REFERER = "https://www.sse.com.cn/assortment/stock/list/share/"
 SSE_SQL_ID = "COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L"
-# 2026-11-15 实测：STATE_CODE=7 / STATE_CODE_STOCK=8 恰好是全部 78 条风险
-# 警示（名称均带 ST/*ST）。COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L 的 COMPANY_STATUS
-# 取值范围与 akshare 一致（2,4,5,7,8），7 即风险警示。
+# 2026-11-16 实测（COMPANY_STATUS=7）：pageHelp.total=80 / pageCount=1 /
+# pageSize=2000，80 行全部 STATE_CODE=7，名称均带 ST/*ST（含 12 只 688）。
+# COMMON_SSE_CP_GPJCTPZ_GPLB_GP_L 的 COMPANY_STATUS 取值范围与 akshare 一致
+# （2,4,5,7,8），7 即风险警示。
 SSE_RISK_STATUS = "7"
 SSE_PAGE_SIZE = 2000          # 服务端硬上限：请求 10000 也只回 2000
 SSE_COVERAGE = "沪A（官方，主板+科创板，不含B股）"
@@ -76,7 +88,7 @@ SZSE_URL = "https://www.szse.cn/api/report/ShowReport/data"
 SZSE_REFERER = "https://www.szse.cn/disclosure/listed/warn/index.html"
 SZSE_CATALOG_ID = "fxjsb"     # 风险警示板页面 data-s-catalog-id
 SZSE_TABKEY = "tab1"          # tab1=风险警示股票；tab2=退市整理股票
-SZSE_COVERAGE = "深A（官方，不含B股）"
+SZSE_COVERAGE = "深A+B（官方，风险警示板含 B 股）"
 SZSE_MAX_PAGES = 50           # 防御：官方若改成分页爆炸，不在探测上加码
 
 DEFAULT_TIMEOUT = 20.0
@@ -207,8 +219,9 @@ def fetch_sse_st_list(timeout=None) -> ExchangeStList:
     """上交所风险警示名单（1 个 HTTP 请求）。
 
     先用 ``COMPANY_STATUS=7`` 只取风险警示状态；再校验
-    ``len(result)==pageHelp.total`` 且每行 ``STATE_CODE=='7'``。过滤若未生效
-    （单页上限 2000、全表 2319）会显式失败，不会把截断名单当成完整名单。
+    ``len(result)==pageHelp.total``、``total<=pageSize`` 与 ``pageCount==1``
+    且每行 ``STATE_CODE=='7'``。过滤若未生效（单页上限 2000、全表 2319）或
+    风险警示数将来超过单页上限，都会显式失败，不会把截断名单当成完整名单。
     """
     params = {
         "STOCK_TYPE": "1,8",             # 主板 A 股 + 科创板
@@ -243,6 +256,24 @@ def fetch_sse_st_list(timeout=None) -> ExchangeStList:
     if total <= 0:
         raise StExchangeError(
             "上交所风险警示名单为空（total=0）：不能当成「今日没有 ST」", 1)
+    # 单页上限（2026-11-16 实测 pageHelp.pageSize=2000、pageCount=1）。本模块
+    # 只取第 1 页，若风险警示数超过单页上限，返回的必然是截断名单：显式失败，
+    # 不靠「len==total」兜底（服务端可能把 total 也改成当页行数）。
+    page_size = page_help.get("pageSize")
+    page_count = page_help.get("pageCount")
+    try:
+        page_size = int(page_size)
+        page_count = int(page_count)
+    except (TypeError, ValueError):
+        page_size = page_count = None
+    if page_size is not None and total > page_size:
+        raise StExchangeError(
+            f"上交所名单 total={total} 超过单页上限 {page_size}："
+            "需要分页才能取全，拒绝把第 1 页当成完整名单", 1)
+    if page_count is not None and page_count > 1:
+        raise StExchangeError(
+            f"上交所名单 pageCount={page_count}>1：需要分页才能取全，"
+            "拒绝把第 1 页当成完整名单", 1)
     if len(result) != total:
         raise StExchangeError(
             f"上交所名单不完整：返回 {len(result)} 行 / 自报 total={total}"
@@ -278,8 +309,10 @@ def fetch_sse_st_list(timeout=None) -> ExchangeStList:
 def fetch_szse_st_list(timeout=None) -> ExchangeStList:
     """深交所风险警示名单（按 ``metadata.pagecount`` 串行翻页，不重试）。
 
-    ``PAGESIZE`` 实测被忽略（固定 20/页）。取完必须满足
-    ``sum(rows)==metadata.recordcount``，否则显式失败。
+    ``PAGESIZE`` 实测被忽略（固定 20/页）。响应顶层通常同时含 ``tab1``
+    （风险警示股票）与 ``tab2``（退市整理股票），**每一页**都必须按
+    ``metadata.tabkey=='tab1'`` 命中，否则显式失败（issue #123）。取完必须
+    满足 ``sum(rows)==metadata.recordcount``，否则显式失败。
     """
     timeout = _timeout(timeout)
     rows: List[dict] = []
@@ -313,12 +346,19 @@ def fetch_szse_st_list(timeout=None) -> ExchangeStList:
                     metadata.get("tabkey") or "").lower() == SZSE_TABKEY:
                 item = candidate
                 break
-        if item is None and len(payload) == 1 and isinstance(payload[0], dict):
-            item = payload[0]
+        # 不匹配时的**单块回退已删除**（issue #123）：响应顶层通常同时含
+        # tab1（风险警示股票）与 tab2（退市整理股票）；早期实现只要顶层恰好
+        # 一个块就直接吃 payload[0]，服务端若只回 tab2 就会静默把「退市整理」
+        # 当成「风险警示」。现在 tabkey 不符即显式失败。
         if item is None:
+            tabkeys = [
+                str((candidate.get("metadata") or {}).get("tabkey") or "?")
+                if isinstance(candidate, dict) else "?"
+                for candidate in payload]
             raise StExchangeError(
                 f"深交所名单找不到 TABKEY={SZSE_TABKEY} 的数据块"
-                f"（第 {page_no} 页）", page_no)
+                f"（第 {page_no} 页；响应含 tabkey={tabkeys}）："
+                "拒绝把另一张表当成风险警示名单", page_no)
         metadata = item.get("metadata")
         data = item.get("data")
         if not isinstance(metadata, dict) or not isinstance(data, list):
@@ -413,11 +453,13 @@ def fetch_official_st_lists(timeout=None) -> OfficialListsResult:
                               requests=requests_made)
 
 
-def merge_lists(lists: Iterable[ExchangeStList]):
-    """合并两所名单：按代码取并集（任一源说是 ST 就是 ST）。
+def merge_lists_detailed(lists: Iterable[ExchangeStList]):
+    """合并两所名单，并返回**结构化**冲突条目。
 
-    返回 ``(rows, coverage, warning)``。同代码名称不一致时保留 ``*ST`` 优先，
-    并给出告警；只在一所出现的代码本来就不重叠（沪/深），不算冲突。
+    返回 ``(rows, coverage, warning, conflicts)``。``conflicts`` 是条目列表
+    （issue #123）：``{"kind": "name_mismatch", "count": n, "codes": [...],
+    "message": "..."}``；没有任何冲突时为空列表。``warning`` 是给人看的
+    汇总文案（保持原措辞）。
     """
     lists = list(lists)
     if not lists:
@@ -437,19 +479,35 @@ def merge_lists(lists: Iterable[ExchangeStList]):
                     merged[code] = dict(row)
     rows = [merged[code] for code in sorted(merged)]
     sources = {snapshot.source for snapshot in lists}
-    coverage = "沪深A（官方，不含北交所/B股）" if {"sse", "szse"} <= sources \
-        else "沪A（官方，不含B股）" if "sse" in sources else "深A（官方，不含B股）"
+    coverage = "沪深A+B（官方，不含北交所）" if {"sse", "szse"} <= sources \
+        else "沪A（官方，不含B股）" if "sse" in sources \
+        else "深A+B（官方，风险警示板含 B 股）"
+    conflicts: List[dict] = []
     warning = None
     if name_conflicts:
-        warning = (f"官方两源有 {len(name_conflicts)} 个代码名称不一致"
-                   f"（样例 {sorted(name_conflicts)[:8]}）；按「是 ST」取并集，"
-                   "*ST 优先")
+        codes = sorted(set(name_conflicts))
+        message = (f"官方两源有 {len(codes)} 个代码名称不一致"
+                   f"（样例 {codes[:8]}）；按「是 ST」取并集，*ST 优先")
+        conflicts.append({"kind": "name_mismatch", "count": len(codes),
+                          "codes": codes, "message": message})
+        warning = message
+    return rows, coverage, warning, conflicts
+
+
+def merge_lists(lists: Iterable[ExchangeStList]):
+    """合并两所名单：按代码取并集（任一源说是 ST 就是 ST）。
+
+    返回 ``(rows, coverage, warning)``。同代码名称不一致时保留 ``*ST`` 优先，
+    并给出告警；只在一所出现的代码本来就不重叠（沪/深），不算冲突。
+    需要结构化冲突条目时用 :func:`merge_lists_detailed`。
+    """
+    rows, coverage, warning, _conflicts = merge_lists_detailed(lists)
     return rows, coverage, warning
 
 
 def merge_to_frame(lists: Iterable[ExchangeStList]) -> pd.DataFrame:
     """合并结果 → DataFrame（列与东财 ST 表同构，供 status 侧复用）。"""
-    rows, coverage, warning = merge_lists(lists)
+    rows, coverage, warning, conflicts = merge_lists_detailed(lists)
     if not rows:
         raise StExchangeError("官方名单合并后为空：不能当成完整快照")
     frame = pd.DataFrame(rows, columns=["code", "name", "st_type", "market",
@@ -457,6 +515,8 @@ def merge_to_frame(lists: Iterable[ExchangeStList]) -> pd.DataFrame:
     frame.attrs["coverage"] = coverage
     if warning:
         frame.attrs["warning"] = warning
+    if conflicts:
+        frame.attrs["conflicts"] = conflicts
     return frame
 
 

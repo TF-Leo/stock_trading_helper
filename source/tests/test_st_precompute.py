@@ -488,7 +488,8 @@ def test_official_fallback_writes_cache_when_eastmoney_blocked(monkeypatch):
     assert payload["source"] == "exchange"
     assert payload["merged_from"] == ["sse", "szse"]
     assert payload["codes"] == ["000002", "600001"]
-    assert payload["coverage"].startswith("沪深A（官方")
+    assert payload["coverage"].startswith("沪深A+B（官方"), \
+        "issue #123：深市 fxjsb 实含 B 股，覆盖文案必须写出来"
 
 
 def test_incomplete_official_never_overwrites_good_cache(monkeypatch):
@@ -548,10 +549,19 @@ def test_eastmoney_and_official_merge_conflict_takes_union(monkeypatch):
     assert stats["source"] == "eastmoney"
     assert stats["merged_from"] == ["eastmoney", "sse", "szse"]
     assert stats["count"] == 4, "并集：600001/600003/830001 + 000002"
-    conflict = stats["conflicts"] or ""
+    conflicts = stats["conflicts"]
+    assert isinstance(conflicts, list), "issue #123：conflicts 是条目列表"
+    kinds = {item["kind"] for item in conflicts}
+    assert kinds == {"name_mismatch", "east_only", "official_only"}, kinds
+    for item in conflicts:
+        assert set(item) == {"kind", "count", "codes", "message"}
+        assert item["count"] == len(item["codes"])
+    conflict = stats["conflict_summary"] or ""
     for needle in ("两源冲突", "名称不一致", "东财独有", "官方独有", "是 ST"):
         assert needle in conflict, (needle, conflict)
     assert "830001" not in conflict, "北交所不在官方覆盖内，不算冲突"
+    assert all("830001" not in item["codes"] for item in conflicts)
+    assert stats["reason"] == conflict
 
     payload = json.loads(Path(status.cache_path()).read_text(encoding="utf-8"))
     assert payload["merged_from"] == ["eastmoney", "sse", "szse"]
@@ -615,6 +625,7 @@ def test_partial_official_does_not_flag_uncovered_market(monkeypatch):
     assert stats["ok"] is True
     assert stats["merged_from"] == ["eastmoney", "sse"]
     assert stats["count"] == 2
-    conflict = stats["conflicts"] or ""
+    assert stats["conflicts"] == [], stats["conflicts"]
+    conflict = stats["conflict_summary"] or ""
     assert "东财独有" not in conflict, conflict
     assert "两源冲突" not in conflict, conflict
