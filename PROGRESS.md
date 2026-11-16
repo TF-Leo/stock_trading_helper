@@ -1,5 +1,54 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-17 · issue #139：超过建议持有期的文案矛盾（**不改判定逻辑**）
+
+- **分支**：`task/horizon-wording`（父 `origin/main` = `e4cd804`），未合并。
+  目标（`PROGRESS.md` 顶部唯一目标）：修三处**说法**，动作/仓位/价位逐字不变。
+- **背景（已确认，不重新论证）**：`decision/policy.py` 的 horizon **只做时间止损**
+  （`bars_held >= horizon and close <= entry_price` 才出场），盈利仓位可无限期持有；
+  历史逐日回放 3645 天里 89 天 `bars_held > 20`、最长 46 日。**未**改成时间止盈。
+- **改动 1（渲染层，`decision/render.py`）**：`hold` + `holding` 且
+  `bars_held > horizon` 时，在「持有中（第 N/H 个交易日…）」后补
+  「；已超建议持有期 {N−H} 日（不强制退出）」。未超期时该措辞**不出现**。
+  超期天数按实算，不固定写 1（实测 46/20 → 超 26 日；2020-11-10 实跑 77/20 → 超 57 日）。
+- **改动 2（`decision/sizing.py::build_invalidation`）**：持仓态不再写
+  「{n} 个交易日内未触发入场」（入场早已触发，与「已持仓」自相矛盾），改为
+  「…或满 {n} 个交易日仍低于入场价（时间止损）」—— 描述的是 `policy.run_policy`
+  **同一条**规则，不是新条件。空仓态文案逐字不变；`holding` 默认 `False`，
+  既有调用方不受影响。**PR 单列「无逻辑变更」+ `decide()` 全组合对拍**（见下）。
+- **改动 3（horizon 口径统一为交易日）**：回测 `avg_holding_days` 是**自然日**
+  （`engine.py` 的 `(exit_date - entry_date).days`），horizon 全链路是**交易日**。
+  新增 `sizing.calendar_days_to_trading_days()` + `derive_horizon_from_calendar()`，
+  `cli.py` 改用后者（`derive_horizon` 本身口径不变、仍收交易日）。
+  实测：600519 平均持仓 27.65 自然日 → 旧「42 个交易日」，新「30 个交易日」。
+  另修 `advice_render.py` 事件窗口注释与 `docs/EVENT_RISK.md` 的
+  「20 自然日 = 20 日持有期同一尺度」错误等价（20 交易日≈28 自然日）；**窗口取值未改**。
+- **未改**：任何阈值/条件/取值；`--json` 结构与键（仅字符串内容变化）；`source/tests/`
+  既有断言未放宽（仅新增测试文件）。
+- **测试**：新增 `source/tests/test_horizon_wording_139.py`（15 项）——三种形态
+  （持仓未超期 / 持仓超期 / 空仓观望）+ invalidation 两态 + 单位换算 + `decide()`
+  192 组合对拍。标的只用 600519 / 600000。
+- **证据（本机 Linux，Python 3.14.7 / pytest 8.3.5，worktree `.venv` 由
+  `uv pip install -r source/requirements.txt` 建立）**：
+  - `python -m pytest tests/ -q` → **1256 passed in 108.68s**（基线 1241）。
+  - `python -m pytest tests/test_horizon_wording_139.py -q` → **15 passed**。
+  - `decide()` 对拍：改前/改后 192 组合的 `(action, target_position)` 输出
+    `diff` 为空 → **逐字节相同**。
+  - 真实 CLI（600519 `--json --fast`）：`invalidation` 42 → **30 个交易日**，
+    `avg_holding_days` 27.646617 不变（证明只是换算，不是改数据）。
+  - `--as-of 2020-11-10` 真实持仓超期：`持有中（第 77/20 个交易日…）；
+    已超建议持有期 57 日（不强制退出）`，`invalidation` 尾段
+    `满 9 个交易日仍低于入场价（时间止损）`。
+  - `python tools/probe.py all-quick` → 41 项 **0 非 PASS/SKIP**（`horizon` PASS）。
+  - `python tools/probe.py all`（**非 Quick**，完整门禁等价物）→ 41 项**全部 PASS**。
+  - **门禁说明**：本机是 Linux，**没有 `pwsh`**，无法直接跑
+    `tools/check_gates.ps1`；已用其两条真实裁定入口（`pytest tests/` + `tools/probe.py`）
+    代替，并跑 `probe.py all`（非 Quick）作为完整门禁等价物（结果见下）。
+- **文档**：README `invalidation` 字段说明改写为两态 + 单位口径；示例 JSON
+  `source/docs/example_output_600519.json` 由 `python cli.py 600519 --json --fast` 现跑重生成。
+  `source/docs/validation_600519.md` 未重生成（重跑会混入与本 issue 无关的 1643→6043
+  根数据窗口变化，且无测试断言其内容）。
+
 ## 2026-11-17 · PR #133 复验返工：参考价带日期/归属 + 仓位信息找回
 
 - **分支**：`task/trigger-semantics`（PR #133 head `c173f46`，未合并）；只改

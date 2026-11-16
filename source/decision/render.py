@@ -99,9 +99,18 @@ def build_reasons(action: str, signal: Dict[str, Any],
 
     else:  # hold
         if policy.get('holding'):
+            bars_held = int(policy.get('bars_held') or 0)
+            # issue #139：horizon 只是**时间止损**（`policy.run_policy`：
+            # `bars_held >= horizon and close <= entry_price` 才出场），盈利仓位
+            # 可以无限期持有。旧文案只写「第 21/20 个交易日」，超过建议持有期却
+            # 没有任何说明，读者会以为有规则没触发。这里只补一句事实：已超期，
+            # 且**不强制退出**——不改任何判定。
+            overdue = (f"；已超建议持有期 {bars_held - int(horizon)} 日（不强制退出）"
+                       if bars_held > int(horizon) else "")
             reasons.append(
-                f"持有中（第 {policy.get('bars_held', 0)}/{horizon} 个交易日，"
-                f"入场 {policy.get('entry_date')} @ {policy.get('entry_price')}）；未触发风控")
+                f"持有中（第 {bars_held}/{horizon} 个交易日，"
+                f"入场 {policy.get('entry_date')} @ {policy.get('entry_price')}）"
+                f"{overdue}；未触发风控")
             tail = (f"止损 {policy.get('stop_price')}、止盈 {policy.get('target_price')}"
                     if policy.get('stop_price') is not None else "止损/止盈不可用")
             reasons.append(tail + (f"；{review_date} 复审" if review_date else ""))
