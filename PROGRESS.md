@@ -49,12 +49,19 @@
   单个域 444 断言从「顶层块存在」改为「本域条目存在且顶层块干净」。
 - **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5 / pandas 3.0.1 /
   akshare 1.18.29；venv 取自 `astock-verify-flow`，与 requirements.txt 一致）**：
-  - `python -m pytest tests/ -q` → **1200 passed in 109.13s**。
+  - `python -m pytest tests/ -q` → **1200 passed in 108.19s**（改动前后各跑一次，
+    均 1200 通过）。
   - `python -m pytest tests/test_flow_surface.py -q` → **6 passed**。
   - `python -m pytest tests/test_eastmoney_guard.py tests/test_events_guard.py
     tests/test_flow_degradation.py tests/test_st_precompute.py -q` → **57 passed**。
+  - `python tools/probe.py as_of` → PASS（2026-10-22 / 10-23 两日 bars 与
+    last_close 与缓存一致）；`python tools/probe.py error_shape` → PASS
+    （600519 / 510300 错误路径 missing_paths=0）。首次 `probe.py all` 与全量
+    pytest 并发跑，两项因此 BLOCKED/FAIL（读本地行情缓存争用）；串行重跑
+    单独 PASS，随后串行重跑 `probe.py all` 结果见 PR 描述。
 - **未验证**：`tools/check_gates.ps1` —— 本机无 `pwsh`（与前几轮同）；
-  以全量 pytest 为运行时裁定器。未探测东财真实端点，全部用桩。
+  以全量 pytest + `tools/probe.py` 为运行时裁定器。未探测东财真实端点，
+  全部用桩。
 
 ## 2026-11-16 · 事件预计算接入统一东财熔断与请求预算（issue #1 敞口）
 
