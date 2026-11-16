@@ -826,13 +826,20 @@ evidence.events = {
 ```bash
 python tools/forward_log.py record                 # 收盘后跑；默认 14 只自选
 python tools/forward_log.py record --codes 002415,601066 --ledger-only
+python tools/forward_log.py record --overwrite     # 显式允许覆盖同 (日期,标的) 记录
 python tools/forward_log.py evaluate               # 结算已到期记录（每日跑）
 python tools/forward_log.py report                 # 汇总；--json 输出机读
 ```
 
 写入 `source/stock_analysis/data/forward/<YYYY-MM-DD>.json`（`data/` 已在
-`.gitignore`）。**同一天重复跑覆盖同 code，不追加**；按 CLI 返回的
-`data.end`（最后一根行情日）分文件，因此周末/节假日跑会落在上一个交易日。
+`.gitignore`）。**文件日期 = 建议日期**（issue #134）：优先 payload 的
+`request.as_of`（`cli.py --as-of` 回放），缺省为运行日；**不再取 `data.end`** ——
+场外基金 T 日净值约 20:45 才入库，18:55 跑时 `data.end` 仍是 T-1，按它落盘
+会把 T 日的建议写进 T-1 的文件，并静默覆盖那里的既有记录。同一
+(日期, 标的) 已有记录时**默认拒绝**（退出码 1、零落盘），需显式
+`--overwrite` 才覆盖；覆盖已结算记录会额外告警。`data.end` 落后于建议日期时，
+记录写 `data_end` / `data_lag_days`（additive），`record` 输出与 `report`
+汇总都会列出滞后条数与天数。
 
 每条记录的键集合固定，取不到就写 `null` 并在 `missing` 里记原因
 （`cache_missing` / `cli_failed` / `field_absent_in_cli_output` 等），
@@ -845,10 +852,12 @@ python tools/forward_log.py report                 # 汇总；--json 输出机�
 | 资金面 | `flow.{available,source,caliber,net_5d,net_20d,as_of,main_net_5d,main_net_20d}` |
 | 估值 | `valuation.{available,pe_percentile_3y,pb_percentile_3y,ps_percentile_3y,as_of}` |
 | 市况 | `market_regime.{label,confidence}` / `index_regime.{label,confidence}` |
-| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` `instrument_type` `price_source` `price_caliber` `instrument_basis` `basis_uncertain` |
+| 运行 | `cli_exit` `elapsed_s` `recorded_at` `missing` `instrument_type` `price_source` `price_caliber` `instrument_basis` `basis_uncertain` `data_end` `data_lag_days` |
 | 结算 | `settled.{ret_20d,hit,settle_date,entry_date,entry_open,exit_open,horizon_days,price_source}` 或 `null` + `settle_reason`，外加 `settle_status` |
 
-结算口径：`open_{d+1+20} / open_{d+1} − 1`。**个股与场内 ETF** 用前复权开盘价
+结算口径：`open_{d+1+20} / open_{d+1} − 1`，其中 `d` 是记录的 `as_of`
+（**建议日期**）：净值迟到时仍从建议日期的下一根行情起算，不借用 `data.end`。
+**个股与场内 ETF** 用前复权开盘价
 （`qfq_open_to_open`，分红送转在比值里自然抵消）；**场外基金**只有单位净值，
 `open` 由净值补齐，因此是**净值对净值**（`nav_to_nav`，OTC 无开盘价）。
 「交易日」以该票自己的行情索引为准（停牌日无开盘价，不能成交）。

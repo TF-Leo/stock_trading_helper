@@ -52,9 +52,12 @@ def _cli_payload(code="002415", as_of="2026-11-12", action="buy",
     """构造一份与 ``cli.py --json`` 同构的最小输出。
 
     ``type_hint`` 写进 ``request.type``：issue #95 起台账按它选结算价源。
+    ``request.as_of`` 与 ``data.end`` 同行：模拟 ``cli.py --as-of <date>`` 的
+    回放输出（issue #134 起写入日期取前者）。
     """
     return {
-        "request": {"code": code, "type": type_hint, "type_hint": "auto"},
+        "request": {"code": code, "type": type_hint, "type_hint": "auto",
+                    "as_of": as_of},
         "data": {"end": as_of, "last_close": 30.5, "bars": 1600},
         "market_regime": {
             "label": "Bull", "confidence": 0.71, "as_of": as_of,
@@ -199,32 +202,106 @@ def test_build_record_missing_field_gets_null_and_reason():
     assert "reason" not in rec["flow"] and "reason" not in rec["valuation"]
 
 
-def test_record_day_is_idempotent_and_overwrites(ledger_tmp):
-    payload = _cli_payload()
-    fl.record_day(["002415"], ledger_dir=ledger_tmp, runner=_runner(payload))
+def test_record_day_refuses_duplicate_by_default(ledger_tmp):
+    """issue #134：同日同 code 重跑默认拒绝，不静默覆盖既有记录。"""
+    payload = _cli_payload(code="600519")
+    fl.record_day(["600519"], ledger_dir=ledger_tmp, runner=_runner(payload))
     path = fl.day_path("2026-11-12", ledger_tmp)
-    assert Path(path).exists()
     first = json.loads(Path(path).read_text(encoding="utf-8"))
-    assert list(first["records"]) == ["002415"]
+    assert list(first["records"]) == ["600519"]
 
-    # 同日重跑：覆盖，不追加（records 仍是 1 条；内容更新为新结果）
-    payload2 = _cli_payload(action="hold", confidence=0.3)
-    fl.record_day(["002415"], ledger_dir=ledger_tmp, runner=_runner(payload2))
+    payload2 = _cli_payload(code="600519", action="hold", confidence=0.3)
+    with pytest.raises(fl.DuplicateRecordError, match="600519"):
+        fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                      runner=_runner(payload2))
+    # 拒绝必须发生在写盘前：文件逐键不变（原始 action / recorded_at 都还在）
     second = json.loads(Path(path).read_text(encoding="utf-8"))
-    assert list(second["records"]) == ["002415"]
-    assert second["records"]["002415"]["action"] == "hold"
-    assert second["records"]["002415"]["confidence"] == 0.3
+    assert second == first
 
 
-def test_record_day_splits_by_cli_data_end(ledger_tmp):
-    """盘后跑到的 as_of 是 data.end，不是运行日：不同票可落不同文件。"""
+def test_record_day_overwrite_is_explicit(ledger_tmp):
+    """issue #134：只有 overwrite=True（CLI --overwrite）才替换既有记录。"""
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code="600519")))
+    payload2 = _cli_payload(code="600519", action="hold", confidence=0.3)
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(payload2), overwrite=True)
+    record = fl.load_day("2026-11-12", ledger_tmp)["records"]["600519"]
+    assert record["action"] == "hold" and record["confidence"] == 0.3
+
+
+def test_record_day_splits_by_advice_date(ledger_tmp):
+    """issue #134：分文件按建议日期（request.as_of），不同票可落不同文件。"""
     def runner(code):
         as_of = "2026-11-11" if code == "600519" else "2026-11-12"
         return _cli_payload(code=code, as_of=as_of), 0, 8.0
-    written = fl.record_day(["600519", "002415"], ledger_dir=ledger_tmp,
+    written = fl.record_day(["600519", "600000"], ledger_dir=ledger_tmp,
                             runner=runner)
     assert sorted(written) == ["2026-11-11", "2026-11-12"]
     assert list(written["2026-11-11"]) == ["600519"]
+
+
+def test_record_uses_advice_date_not_data_end(ledger_tmp):
+    """issue #134 验收：净值迟到（data.end=T-1、as_of=T）写进 T 的文件。
+
+    场外基金 T 日净值约 20:45 才入库，18:55 跑时 ``data.end`` 仍是 T-1；
+    旧实现按 ``data.end`` 落盘，把 T 日的建议写进 T-1 的文件并覆盖旧记录。
+    """
+    payload = _cli_payload(code="600519", as_of="2026-11-16")
+    payload["request"]["as_of"] = "2026-11-17"
+    written = fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                            runner=_runner(payload))
+    assert list(written) == ["2026-11-17"]
+    assert not Path(fl.day_path("2026-11-16", ledger_tmp)).exists()
+    record = fl.load_day("2026-11-17", ledger_tmp)["records"]["600519"]
+    assert record["as_of"] == "2026-11-17"
+    assert record["data_end"] == "2026-11-16"
+    assert record["data_lag_days"] == 1
+
+
+def test_record_defaults_to_today_when_request_has_no_as_of(ledger_tmp):
+    """issue #134：没有 request.as_of 时缺省为**当天**，仍不是 data.end。"""
+    payload = _cli_payload(code="600000", as_of="2026-11-16")
+    payload["request"].pop("as_of")
+    fl.record_day(["600000"], ledger_dir=ledger_tmp, runner=_runner(payload),
+                  now=datetime(2026, 11, 17, 21, 0))
+    assert Path(fl.day_path("2026-11-17", ledger_tmp)).exists()
+    assert not Path(fl.day_path("2026-11-16", ledger_tmp)).exists()
+    record = fl.load_day("2026-11-17", ledger_tmp)["records"]["600000"]
+    assert record["data_lag_days"] == 1
+
+
+def test_record_lag_zero_when_data_end_matches_advice_date(ledger_tmp):
+    """同日数据不滞后：data_lag_days=0（字段在，值明确）。"""
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(_cli_payload(code="600519")))
+    record = fl.load_day("2026-11-12", ledger_tmp)["records"]["600519"]
+    assert record["data_end"] == "2026-11-12"
+    assert record["data_lag_days"] == 0
+
+
+def test_record_lag_null_when_data_end_missing(ledger_tmp):
+    """CLI 失败 / 无 data.end：data_lag_days=null，不猜成 0。"""
+    fl.record_day(["600519"], ledger_dir=ledger_tmp,
+                  runner=_runner(None, exit_code=30),
+                  now=datetime(2026, 11, 17, 21, 0))
+    record = fl.load_day("2026-11-17", ledger_tmp)["records"]["600519"]
+    assert record["data_end"] is None
+    assert record["data_lag_days"] is None
+
+
+def test_write_records_checks_all_conflicts_before_writing(ledger_tmp):
+    """冲突检查是**整体预检**：有冲突时另一天的新文件也不得落盘。"""
+    fl.write_records({"2026-11-12": {"600519": {"code": "600519"}}},
+                     ledger_dir=ledger_tmp)
+    batch = {
+        "2026-11-12": {"600519": {"code": "600519"}},
+        "2026-11-13": {"600000": {"code": "600000"}},
+    }
+    with pytest.raises(fl.DuplicateRecordError) as excinfo:
+        fl.write_records(batch, ledger_dir=ledger_tmp)
+    assert excinfo.value.conflicts == [("2026-11-12", "600519")]
+    assert not Path(fl.day_path("2026-11-13", ledger_tmp)).exists()
 
 
 def test_record_day_writes_even_when_runner_raises(ledger_tmp):
@@ -1465,10 +1542,19 @@ def test_tool_record_writes_ledger_and_legacy_csv(tmp_path, monkeypatch):
     assert len(rows) == 1
     assert rows[0]["code"] == "002415" and rows[0]["action"] == "buy"
     assert rows[0]["close"] == "30.5"  # 旧字段仍然来自 CLI payload
-    # 同一天重跑：CSV 不重复追加
-    tool.record(["002415"], ledger_dir=ledger_dir, runner=_runner(_cli_payload()))
+    # issue #134：同一天重跑默认拒绝（JSON 台账不覆盖），CSV 也不追加
+    with pytest.raises(fl.DuplicateRecordError):
+        tool.record(["002415"], ledger_dir=ledger_dir,
+                    runner=_runner(_cli_payload()))
     rows = list(csv.DictReader(tool.LOG.open(encoding="utf-8", newline="")))
     assert len(rows) == 1
+    # 显式 --overwrite 才写 JSON；CSV 仍是 append-only，不重复追加
+    tool.record(["002415"], ledger_dir=ledger_dir,
+                runner=_runner(_cli_payload(action="hold")), overwrite=True)
+    rows = list(csv.DictReader(tool.LOG.open(encoding="utf-8", newline="")))
+    assert len(rows) == 1
+    assert fl.load_day("2026-11-12", ledger_dir)["records"]["002415"][
+        "action"] == "hold"
 
 
 def test_tool_record_ledger_only_skips_csv(tmp_path, monkeypatch):
@@ -1577,9 +1663,13 @@ def test_tool_record_calendar_unavailable_cli_exits_50(
     assert "--allow-non-trading-day" in err
 
 
-def test_tool_record_calendar_unavailable_allow_warns_overwrite(
+def test_tool_record_calendar_unavailable_allow_warns_advice_date(
         tmp_path, monkeypatch, capsys):
-    """显式放行时写入，但必须醒目提示可能覆盖台账里最近一天的既有记录。"""
+    """显式放行时写入，但必须醒目提示写入日期与覆盖保护（issue #134）。
+
+    issue #134 起写入日期是建议日期（``request.as_of``，缺省运行日），不再是
+    ``data.end``；同一 (日期, 标的) 已有记录仍需 ``--overwrite``。
+    """
     tool = _load_forward_log(trading_day=None)
     monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
     monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
@@ -1589,17 +1679,20 @@ def test_tool_record_calendar_unavailable_allow_warns_overwrite(
 
     written = tool.record(
         ["600000"], ledger_dir=ledger_dir, allow_non_trading_day=True,
-        day=date(2026, 11, 15),
+        day=date(2026, 11, 15), overwrite=True,
         runner=_runner(_cli_payload(code="600000", as_of="2026-11-12")))
 
     assert list(written) == ["2026-11-12"]
     err = capsys.readouterr().err
-    assert "警告" in err and "可能覆盖 2026-11-12 的既有记录" in err
+    assert "警告" in err
+    assert "2026-11-15" in err          # 缺省运行日
+    assert "request.as_of" in err
+    assert "--overwrite" in err
 
 
-def test_tool_record_non_trading_day_allow_warns_overwrite(
+def test_tool_record_non_trading_day_allow_warns_advice_date(
         tmp_path, monkeypatch, capsys):
-    """休市日显式放行同样打印「可能覆盖 {date}」警告。"""
+    """休市日显式放行同样打印「建议日期 + 覆盖保护」警告。"""
     tool = _load_forward_log(trading_day=False)
     monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
     monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
@@ -1608,17 +1701,17 @@ def test_tool_record_non_trading_day_allow_warns_overwrite(
                      ledger_dir=ledger_dir)
 
     tool.record(["600519"], ledger_dir=ledger_dir, allow_non_trading_day=True,
-                day=date(2026, 11, 15),
+                day=date(2026, 11, 15), overwrite=True,
                 runner=_runner(_cli_payload(code="600519", as_of="2026-11-12",
                                             status="market_closed")))
 
     err = capsys.readouterr().err
-    assert "休市" in err and "可能覆盖 2026-11-12 的既有记录" in err
+    assert "休市" in err and "2026-11-15" in err
 
 
 def test_tool_record_non_trading_day_allow_writes_without_ledger(
         tmp_path, monkeypatch):
-    """台账为空时放行仍写入，警告退化为「上一交易日」。"""
+    """台账为空时放行仍写入（建议日期取 request.as_of）。"""
     tool = _load_forward_log(trading_day=False)
     monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
     monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
@@ -1639,14 +1732,120 @@ def test_tool_record_survives_cli_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
     monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
     ledger_dir = tmp_path / "forward"
-    tool.record(["002415"], ledger_dir=ledger_dir,
+    tool.record(["002415"], ledger_dir=ledger_dir, day=date(2026, 11, 17),
                 runner=_runner(None, exit_code=30, elapsed=2.0))
-    payload = fl.load_day(fl._local_expected_trade_date(), ledger_dir)
+    # issue #134：无 payload → 无 request.as_of / data.end，缺省落运行日。
+    payload = fl.load_day("2026-11-17", ledger_dir)
     assert payload is not None
     record = payload["records"]["002415"]
     assert record["action"] is None and record["cli_exit"] == 30
     assert record["missing"]["action"] == "cli_failed"
     assert not tool.LOG.exists()  # CSV 需要 payload，无 payload 时不写假行
+
+
+def test_tool_record_reports_data_lag(tmp_path, monkeypatch, capsys):
+    """issue #134：data.end < as_of 时日志必须打印 data_lag_days，不得静默。"""
+    tool = _load_forward_log()
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+    payload = _cli_payload(code="600519", as_of="2026-11-16")
+    payload["request"]["as_of"] = "2026-11-17"
+
+    written = tool.record(["600519"], ledger_dir=ledger_dir,
+                          runner=_runner(payload))
+
+    assert list(written) == ["2026-11-17"]
+    out = capsys.readouterr().out
+    assert "data_lag_days=1" in out and "data_end=2026-11-16" in out
+    assert "数据滞后：1 条" in out
+
+
+def test_tool_record_duplicate_cli_exits_1(tmp_path, monkeypatch, capsys):
+    """issue #134：同 (日期, 标的) 重复写入 → 明确报错 + 退出码 1，零改动。"""
+    tool = _load_forward_log()
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+    fl.write_records({"2026-11-12": {"600519": {"code": "600519"}}},
+                     ledger_dir=ledger_dir)
+    monkeypatch.setattr(fl, "default_runner",
+                        _runner(_cli_payload(code="600519")))
+    monkeypatch.setattr(sys, "argv", [
+        "forward_log.py", "record", "--codes", "600519",
+        "--ledger-dir", str(ledger_dir)])
+
+    with pytest.raises(SystemExit) as excinfo:
+        tool.main()
+
+    assert excinfo.value.code == tool.EXIT_DUPLICATE_RECORD == 1
+    err = capsys.readouterr().err
+    assert "已有同 (日期, 标的) 记录" in err and "--overwrite" in err
+    # 拒绝发生在写盘前：原记录逐键不变，也没有生成 CSV
+    assert fl.load_day("2026-11-12", ledger_dir)["records"]["600519"] == {
+        "code": "600519"}
+    assert not tool.LOG.exists()
+
+
+def test_settled_record_is_never_overwritten_without_overwrite(
+        tmp_path, monkeypatch):
+    """验收：已结算记录 0 漂移 —— 重复 record 默认拒绝，settled 块原样保留。"""
+    tool = _load_forward_log()
+    monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
+    monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
+    ledger_dir = tmp_path / "forward"
+    settled = {"ret_20d": 0.2, "hit": True, "settle_date": "2026-12-01",
+               "entry_date": "2026-11-13", "entry_open": 10.0,
+               "exit_open": 12.0, "price_source": "local_qfq_cache"}
+    _write_settled_day(ledger_dir, "2026-11-12", {
+        "600519": {"code": "600519", "as_of": "2026-11-12", "action": "buy",
+                   "confidence": 0.6, "flow": {}, "valuation": {},
+                   "settled": settled, "settle_status": "settled"},
+    })
+    before = json.loads(
+        Path(fl.day_path("2026-11-12", ledger_dir)).read_text(encoding="utf-8"))
+
+    with pytest.raises(fl.DuplicateRecordError):
+        tool.record(["600519"], ledger_dir=ledger_dir,
+                    runner=_runner(_cli_payload(code="600519",
+                                                action="hold")))
+
+    after = json.loads(
+        Path(fl.day_path("2026-11-12", ledger_dir)).read_text(encoding="utf-8"))
+    assert after == before
+    assert fl.has_settlement(after["records"]["600519"])
+    assert after["records"]["600519"]["settled"] == settled
+
+
+def test_report_shows_data_lag_counts(ledger_tmp):
+    """issue #134：汇总里可见数据滞后（条数 / 最大天数 / 按天数分布）。"""
+    _write_settled_day(ledger_tmp, "2026-11-12", {
+        "600519": {"code": "600519", "as_of": "2026-11-12", "action": "buy",
+                   "confidence": 0.5, "flow": {}, "valuation": {},
+                   "data_end": "2026-11-11", "data_lag_days": 1,
+                   "settled": None, "settle_reason": "not_matured"},
+        "600000": {"code": "600000", "as_of": "2026-11-12", "action": "hold",
+                   "flow": {}, "valuation": {},
+                   "data_end": "2026-11-12", "data_lag_days": 0,
+                   "settled": None, "settle_reason": "not_matured"},
+    })
+    report = fl.build_report(ledger_dir=ledger_tmp)
+    assert report["data_lag"] == {"records": 1, "max_days": 1,
+                                  "by_days": {"1": 1}}
+    assert "数据滞后 1 条" in fl.format_report(report)
+
+
+def test_report_legacy_records_without_lag_fields_are_untouched(ledger_tmp):
+    """旧台账（无 data_end/data_lag_days）照常读取，不把「未记录」算成 0 滞后。"""
+    _write_settled_day(ledger_tmp, "2026-11-12", {
+        "600519": {"code": "600519", "as_of": "2026-11-12", "action": "buy",
+                   "confidence": 0.5, "flow": {}, "valuation": {},
+                   "settled": None, "settle_reason": "not_matured"},
+    })
+    report = fl.build_report(ledger_dir=ledger_tmp)
+    assert report["records"] == 1
+    assert report["data_lag"] == {"records": 0, "max_days": 0, "by_days": {}}
+    assert "数据滞后" not in fl.format_report(report)
 
 
 def test_tool_evaluate_output_does_not_pair_zero_failed_with_reasons(
