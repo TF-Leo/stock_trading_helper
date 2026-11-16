@@ -35,22 +35,31 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
   保证「显示值落在哪一档，分级就是哪一档」；其余百分比仍走
   :func:`_fmt_pct` 的四舍五入口径。
 * **None 整段消失**：任何可选字段缺失时，对应句子/段落整体不出现，输出中
-  不允许出现字符串 ``None``。
+  不允许出现字符串 ``None``。唯一例外是 ``entry_zone``：``null`` 表示
+  「不适用/缺数据」，保留「入场区 —」占位（issue #132）。
 * **零新依赖**。
 
 字段口径直接沿用 CLI 当前 JSON（``cli.py`` 的成功/错误响应同构）：
 
 * ``position_fraction`` 是「策略建议权重」（小数，0.15 = 15%），不是用户应买
-  金额；文案必须保留「建议仓位」四个字。
+  金额；文案必须保留「建议仓位」四个字。**例外**：动作后目标仓位为 0
+  （``target_position == 0`` 或 ``action`` 为 ``sell`` / ``avoid``）时只写
+  「目标仓位 0%」，不再并列「建议仓位」—— 两个数并列会自相矛盾
+  （issue #132）。
 * ``horizon_days`` 当前是 ``[20, 20]``（低/高），渲染取第一个正值。
 * ``instrument.limit_up`` / ``limit_down`` 是**价格**，不是布尔。一字板优先
   读取显式字段 ``instrument.one_word_limit``（``"up"`` / ``"down"``），缺失时
   才从 ``diagnostics.warnings`` 里识别 CLI 已写入的「一字涨停/一字跌停」事实。
 * ``evidence.triggers[]`` 只描述**已触发**的买卖信号（``state`` 为
   ``buy_triggered`` / ``sell_triggered``）；触发价取 ``buy_price`` /
-  ``sell_price``，距触发百分比取 ``recommendation.distance_to_trigger`` 的
-  ``buy_pct`` / ``sell_pct``，**逐值照抄、不重算**。字段缺失或没有已触发
-  信号时整行消失。
+  ``sell_price``，**逐值照抄、不重算**。这两个值按定义是「最近一次买点/卖点
+  所在 bar 的收盘价」——**历史参考价**，不是当日可成交价。因此已触发态只写
+  「参考价 {P}，最近一次买点/卖点收盘」，不再输出「距触发 X%」：把历史价位
+  与现价做百分比会被读成「离触发很近」（issue #132）。未触发态本就没有这一
+  行，语义不变。字段缺失或没有已触发信号时整行消失。
+* ``recommendation.entry_zone`` 为 ``null``（例如 ``action=sell`` 按设计不
+  给入场区）时，价位行仍保留「入场区 —」占位，不能把字段名整段丢掉——读者
+  需要区分「缺数据」与「不适用」（issue #132）。
 * ``instrument.is_suspended`` 为 ``None`` 表示**无法判断**（盘前集合竞价前
   的正常现象），绝不能当成「确认停牌」；只有 ``True`` 才进不可执行闸门。
 * 名称优先取 ``instrument.display_name`` / 顶层 ``display_name``，其次
@@ -864,27 +873,25 @@ def _action_line(rec: Dict[str, Any]) -> Optional[str]:
     return "｜".join(parts) or None
 
 
-#: 已触发状态 → (用户可读方向, 触发价字段, 距触发字段)。
+#: 已触发状态 → (用户可读方向, 触发价字段, 参考价所属点位)。
 _TRIGGER_STATES = {
-    "buy_triggered": ("买信号", "buy_price", "buy_pct"),
-    "sell_triggered": ("卖信号", "sell_price", "sell_pct"),
+    "buy_triggered": ("买信号", "buy_price", "买点"),
+    "sell_triggered": ("卖信号", "sell_price", "卖点"),
 }
 
 
 def _trigger_line(payload: Dict[str, Any]) -> Optional[str]:
     """T1：已触发的买/卖信号一行事实；无已触发信号或字段缺失时整行消失。
 
-    触发价与「现价距触发」百分比**逐值取自 JSON**（``buy_price`` /
-    ``sell_price`` 与 ``recommendation.distance_to_trigger``），绝不重算。
+    触发价**逐值取自 JSON**（``buy_price`` / ``sell_price``），绝不重算。
+    这两个字段的语义是「最近一次买点/卖点所在 bar 的收盘价」，属于**历史
+    参考价**：已触发态因此只写「参考价 {P}，最近一次买点/卖点收盘」，不再
+    输出「距触发 X%」—— 把历史价位和现价做百分比会被误读成「离触发很近」
+    （issue #132）。未触发态没有这一行，语义不变。
     """
     triggers = _dict(payload.get("evidence")).get("triggers")
     if not isinstance(triggers, (list, tuple)):
         return None
-    distances = _dict(_dict(payload.get("recommendation")).get("distance_to_trigger"))
-    # 行情非当日时不得自称「现价」（与 _price_line 的口径一致）；距离值仍是
-    # JSON 里基于 last_close 的原值，这里只调整措辞，不重算。
-    stale = _freshness(payload)[0]
-    distance_label = "距触发" if stale else "现价距触发"
 
     parts: List[str] = []
     for item in triggers:
@@ -893,23 +900,35 @@ def _trigger_line(payload: Dict[str, Any]) -> Optional[str]:
         mapping = _TRIGGER_STATES.get(state or "")
         if mapping is None:
             continue
-        label, price_field, pct_field = mapping
+        label, price_field, point = mapping
         indicator = _text(trigger.get("indicator"))
         price = _fmt_num(trigger.get(price_field))
-        distance = _fmt_num(distances.get(pct_field))
-        if not indicator or price is None or distance is None:
+        if not indicator or price is None:
             continue
         parts.append(f"{indicator} {label}已触发"
-                     f"（触发价 {price}，{distance_label} {distance}%）")
+                     f"（参考价 {price}，最近一次{point}收盘）")
     return "触发：" + "；".join(parts) if parts else None
 
 
 def _position_line(rec: Dict[str, Any]) -> Optional[str]:
-    """T1：建议仓位 / 持有期 / 复审日；任一为 None 时该段整体消失。"""
+    """T1：目标仓位 / 建议仓位 / 持有期 / 复审日；缺失段整体消失。
+
+    ``target_position == 0`` 或 ``action`` 为 ``sell`` / ``avoid`` 时只写
+    「目标仓位 0%」：此时 ``position_fraction`` 可能因止损距离而算出一个
+    非零的「建议仓位」（例如 0.2%），与「目标仓位 0%」并列会自相矛盾
+    （issue #132）。其余情况保持原「建议仓位 {w}%」措辞不变。
+    """
     parts = []
-    position = _fmt_pct(rec.get("position_fraction"))
-    if position is not None:
-        parts.append(f"建议仓位 {position}")
+    action = _text(rec.get("action"))
+    target = _num(rec.get("target_position"))
+    zero_target = (action in ("sell", "avoid")
+                   or (target is not None and target == 0.0))
+    if zero_target:
+        parts.append("目标仓位 0%")
+    else:
+        position = _fmt_pct(rec.get("position_fraction"))
+        if position is not None:
+            parts.append(f"建议仓位 {position}")
 
     horizon = _horizon_value(rec)
     review_date = _date_text(rec.get("review_date"))
@@ -924,13 +943,21 @@ def _position_line(rec: Dict[str, Any]) -> Optional[str]:
 
 
 def _levels_line(rec: Dict[str, Any]) -> Optional[str]:
-    """价位原样展示（不重算）；缺失字段整段消失。"""
+    """价位原样展示（不重算）；``entry_zone`` 为 null 时保留占位。
+
+    ``entry_zone`` 对 ``action=sell`` 按设计为 null —— 这是「不适用」而不是
+    「没取到」，所以字段名必须留在价位行里（写作「入场区 —」），否则读者
+    无法区分两者（issue #132）。止损/止盈缺失时价位行仍只保留入场区占位。
+    """
     parts = []
     zone = rec.get("entry_zone")
+    lower = upper = None
     if isinstance(zone, (list, tuple)) and len(zone) == 2:
         lower, upper = _fmt_num(zone[0]), _fmt_num(zone[1])
-        if lower is not None and upper is not None:
-            parts.append(f"入场区 {lower}-{upper}")
+    if lower is not None and upper is not None:
+        parts.append(f"入场区 {lower}-{upper}")
+    else:
+        parts.append("入场区 —")
     stop_loss = _fmt_num(rec.get("stop_loss"))
     if stop_loss is not None:
         parts.append(f"止损 {stop_loss}")

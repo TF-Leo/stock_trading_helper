@@ -1,5 +1,31 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-17 · issue #132 已触发态「距触发」语义 + 仓位/入场区渲染矛盾
+
+- **分支**：`task/trigger-semantics`（父 `origin/main` `e2ed022`）；只改渲染层
+  `source/stock_analysis/advice_render.py`，**未改 `decision/*`**、未引入依赖、
+  `--json` 既有键与含义不变（本次未新增 JSON 字段）。
+- **改动**：
+  1. 已触发态（`buy_triggered` / `sell_triggered`）不再输出「距触发 X%」，
+     改输出「参考价 {P}，最近一次买点/卖点收盘」——这两个价位按
+     `decision/triggers.py` 的定义是历史 bar 收盘价，不是当日可成交价；
+     未触发态本来就没有这一行，语义不变。
+  2. `target_position == 0` 或 `action ∈ {sell, avoid}`：只输出「目标仓位 0%」，
+     不再并列「建议仓位」（避免 `position_fraction` 非零时自相矛盾）。
+  3. `entry_zone` 为 null：价位行保留「入场区 —」占位，不再整段丢掉字段名。
+- **测试**：新增 `source/tests/test_trigger_semantics_132.py`（7 项）——
+  已触发 / 未触发 / sell / avoid / 基金（场外基金）五个快照（仅用
+  600519 / 600000），外加「已触发态无『距触发』」「无 `distance_to_trigger`
+  仍能渲染」「渲染不改入参」；按新口径更新 `test_advice_render.py` 的旧断言
+  与 9 份 fixture 快照中受影响者。
+- **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5，venv 取自
+  `astock-verify-flow`，与 requirements.txt 一致）**：
+  - `python -m pytest tests/ -q` → **1217 passed in 109.10s**。
+  - `python -m pytest tests/test_trigger_semantics_132.py
+    tests/test_advice_render.py -q` → **218 passed**。
+- **未做**：`cli.py` 的纯文本简版输出与 `decision/render.py::print_detail`
+  未改（后者属 `decision/*`；前者不并列「目标仓位」，无 issue #132 的矛盾）。
+
 ## 2026-11-16 · PR #131 P2 修复：升级投票收紧 + 窗口解耦 + 全域封锁可清除
 
 - **分支**：`TF-Leo/fix-pr131`（基于 PR #131 head `5cd4ed2`，父 `origin/main`
