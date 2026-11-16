@@ -313,7 +313,7 @@ python cli.py 600519 --start 20200101 --json
 - **name**: 标的名称
 - **board**: 板块（"sh_main"/"sh_star"/"sz_main"/"sz_gem"/"bj"/"fund"/"unknown"）
 - **price_limit_pct**: 涨跌停幅度（0.10 表示 10%）。有实时报价时以腾讯 `limit_up/last_close` 推算为准；否则按板块静态规则（主板 10%、创业板/科创板 20%、北交所 30%）。**2026-07-06 起沪深主板 ST/*ST 已由 5% 并轨为 10%**（交易所《交易规则（2026 年修订）》），故不再对主板 ST 做 5% 修正；创业板/科创板 ST 仍 20%，北交所 ST 30%
-- **is_st**: 是否 ST/*ST（**真实值**：收盘后预计算的东财 §6.8 名单优先，其次腾讯报价名称前缀；两者都不可用时，若本地名称带 ST 前缀则判 `true` 并在 `diagnostics.warnings` 注明「仅依据名称」，否则为 `null`，不再默认 `false`）。**基金不参与 ST 判定**：恒为 `null`，且 `is_st_source=not_applicable`（issue #109）
+- **is_st**: 是否 ST/*ST（**真实值**：收盘后预计算的东财 §6.8 名单优先，其次交易所官方风险警示名单缓存，再次腾讯报价名称前缀；都不可用时，若本地名称带 ST 前缀则判 `true` 并在 `diagnostics.warnings` 注明「仅依据名称」，否则为 `null`，不再默认 `false`）。官方名单的深市部分**含 B 股**（风险警示板口径）：B 股代码的 `is_st` 同样为 `true`，但本项目只交易 A 股，不影响候选池。**基金不参与 ST 判定**：恒为 `null`，且 `is_st_source=not_applicable`（issue #109）
 - **is_st_source**: `is_st` 的判定来源（issue #106 additive）：`exchange_list`（交易所/东财 ST 名单）、`quote_name`（腾讯实时报价名称）、`local_name`（本地名称）、`unavailable`（三者都不可用，`is_st` 为 `null`）、`not_applicable`（基金不参与 ST 判定，`is_st` 为 `null`，issue #109）。名单与名称冲突时按「是 ST」保守处理并告警；**`unavailable` 只表示未知，渲染层写「ST 状态未知」，绝不显示成「非 ST」**。取数失败 / 数据不足的错误响应（`recommendation.status` 为 `data_source_error` / `insufficient_data`）**不渲染**「ST 状态未知」：ST 状态根本没解析，属于「未尝试」而非「尝试后未知」
 - **is_suspended**: 是否停牌。判据是「交易日 10:00 后 / 已收盘」腾讯报价定格（`is_stale=true` 且当日成交量为 0）；**盘前（<10:00）返回 `null`**，不把集合竞价前的正常定格误判为停牌。**非交易日（周末/法定节假日）恒为 `null`**：休市日报价定格是常态，不是停牌（issue #117）
 - **market_closed**: 今日是否休市（issue #117 additive）。`true` = 官方交易日历确认非交易日（周末/法定节假日）；`false` = 交易日；`null` = 交易日历不可用，**无法判定**。为 `true` 时 `recommendation.status=market_closed`、退出码 `50`，`action` 固定为 `avoid`
@@ -324,7 +324,7 @@ python cli.py 600519 --start 20200101 --json
 - **status_source**: 本次状态的数据来源，`+` 分隔的组合值：
   - `tencent_quote`：实时报价（涨跌停价 / 名称 / is_stale）
   - `eastmoney_st_list`：收盘后预计算的东财 §6.8 ST 名单（缓存覆盖最近交易日）
-  - `exchange_st_list`：东财不可用时，来自交易所官方（上交所 / 深交所）风险警示名单的缓存（2026-11-15 additive；覆盖沪深 A，不含北交所/B股，warning 会写明）
+  - `exchange_st_list`：东财不可用时，来自交易所官方（上交所 / 深交所）风险警示名单的缓存（2026-11-15 additive；覆盖沪深 A 股 + 深市 B 股，不含北交所，warning 会写明）
   - `st_cache`：ST 名单缓存过期或取数失败后回退的旧缓存（同时 `diagnostics.warnings` 有说明）
   - `quote_unavailable`：腾讯报价取数失败或字段异常
   - `offline`：显式离线（`ASTOCK_STATUS_OFFLINE=1` 或 `ASTOCK_DISABLE_NETWORK=1`）
@@ -397,7 +397,7 @@ python cli.py 600519 --start 20200101 --json
 > `COMPANY_STATUS=7` 1 个请求；深交所 `ShowReport/data` `CATALOGID=fxjsb`
 > 按官方分页串行取，当前 6 页）做**交叉校验**——东财可用时按代码取并集
 > （任一源说是 ST 就是 ST），冲突写 `CONFLICT` 告警；东财 444/冷却/失败时
-> 官方两所即作为兜底名单落盘。官方备胎覆盖沪深 A、不含北交所/B股。预计算命中
+> 官方两所即作为兜底名单落盘。官方备胎覆盖沪深 A 股 + 深市 B 股、不含北交所。预计算命中
 > 444 / 零字节 FIN 时立即中止**东财**并写 `eastmoney_cooldown.json`（默认
 > 1800s）；冷却期内不再请求东财，但仍会尝试官方备胎（若两所都成功，照常
 > 落盘）。任一所需源异常都**不覆盖已有好缓存**。

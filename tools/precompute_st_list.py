@@ -35,8 +35,8 @@ push2/push2delay 的请求数为 **0**。
 --------
 * 东财可用：以东财为基准（含北交所），把官方名单按代码**取并集**——
   任一源说是 ST 就是 ST（ST 假阴性会让人误买风险警示股）；
-* 东财不可用、两所官方都可用：只用官方名单（覆盖沪深 A，不含北交所/B股，
-  缓存 warning 明确写出覆盖缺口）；
+* 东财不可用、两所官方都可用：只用官方名单（覆盖沪深 A 股 + 深市 B 股，
+  不含北交所；缓存 warning 明确写出覆盖缺口）；
 * 同名代码名称不一致 / 只在一边出现（沪深重叠范围）→ 取并集并告警；
   北交所代码不在官方覆盖内，不算冲突。
 * 缓存 ``source`` 记录主源（``eastmoney`` / ``exchange``），
@@ -124,8 +124,14 @@ def _snapshot_stats(snapshot, requests_made=0) -> dict:
 
 
 def _merge_east_with_official(east: st.StListSnapshot,
-                              official_lists) -> st.StListSnapshot:
-    """东财为基准 + 官方名单取并集；冲突取「是 ST」并告警。"""
+                              official_lists):
+    """东财为基准 + 官方名单取并集；冲突取「是 ST」并告警。
+
+    返回 ``(snapshot, conflicts)``。``conflicts`` 是**结构化条目**列表
+    （issue #123）：``{"kind": "east_only" / "official_only" /
+    "name_mismatch", "count": n, "codes": [...], "message": "..."}``；
+    没有任何冲突时为空列表。``snapshot.warning`` 仍是给人看的整段文案。
+    """
     stocks = {code: dict(info) for code, info in east.stocks.items()}
     official_codes = set()
     name_conflicts = []
@@ -155,41 +161,52 @@ def _merge_east_with_official(east: st.StListSnapshot,
     official_only = sorted(official_codes - set(east.stocks))
     conflicts = []
     if east_only:
-        conflicts.append(f"东财独有 {len(east_only)}（样例 {east_only[:8]}）")
+        conflicts.append({
+            "kind": "east_only", "count": len(east_only), "codes": east_only,
+            "message": f"东财独有 {len(east_only)}（样例 {east_only[:8]}）"})
     if official_only:
-        conflicts.append(
-            f"官方独有 {len(official_only)}（样例 {official_only[:8]}）")
+        conflicts.append({
+            "kind": "official_only", "count": len(official_only),
+            "codes": official_only,
+            "message": f"官方独有 {len(official_only)}"
+                       f"（样例 {official_only[:8]}）"})
     if name_conflicts:
-        conflicts.append(
-            f"名称不一致 {len(set(name_conflicts))}"
-            f"（样例 {sorted(set(name_conflicts))[:8]}）")
+        unique = sorted(set(name_conflicts))
+        conflicts.append({
+            "kind": "name_mismatch", "count": len(unique), "codes": unique,
+            "message": f"名称不一致 {len(unique)}（样例 {unique[:8]}）"})
     warning = east.warning
     if conflicts:
-        note = ("两源冲突：" + "；".join(conflicts) +
+        note = ("两源冲突：" + "；".join(item["message"] for item in conflicts) +
                 "；按「是 ST」取并集（不会漏报）")
         warning = f"{warning}；{note}" if warning else note
-    return st.StListSnapshot(
+    snapshot = st.StListSnapshot(
         available=True, stocks=stocks, coverage=east.coverage,
         source="eastmoney", fetched_at=east.fetched_at,
         session_date=east.session_date, degraded=east.degraded,
         warning=warning, state="ok", stale=east.stale, retried=east.retried,
         cleaned_duplicates=east.cleaned_duplicates, reason=east.reason,
         merged_from=["eastmoney"] + [item.source for item in official_lists])
+    return snapshot, conflicts
 
 
-def _official_only_snapshot(official_lists) -> st.StListSnapshot:
-    """两所官方名单合并成快照（覆盖沪深 A，不含北交所/B股）。"""
+def _official_only_snapshot(official_lists):
+    """两所官方名单合并成快照（覆盖沪深 A 股 + 深市 B 股，不含北交所）。
+
+    返回 ``(snapshot, conflicts)``；``conflicts`` 语义同
+    :func:`_merge_east_with_official`。
+    """
     frame = st_exchange.merge_to_frame(official_lists)
     snapshot = st.snapshot_from_frame(frame)
     snapshot.source = "exchange"
     snapshot.coverage = str(frame.attrs.get("coverage") or snapshot.coverage)
     snapshot.merged_from = [item.source for item in official_lists]
     note = ("东财不可用，回退交易所官方风险警示名单（"
-            f"{snapshot.coverage}）；官方名单不含北交所/B股，"
-            "这些标的仍需实时报价名称兜底")
+            f"{snapshot.coverage}）；官方名单不含北交所，"
+            "北交所标的仍需实时报价名称兜底")
     frame_warning = frame.attrs.get("warning")
     snapshot.warning = f"{note}；{frame_warning}" if frame_warning else note
-    return snapshot
+    return snapshot, list(frame.attrs.get("conflicts") or [])
 
 
 def precompute(now=None, force=False, dry_run=False, budget=None,
@@ -213,7 +230,8 @@ def precompute(now=None, force=False, dry_run=False, budget=None,
         "path": None,
         "source": None,
         "merged_from": [],
-        "conflicts": None,
+        "conflicts": [],
+        "conflict_summary": None,
         "sources": {},
         "official_errors": [],
         "blocked": False,
@@ -311,9 +329,10 @@ def precompute(now=None, force=False, dry_run=False, budget=None,
                        and len(official_result.lists) == 2)
 
     chosen = None
+    conflicts = []
     if east_ok:
         lists = list(official_result.lists) if official_result else []
-        chosen = _merge_east_with_official(east_snapshot, lists)
+        chosen, conflicts = _merge_east_with_official(east_snapshot, lists)
         stats["source"] = "eastmoney"
         if official_result and official_result.errors:
             note = ("官方备胎部分失败（" + "；".join(
@@ -323,7 +342,7 @@ def precompute(now=None, force=False, dry_run=False, budget=None,
             chosen.warning = f"{chosen.warning}；{note}" if chosen.warning \
                 else note
     elif official_ok:
-        chosen = _official_only_snapshot(official_result.lists)
+        chosen, conflicts = _official_only_snapshot(official_result.lists)
         stats["source"] = "exchange"
     else:
         # 没有任何所需源给出完整名单：只告警，绝不覆盖已有好缓存。
@@ -354,7 +373,12 @@ def precompute(now=None, force=False, dry_run=False, budget=None,
     stats["state"] = "ok"
     stats["count"] = len(chosen.stocks)
     stats["merged_from"] = list(chosen.merged_from)
-    stats["conflicts"] = chosen.warning
+    # issue #123：``conflicts`` 装**结构化冲突条目**（不是整段 warning）。
+    # 每条：{"kind": "east_only" / "official_only" / "name_mismatch",
+    #        "count": n, "codes": [...], "message": "..."}。
+    # 整段文案在 ``reason`` / 缓存 warning 里（保持原样，additive）。
+    stats["conflicts"] = conflicts
+    stats["conflict_summary"] = chosen.warning
     stats["reason"] = chosen.warning
     if east_ok:
         # 东财成功说明封锁已解除：清掉可能残留的过期/已强制跳过的冷却文件。
@@ -418,7 +442,8 @@ def main(argv=None) -> int:
               f"state={stats['state']} source={stats['source']} "
               f"merged_from={merged} -> {stats['path']}")
         if stats["conflicts"]:
-            print(f"  CONFLICT {stats['conflicts']}", file=sys.stderr)
+            for conflict in stats["conflicts"]:
+                print(f"  CONFLICT {conflict['message']}", file=sys.stderr)
     else:
         print(f"FAIL requests={stats['requests']} state={stats['state']} "
               f"blocked={stats['block_reason'] or '-'} "

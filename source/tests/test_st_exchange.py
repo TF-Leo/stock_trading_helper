@@ -3,7 +3,7 @@
 
 对应 ``source/stock_analysis/data_sources/st_exchange.py``。所有网络入口
 （``st_exchange.requests.get``）都打桩，不触网。测试代码只使用公开基准/虚构
-代码（600519/600000/600001/000002/688001），不出现任何真实持仓代码。
+代码（600519/600000/600001/000002/200056/688001），不出现任何真实持仓代码。
 """
 from __future__ import annotations
 
@@ -118,6 +118,37 @@ def test_fetch_sse_rejects_truncated_page(monkeypatch):
         st_exchange.fetch_sse_st_list()
 
 
+def test_fetch_sse_rejects_total_beyond_single_page(monkeypatch):
+    """issue #123：total 超过单页上限 → 必须分页；这里显式失败，不静默截断。"""
+    calls = []
+    rows = [{"A_STOCK_CODE": "600001", "SEC_NAME_CN": "ST示例",
+             "STATE_CODE": "7"}]
+    payload = _sse_payload(rows=rows, total=1)
+    payload["pageHelp"].update({"pageSize": 2000, "pageCount": 1})
+    _fake_get(monkeypatch, calls, sse=payload)
+    assert st_exchange.fetch_sse_st_list().codes == {"600001"}
+
+    calls = []
+    payload = _sse_payload(rows=rows, total=2500)
+    payload["pageHelp"].update({"pageSize": 2000, "pageCount": 2})
+    _fake_get(monkeypatch, calls, sse=payload)
+    with pytest.raises(st_exchange.StExchangeError, match="分页"):
+        st_exchange.fetch_sse_st_list()
+
+
+def test_fetch_sse_measured_shape_is_complete(monkeypatch):
+    """2026-11-16 实测形状：total=80 / pageSize=2000 / pageCount=1，正常通过。"""
+    calls = []
+    rows = [{"A_STOCK_CODE": f"6000{i:02d}", "SEC_NAME_CN": "ST示例",
+             "STATE_CODE": "7"} for i in range(80)]
+    payload = _sse_payload(rows=rows, total=80)
+    payload["pageHelp"].update({"pageSize": 2000, "pageCount": 1})
+    _fake_get(monkeypatch, calls, sse=payload)
+    snapshot = st_exchange.fetch_sse_st_list()
+    assert len(snapshot.rows) == 80
+    assert snapshot.requests == 1
+
+
 def test_fetch_sse_rejects_filter_not_applied(monkeypatch):
     calls = []
     rows = [
@@ -219,6 +250,66 @@ def test_fetch_szse_missing_metadata_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# issue #123：tabkey 校验（单块回退曾经静默吃下 tab2）
+# ---------------------------------------------------------------------------
+def test_fetch_szse_single_block_with_wrong_tabkey_raises(monkeypatch):
+    """响应顶层只有 1 个块、但 tabkey=tab2（退市整理）→ 必须显式失败。
+
+    旧实现有「顶层恰好一个块就吃 payload[0]」的回退，会把退市整理名单
+    静默当成风险警示名单。
+    """
+    calls = []
+    pages = {1: [_szse_item([{"zqdm": "000002", "gsjc": "ST示例二"}],
+                            page_no=1, pagecount=1, recordcount=1,
+                            tabkey="tab2")]}
+    _fake_get(monkeypatch, calls, szse=pages)
+    with pytest.raises(st_exchange.StExchangeError, match="tabkey"):
+        st_exchange.fetch_szse_st_list()
+    assert len(calls) == 1
+
+
+def test_fetch_szse_single_block_without_tabkey_raises(monkeypatch):
+    """顶层只有 1 个块、metadata 里干脆没有 tabkey → 同样不得回退。"""
+    calls = []
+    item = _szse_item([{"zqdm": "000002", "gsjc": "ST示例二"}],
+                      page_no=1, pagecount=1, recordcount=1)
+    del item["metadata"]["tabkey"]
+    _fake_get(monkeypatch, calls, szse={1: [item]})
+    with pytest.raises(st_exchange.StExchangeError, match="tabkey"):
+        st_exchange.fetch_szse_st_list()
+
+
+def test_fetch_szse_picks_tab1_when_both_tabs_present(monkeypatch):
+    """真实响应形状：tab1 + tab2 同时返回，只吃 tab1（tab2 退市整理 0 条）。"""
+    calls = []
+    tab2 = _szse_item([], page_no=1, pagecount=0, recordcount=0, tabkey="tab2")
+    tab2["metadata"]["name"] = "退市整理股票"
+    pages = {1: [_szse_item([{"zqdm": "000002", "gsjc": "ST示例二"},
+                             {"zqdm": "200056", "gsjc": "*ST示例B"}],
+                            page_no=1, pagecount=1, recordcount=2),
+                 tab2]}
+    _fake_get(monkeypatch, calls, szse=pages)
+    snapshot = st_exchange.fetch_szse_st_list()
+    assert snapshot.codes == {"000002", "200056"}
+
+
+def test_fetch_szse_wrong_tabkey_on_later_page_raises(monkeypatch):
+    """翻页途中某一页只回 tab2 → 显式失败，不把两页拼成半截名单。"""
+    calls = []
+    pages = {
+        1: [_szse_item([{"zqdm": "000002", "gsjc": "ST示例二"}],
+                       page_no=1, pagecount=2, recordcount=2)],
+        2: [_szse_item([{"zqdm": "000003", "gsjc": "ST示例三"}],
+                       page_no=2, pagecount=2, recordcount=2,
+                       tabkey="tab2")],
+    }
+    _fake_get(monkeypatch, calls, szse=pages)
+    with pytest.raises(st_exchange.StExchangeError, match="tabkey"):
+        st_exchange.fetch_szse_st_list()
+    assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
 # 两所汇总 / 合并
 # ---------------------------------------------------------------------------
 def _snapshot(source, rows, requests=1, coverage="x"):
@@ -282,10 +373,40 @@ def test_merge_lists_union_and_name_conflict():
 
     rows, coverage, warning = st_exchange.merge_lists([sse, szse])
     assert [row["code"] for row in rows] == ["000002", "600001", "600002"]
-    assert coverage == "沪深A（官方，不含北交所/B股）"
+    assert coverage == "沪深A+B（官方，不含北交所）"
     assert warning and "600001" in warning and "*ST 优先" in warning
     kept = {row["code"]: row for row in rows}["600001"]
     assert kept["name"] == "*ST示例" and kept["st_type"] == "*ST"
+
+
+def test_merge_lists_detailed_exposes_structured_conflicts():
+    """issue #123：冲突要有结构化条目（kind/count/codes），不是整段文案。"""
+    sse = _snapshot("sse", [
+        {"code": "600001", "name": "*ST示例", "st_type": "*ST",
+         "market": "sh", "source": "sse"}])
+    szse = _snapshot("szse", [
+        {"code": "600001", "name": "ST示例改名", "st_type": "ST",
+         "market": "sh", "source": "szse"}])
+
+    rows, coverage, warning, conflicts = st_exchange.merge_lists_detailed(
+        [sse, szse])
+    assert [row["code"] for row in rows] == ["600001"]
+    assert len(conflicts) == 1
+    entry = conflicts[0]
+    assert entry["kind"] == "name_mismatch"
+    assert entry["count"] == 1
+    assert entry["codes"] == ["600001"]
+    assert entry["message"] in warning
+
+
+def test_merge_lists_detailed_no_conflicts_is_empty_list():
+    sse = _snapshot("sse", [
+        {"code": "600001", "name": "*ST示例", "st_type": "*ST",
+         "market": "sh", "source": "sse"}])
+    _rows, _coverage, warning, conflicts = st_exchange.merge_lists_detailed(
+        [sse])
+    assert warning is None
+    assert conflicts == []
 
 
 def test_merge_to_frame_attrs_and_market_of():
@@ -294,6 +415,7 @@ def test_merge_to_frame_attrs_and_market_of():
          "market": "sh", "source": "sse"}], coverage="沪A")])
     assert list(frame.columns) == ["code", "name", "st_type", "market", "source"]
     assert frame.attrs["coverage"] == "沪A（官方，不含B股）"
+    assert "conflicts" not in frame.attrs, "无冲突时不写空条目"
     assert st_exchange.market_of("830001") == "bj"
     assert st_exchange.market_of("600519") == "sh"
     assert st_exchange.market_of("000002") == "sz"

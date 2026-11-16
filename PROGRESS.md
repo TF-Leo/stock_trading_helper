@@ -1,5 +1,44 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-16 · ST 官方备胎四项残留（issue #123）
+
+- **分支**：`TF-Leo/st-tabkey`（父 `origin/main` `d800336`）；关联 issue #123；
+  **PR 待建，不合并**。未改合并策略、未动 `decision/*`、未引入依赖。
+- **改动（6 个文件）**：
+  1. **SZSE tabkey 校验（数据正确性）**：删除「顶层只有 1 个块就吃
+     `payload[0]`」的单块回退。响应顶层通常同时含 `tab1`（风险警示股票）与
+     `tab2`（退市整理股票）；现在**每一页**都必须按 `metadata.tabkey=='tab1'`
+     命中，否则抛 `StExchangeError` 并在文案里列出实际收到的 tabkey。
+     新增 4 项测试：单块 tab2 / 单块缺 tabkey / 翻页途中出现 tab2 → 失败；
+     tab1+tab2 同时返回 → 只吃 tab1。
+  2. **深市 fxjsb 实含 B 股**：2026-11-16 实测 115 条含 `200056 *ST皇庭B`、
+     `200488 ST晨鸣B`。改文案：`SZSE_COVERAGE="深A+B（官方，风险警示板含 B
+     股）"`、合并覆盖「沪深A+B（官方，不含北交所）」；模块 docstring /
+     `docs/ST_LIST_PRECOMPUTE.md` / README 同步。**B 股纳入策略**：保留（官方
+     口径就是风险警示股票）；B 股代码的 `is_st` 为 `true`，但本项目只交易
+     A 股，不进候选池；若将来纳入 B 股，该判定语义仍正确。
+  3. **注释条数按实测更新**：SSE 由「78 条 / 10 只 688」改为「**80 条 / 12
+     只 688**」（2026-11-16 复核 `pageHelp.total=80`、`pageCount=1`、
+     `pageSize=2000`）。**SSE 完整性结论**：80 < 2000 且 `pageCount=1`，
+     单页即全量，**无截断**；另加 `total<=pageSize` 与 `pageCount==1` 双重
+     校验，将来超过单页上限会显式失败而不是静默截断（+2 项测试）。
+  4. **`stats.conflicts` 语义**：由整条 warning 改为**结构化条目列表**
+     `[{"kind": "east_only"/"official_only"/"name_mismatch", "count": n,
+     "codes": [...], "message": "..."}]`，无冲突为 `[]`；整段文案移到
+     `stats.conflict_summary`（`stats.reason` 与缓存 warning 不变）。
+     `st_exchange.merge_lists_detailed()` 新增，`merge_lists()` 保持原签名。
+- **官方源实测（本机 2026-11-16，串行，共 10 次请求，未探测东财）**：
+  - SSE：`COMPANY_STATUS=7` → 200，`total=80`、`pageSize=2000`、
+    `pageCount=1`、80 行全部 `STATE_CODE=7`、12 只 688、名称全部带 ST 前缀。
+  - SZSE：`CATALOGID=fxjsb` → 200，两块（`tab1` 115 条 / 6 页，
+    `tab2` 退市整理 0 条）；代码前缀 `000/002/200/300/301`，其中 2 只 B 股。
+  - 落盘回放（零网络）：`fetch_official_st_lists()` → sse 80 + szse 115、
+    7 请求、0 错误；`merge_lists_detailed()` → 195 行、
+    `沪深A+B（官方，不含北交所）`、无冲突；只回 tab2 的回放 → 显式失败。
+- **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5 / pandas 3.0.1）**：
+  - `python -m pytest source/tests/ -q` → **1176 passed in 101.06s**。
+  - `tools/check_gates.ps1`：本机无 `pwsh`，**未验证**（与前几轮同）。
+
 ## 2026-11-16 · 测试隔离真实 state 目录（issue #124）
 
 - **分支**：`TF-Leo/test-state-isolation`（父 `origin/main` `23af90f`）；
@@ -114,6 +153,9 @@
     **2000**（请求 10000 仍回 2000）；字段 `A_STOCK_CODE` / `SEC_NAME_CN` /
     `STATE_CODE`。实测 `STATE_CODE=7` 恰为全部名称带 ST/*ST 的风险警示股
     （当次 78 条，含 10 只 688 科创板）。首猜页面 URL 404，未重试。
+    > **2026-11-16 更正（issue #123）**：该次按 2000 行截断误数，实测应为
+    > **80 条 / 12 只 688**（`pageHelp.total=80`、`pageCount=1`，未截断）。
+    > 另：`STATE_CODE_STOCK=8` 与风险警示无关，旧文表述已删。
   - 深交所风险警示板页面 `GET https://www.szse.cn/disclosure/listed/warn/index.html`
     → **HTTP 200**，页面 `data-s-catalog-id="fxjsb"`；数据 API
     `GET https://www.szse.cn/api/report/ShowReport/data`
@@ -141,6 +183,9 @@
   都算冲突，写 `stats.conflicts` / 缓存 warning / stderr（`CONFLICT`），
   `*ST` 名称优先；北交所不在官方覆盖内，不算冲突。官方单独落盘时
   `coverage=沪深A（官方，不含北交所/B股）`，warning 明示缺口。
+  > **2026-11-16 更正（issue #123）**：深市 `fxjsb` 实含 2 只 B 股
+  > （`200056` / `200488`），覆盖文案已改为「沪深A+B（官方，不含北交所）」；
+  > `stats.conflicts` 改为结构化条目列表（见本轮台账）。
 - **不覆盖好缓存**：东财失败 + 官方仅一所成功 / 官方空表 / 任一结构异常 →
   不写缓存（逐字节断言旧缓存不变）；官方成功**不清**东财冷却（东财可能仍封）。
 - **冷却语义**：东财冷却期内东财 **0 请求**，但仍尝试官方两所（不同主机）；
