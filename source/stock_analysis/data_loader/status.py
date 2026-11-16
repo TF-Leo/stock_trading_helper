@@ -47,6 +47,7 @@ __all__ = [
     "ST_LIST_STATE_DIR_ENV",
     "ST_LIST_COOLDOWN_PATH_ENV",
     "ST_LIST_COOLDOWN_SECONDS",
+    "ST_LIST_SURFACE",
     "StListEmptyError",
     "StListDuplicateError",
     "StListBlocked",
@@ -83,6 +84,11 @@ ST_LIST_COOLDOWN_PATH_ENV = "ST_LIST_COOLDOWN_PATH"
 ST_LIST_COOLDOWN_SECONDS = float(os.getenv(
     "ST_LIST_COOLDOWN_SECONDS", str(em_guard.cooldown_seconds())))
 ST_LIST_CACHE_SCHEMA = 2
+
+#: ST 名单守护的东财域名（issue #130）：clist 主域 ``push2``；``push2delay``
+#: 是同一接口的延迟镜像（生成物 ``EM_CLIST_HOSTS``），共用本域冷却条目 ——
+#: 主域被封时换镜像域重试毫无意义，必须一起停。
+ST_LIST_SURFACE = "push2.eastmoney.com"
 
 _GEM_BOARDS = ("sz_gem", "sh_star")
 _TRADING_DAY_LOOKBACK = 30
@@ -602,26 +608,49 @@ def _cache_date(payload: dict) -> str:
     return fetched or "未知日期"
 
 
-def cooldown_state(now: Optional[_dt.datetime] = None) -> Optional[dict]:
+def cooldown_state(now: Optional[_dt.datetime] = None,
+                   surface: Optional[str] = ST_LIST_SURFACE) -> Optional[dict]:
     """读取冷却状态；仍在生效才返回（附带 ``remaining_seconds``），否则 None。
 
-    issue #108：委托 ``eastmoney_guard.cooldown_state`` —— 资金流与 ST 名单
-    共用同一个文件、同一套过期判定。
+    issue #108：委托 ``eastmoney_guard`` —— 资金流与 ST 名单共用同一个文件、
+    同一套过期判定。issue #130：默认按 **ST 自己的域**（``push2``）读
+    「顶层共享封锁 ∪ 本域条目」；``datacenter-web`` 单独冷却不会让 ST 名单
+    整轮停摆。传 ``surface=None`` 只读顶层共享封锁（旧语义）。
     """
+    if surface:
+        return em_guard.scoped_cooldown_state(now=now, path=cooldown_path(),
+                                              surface=surface)
     return em_guard.cooldown_state(now=now, path=cooldown_path())
 
 
 def mark_cooldown(reason: str, detail: Optional[str] = None,
                   seconds: Optional[float] = None,
-                  now: Optional[_dt.datetime] = None) -> dict:
-    """写入跨进程冷却（``eastmoney_cooldown.json``，原子替换）。"""
+                  now: Optional[_dt.datetime] = None,
+                  surface: Optional[str] = ST_LIST_SURFACE,
+                  escalate=None) -> dict:
+    """写入跨进程冷却（``eastmoney_cooldown.json``，原子替换）。
+
+    issue #130：默认只写 ST 自己的域条目（``surfaces["push2…"]``），不污染
+    顶层共享封锁；顶层块由 :func:`em_guard.mark_cooldown` 在同一冷却窗口内
+    ≥2 个域都命中 444 时自动升级（``escalate=True/False`` 可强制）。
+    ``surface=None`` 恢复旧语义（直接写顶层共享封锁）。
+    """
     wait = (ST_LIST_COOLDOWN_SECONDS if seconds is None else float(seconds))
     return em_guard.mark_cooldown(reason, detail, seconds=wait, now=now,
-                                  path=cooldown_path())
+                                  path=cooldown_path(), surface=surface,
+                                  escalate=escalate)
 
 
-def clear_cooldown() -> None:
-    """删除冷却状态（人工解除封锁后复跑预计算时用）。"""
+def clear_cooldown(surface: Optional[str] = ST_LIST_SURFACE) -> None:
+    """清除冷却（人工解除封锁后复跑预计算时用）。
+
+    issue #130：默认只删 ST 自己的域条目，不碰其它域与顶层共享封锁；
+    ``surface=None`` 删除整个冷却文件（旧语义，``--clear-cooldown`` 之外的
+    人工排障用）。
+    """
+    if surface:
+        em_guard.clear_cooldown(path=cooldown_path(), surface=surface)
+        return
     em_guard.clear_cooldown(path=cooldown_path())
 
 
@@ -642,6 +671,11 @@ class StListFetchGuard(em_guard.EmFetchGuard):
     444 / FIN 时直接抛 :class:`StListBlocked`（不是
     ``requests.RequestException``），让上游不会把一次封禁放大成多次请求。
 
+    issue #130：``surface=ST_LIST_SURFACE`` —— 冷却**读**「顶层共享封锁 ∪
+    本域」，**写**只写本域（``surfaces["push2…"]``），因此 ``datacenter-web``
+    的事件任务被 444 时 ST 名单仍可运行（反之亦然）。顶层共享块只在该冷却
+    窗口内 ≥2 个域都命中 444 时由 ``mark_cooldown`` 自动升级。
+
     用法::
 
         guard = StListFetchGuard()
@@ -650,11 +684,13 @@ class StListFetchGuard(em_guard.EmFetchGuard):
         guard.requests, guard.block_reason
     """
 
-    def __init__(self, budget=None, now_fn=None, respect_cooling=True) -> None:
+    def __init__(self, budget=None, now_fn=None, respect_cooling=True,
+                 surface=ST_LIST_SURFACE, escalate=None) -> None:
         super().__init__(budget=budget, path=cooldown_path(),
                          cooldown_seconds_override=ST_LIST_COOLDOWN_SECONDS,
                          block_exc=StListBlocked, now_fn=now_fn,
-                         respect_cooling=respect_cooling)
+                         respect_cooling=respect_cooling, surface=surface,
+                         escalate=escalate)
 
 
 def fetch_st_list() -> StListSnapshot:

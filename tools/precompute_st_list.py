@@ -48,9 +48,13 @@ push2/push2delay 的请求数为 **0**。
 零字节 FIN 时**立即中止东财本轮**（不换域、不重试），写
 ``data/state/eastmoney_cooldown.json``（issue #108 起与资金流预计算**共用
 同一份冷却文件**），默认冷却 1800 秒（``EASTMONEY_COOLDOWN_SECONDS`` 可覆盖）。
-冷却期内**不再请求东财**，但仍会尝试官方备胎（官方是不同主机，不受东财
-冷却影响）。每轮对东财同一域名的请求数有硬上限（默认 60，``--budget`` /
-``EASTMONEY_REQUEST_BUDGET`` 可覆盖）。
+issue #130 起冷却**按域隔离**：只写 ``surfaces["push2 家族"]``
+（``push2`` / ``push2delay`` / ``push2his`` 同一风控面，归并成一个键），
+不写顶层共享块 —— 事件（``datacenter-web``）或监控池被 444 不会让 ST 名单
+整轮停摆，反之亦然。顶层共享块只在同一冷却窗口内 ≥2 个不同域都命中 444
+时自动升级。冷却期内**不再请求东财**，但仍会尝试官方备胎（官方是不同主机，
+不受东财冷却影响）。每轮对东财同一域名的请求数有硬上限（默认 60，
+``--budget`` / ``EASTMONEY_REQUEST_BUDGET`` 可覆盖）。
 
 cron（实际接线由协调者安排）
 ----------------------------
@@ -381,7 +385,8 @@ def precompute(now=None, force=False, dry_run=False, budget=None,
     stats["conflict_summary"] = chosen.warning
     stats["reason"] = chosen.warning
     if east_ok:
-        # 东财成功说明封锁已解除：清掉可能残留的过期/已强制跳过的冷却文件。
+        # 东财成功说明封锁已解除：清掉本域可能残留的过期/已强制跳过的条目
+        # （issue #130：只清 push2 家族，不碰其它域与顶层共享封锁）。
         # 官方备胎成功**不**清东财冷却（东财可能仍在封禁）。
         try:
             st.clear_cooldown()
@@ -419,10 +424,12 @@ def main(argv=None) -> int:
 
     if args.clear_cooldown:
         st.clear_cooldown()
-        message = f"已清除冷却文件 {st.cooldown_path()}"
+        message = f"已清除本域冷却条目 {st.ST_LIST_SURFACE}（{st.cooldown_path()}）"
         print(message)
         if args.json:
-            print(json.dumps({"cleared": st.cooldown_path()}, ensure_ascii=False))
+            print(json.dumps({"cleared": st.ST_LIST_SURFACE,
+                              "path": st.cooldown_path()},
+                             ensure_ascii=False))
         return EXIT_OK
 
     try:

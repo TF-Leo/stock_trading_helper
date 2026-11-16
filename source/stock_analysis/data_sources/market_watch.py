@@ -74,6 +74,7 @@ __all__ = [
     "MARKET_WATCH_KEYS",
     "MONITOR_URL",
     "OFFLINE_ENV",
+    "SURFACE",
     "PoolSnapshot",
     "MarketWatchError",
     "cache_path",
@@ -95,6 +96,8 @@ MONITOR_URL = "https://mobappconfig.securities.eastmoney.com/emcfg/stock_monitor
 MONITOR_REFERER = "https://vipmoney.eastmoney.com/"
 UPSTREAM = "a-stock-data v3.10.4 §8.4 em_stock_monitor"
 SOURCE = "eastmoney_stock_monitor"
+#: 冷却域键（issue #130）：监控池是独立主机，与 push2 / datacenter-web 互不误伤。
+SURFACE = "mobappconfig.securities.eastmoney.com"
 
 #: 盘前主路径的超时上限（秒）。上游示例用 20s；这里按 T6 契约压到 3s。
 DEFAULT_TIMEOUT = 3.0
@@ -205,7 +208,10 @@ def fetch_pool(timeout: float = DEFAULT_TIMEOUT) -> List[dict]:
     try:
         # issue #108：东财 IP 级反爬冷却期内一个请求都不发；命中 444 / 零字节
         # FIN 时由闸门写持久冷却（与资金流 / ST 名单共用同一份状态文件）。
-        with _em_guard.EmFetchGuard(block_exc=MarketWatchError):
+        # issue #130：显式传本域（``mobappconfig.securities.eastmoney.com``）——
+        # push2 / datacenter-web 被封不会让监控池整轮停摆，反之亦然。
+        with _em_guard.EmFetchGuard(block_exc=MarketWatchError,
+                                    surface=SURFACE):
             response = _http_get(MONITOR_URL,
                                  {"Referer": MONITOR_REFERER}, timeout)
     except _em_guard.EastmoneyCooling as exc:

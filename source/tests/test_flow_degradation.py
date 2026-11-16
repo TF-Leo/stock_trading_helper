@@ -159,7 +159,10 @@ def test_444_block_stops_eastmoney_requests_and_records_reason(tmp_path, monkeyp
     assert stats["block_reason"] == "http_444"
     assert "反爬阻断" in stats["degraded_reason"]
     assert "已降级到 sina_total_net" in capsys.readouterr().err
-    assert em.cooldown_state()["reason"] == "http_444"
+    # issue #130：资金流只写**本域**（push2 家族），顶层共享块保持干净。
+    assert em.cooldown_state() is None, "单个域 444 不得升级成全域封锁"
+    scoped = em.scoped_cooldown_state(surface=tool.SURFACE_EASTMONEY)
+    assert scoped["reason"] == "http_444" and scoped["scope"] == "surface"
 
     for code in ("600519", "600000"):
         payload = json.loads((tmp_path / f"{code}.json").read_text(encoding="utf-8"))

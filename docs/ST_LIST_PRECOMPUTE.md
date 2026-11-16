@@ -151,14 +151,19 @@ warning / stderr（`CONFLICT ...`）。北交所不在官方覆盖内，**不算
 
 * 命中 HTTP 444 或零字节 FIN → 抛 `StListBlocked`（刻意不继承
   `requests.RequestException`）：**不换域、不重试，一次即止**；
-* 写 `source/stock_analysis/data/state/st_list_cooldown.json`
-  （`reason` / `detail` / `blocked_at` / `blocked_until`，默认 1800s，
-  可用 `ST_LIST_COOLDOWN_SECONDS` 覆盖）；
+* 写 `source/stock_analysis/data/state/eastmoney_cooldown.json` 的
+  `surfaces["push2 家族"]` 条目（`reason` / `detail` / `blocked_at` /
+  `blocked_until`，默认 1800s，可用 `EASTMONEY_COOLDOWN_SECONDS` 覆盖）。
+  issue #130 起与资金流共用同一个域键（`push2` / `push2delay` / `push2his`
+  同一风控面），**不写**顶层共享块 —— 事件（`datacenter-web`）或监控池被
+  444 不会让 ST 名单整轮停摆。顶层共享块只在同一冷却窗口内 ≥2 个不同域都
+  命中 444 时由 `mark_cooldown` 自动升级；
 * 冷却期内**不再请求东财**（东财 0 请求）；2026-11-15 起**仍会尝试交易所
   官方备胎**（不同主机，不受东财冷却影响）。若官方两所都成功，本轮照常
   落盘、退出码 0；若 `--no-official` 且冷却中，才是 0 请求跳过（退出码 3）；
 * 人工确认封锁解除后可 `--force` 或 `--clear-cooldown`。只有**东财成功**
-  才清冷却文件；官方备胎成功不清（东财可能仍在封禁）。
+  才清冷却（只清本域条目，其它域与顶层共享封锁保留）；官方备胎成功不清
+  （东财可能仍在封禁）。
 
 ## 7. 命令与退出码
 

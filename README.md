@@ -574,6 +574,18 @@ nginx 444 / 零字节 FIN 时，预计算立即熔断并写
 的请求数有硬上限（默认 60，`EASTMONEY_REQUEST_BUDGET` 可覆盖）；超限提前退出
 并告警，不落半截缓存。
 
+**冷却按域隔离（issue #130）**：所有东财取数调用（资金流 / ST 名单 / 事件 /
+监控池）都显式传 `surface=<自己的域名>`，444 只写
+`eastmoney_cooldown.json` 的 `surfaces[<域名>]`，**不写**顶层共享块。
+`push2` / `push2delay` / `push2his` 是同一套 L7 反爬规则，归并成**同一个**
+surface 键（`push2.eastmoney.com`）；`datacenter-web.eastmoney.com`
+（事件）与 `mobappconfig.securities.eastmoney.com`（监控池）各自独立。
+读取取「顶层共享封锁 ∪ 本域」并集，所以 18:30 资金流被 444 不会再让
+18:45 的事件任务 0 请求跳过。顶层共享块 = **显式全域封锁**：只有同一冷却
+窗口内 **≥2 个不同域**都命中 444（判定为出口 IP 级封锁）才由
+`mark_cooldown` 自动写下（`surfaces_blocked` 列出当时生效的域）；单个域命中
+只写本域。`--clear-cooldown` 只删本域条目。
+
 **只展示、不改决策**：`evidence.flow` 不参与 `action`、`status`、`position_fraction`、
 `entry_zone`、`target_position` 的任何计算；A/B 对照中 `recommendation` 逐键一致。
 
@@ -761,7 +773,8 @@ source/stock_analysis/data/state/events/events.json
   `surfaces["datacenter-web.eastmoney.com"]`，不写顶层共享封锁 —— `push2` /
   `push2his` 与 `datacenter-web` 是东财两套网关（历史上 push2 被 444 时
   datacenter 仍 200），共用一个整域键会互相误伤。读取时取「顶层共享封锁 ∪
-  本域条目」并集：任一命中都 0 请求。
+  本域条目」并集：任一命中都 0 请求。顶层块 = **显式全域封锁**，只有同一
+  冷却窗口内 ≥2 个不同域都命中 444（出口 IP 级封禁）才会被写下。
 
 ```
 evidence.events = {

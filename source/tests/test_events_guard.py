@@ -350,6 +350,7 @@ def test_clear_cooldown_surface_keeps_other_surfaces(tmp_path, monkeypatch):
     monkeypatch.setenv(em.STATE_PATH_ENV, str(tmp_path / "cool.json"))
     em.mark_cooldown("http_444", "datacenter", seconds=600, now=NOW,
                      surface=pe.SURFACE)
+    # issue #130：push2 家族三个主机归并成同一个 surface 键。
     em.mark_cooldown("http_444", "push2", seconds=600, now=NOW,
                      surface="push2his.eastmoney.com")
 
@@ -357,7 +358,7 @@ def test_clear_cooldown_surface_keeps_other_surfaces(tmp_path, monkeypatch):
 
     raw = json.loads((tmp_path / "cool.json").read_text(encoding="utf-8"))
     assert DATACENTER_HOST not in raw[em.SURFACES_KEY]
-    assert "push2his.eastmoney.com" in raw[em.SURFACES_KEY]
+    assert em.PUSH2_SURFACE in raw[em.SURFACES_KEY]
 
 
 # ---------------------------------------------------------------------------

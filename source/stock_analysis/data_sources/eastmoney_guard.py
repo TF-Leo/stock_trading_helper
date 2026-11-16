@@ -42,12 +42,29 @@ TLS / DNS / 路由均正常 → 这是**对本机出口 IP 的反爬封禁**，�
     }
 
 * **写**：带 ``surface`` 的闸门只写 ``surfaces[<域名>]``，顶层共享字段原样保留
-  —— 一个域被封不会让另一个域的任务整轮停摆；
+  —— 一个域被封不会让另一个域的任务整轮停摆（唯一例外是下面说的
+  「≥2 个不同域都命中 444」的显式全域封锁）；
 * **读**：``scoped_cooldown_state()`` 先看顶层共享封锁（任何域被封都视为
   "此刻别碰东财"，保守），再看本域条目；顶层封锁只会让本轮 **0 请求**并保留
   旧缓存，不会延长或升级封锁；
-* 不带 ``surface`` 的既有调用（资金流 / ST 名单 / 监控池）行为完全不变：
-  只读写顶层字段。
+* 不带 ``surface`` 的既有调用仍只读写顶层字段（兼容旧调用 / 测试）。
+
+顶层共享封锁 = **显式全域封锁**（issue #130）
+---------------------------------------------
+顶层块不再是「某个域 444」的副作用，而是「疑似 IP 级封禁」的判定结果：
+``mark_cooldown(surface=…)`` 默认**自动升级** —— 若冷却文件里已有**另一个仍在
+生效的域条目**（同一冷却窗口内 ≥2 个不同域命中 444），说明不是单个网关的
+策略，而是整条出口 IP 被封，此时同时写顶层共享块（记录
+``surfaces_blocked``）。只有单个域命中时**只写本域**，其它域的任务照常运行。
+
+升级判定可用参数覆盖：``escalate=True`` 强制写顶层（人工判定 / 测试），
+``escalate=False`` 永不写顶层。因此：
+
+* ``push2his`` 在 18:30 被 444 → 只写 ``surfaces["push2.eastmoney.com"]``
+  （push2 家族共用一个键），18:45 的 datacenter 任务读取并集时本域无条目、
+  顶层无封锁 → **照常运行**；
+* 同一窗口内 push2his 与 datacenter 都被 444 → 第二个域写本域条目时自动写
+  顶层共享块 → 之后所有域 0 请求（这才是「整条出口别碰」）。
 
 与 ``tencent_throttle`` 的关系
 ------------------------------
@@ -98,6 +115,10 @@ __all__ = [
     "BLOCKED_STATUS",
     "SCHEMA_VERSION",
     "SURFACES_KEY",
+    "PUSH2_SURFACE",
+    "DATACENTER_SURFACE",
+    "MONITOR_SURFACE",
+    "surface_of",
     "AntiScrapeBlocked",
     "EastmoneyCooling",
     "EastmoneyBudgetExceeded",
@@ -128,6 +149,14 @@ BLOCKED_STATUS = 444
 SCHEMA_VERSION = 1
 #: 域级冷却条目的键（``surfaces[<hostname>]``）；顶层字段是共享封锁。
 SURFACES_KEY = "surfaces"
+
+#: 域级冷却的**规范键**（issue #130）。``push2`` / ``push2delay`` / ``push2his``
+#: 是同一套 L7 反爬规则（同一个风控面，只是主机名不同），因此三者共用一个
+#: surface 键；否则「资金流命中 push2his + ST 名单命中 push2」会被误判成
+#: 「两个不同域都 444」而错误升级成全域封锁。
+PUSH2_SURFACE = "push2.eastmoney.com"
+DATACENTER_SURFACE = "datacenter-web.eastmoney.com"
+MONITOR_SURFACE = "mobappconfig.securities.eastmoney.com"
 
 #: 零字节 FIN / 连接被反爬层直接切断的常见文案（requests / ssl / 原生 socket）。
 _BLOCK_MARKERS = (
@@ -350,6 +379,7 @@ def scoped_cooldown_state(now=None, path=None, surface=None) -> dict | None:
     if payload is None:
         return None
     now_ts = _now_ts(now)
+    surface = surface_of(surface) if surface else None
     candidates = []
     shared = _active(payload, now_ts)
     if shared is not None:
@@ -366,21 +396,30 @@ def scoped_cooldown_state(now=None, path=None, surface=None) -> dict | None:
 
 
 def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
-                  path=None, surface=None) -> dict:
+                  path=None, surface=None, escalate=None) -> dict:
     """写入跨进程冷却（原子替换），返回本次写下的那条冷却记录。
 
     「读-改-写」在文件锁内完成：并发进程各自只追加自己知道的封锁，不会用
     旧状态覆盖对方刚写下的更晚到期时间（取 ``max``）。
 
-    ``surface`` 给定时只写 ``surfaces[<域名>]``（域级封锁），顶层共享字段与
+    ``surface`` 给定时写 ``surfaces[<域名>]``（域级封锁），顶层共享字段与
     其它域条目原样保留 —— 一个域被封不会误伤另一个域。``surface`` 为空时
-    写顶层共享封锁（资金流 / ST 名单 / 监控池的既有语义），同样保留已有
-    域级条目。
+    写顶层共享封锁（显式全域封锁），同样保留已有域级条目。
+
+    顶层共享封锁的升级（issue #130）
+    --------------------------------
+    ``escalate=None``（默认）时**自动判定**：若冷却文件里已有**另一个仍在生效
+    的域条目**（同一冷却窗口内 ≥2 个不同域都命中 444），则不是单个网关的策略
+    而是整条出口 IP 被封 —— 本次除写本域条目外**同时写顶层共享块**
+    （``surfaces_blocked`` 列出当时生效的域名）。只有单个域命中时只写本域。
+    ``escalate=True`` 强制写顶层，``escalate=False`` 永不写顶层（测试 /
+    人工判定用）。
     """
     now_ts = _now_ts(now)
     wait = cooldown_seconds() if seconds is None else max(0.0, float(seconds))
     until_ts = now_ts + wait
     target = path or state_path()
+    surface = surface_of(surface) if surface else None
     with _FileLock(_lock_path(target)):
         raw = _read_payload(target) or {}
         surfaces = raw.get(SURFACES_KEY)
@@ -406,13 +445,41 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
             "pid": os.getpid(),
         }
         if surface:
-            entry["surface"] = str(surface)
-            surfaces[str(surface)] = entry
+            entry["surface"] = surface
+            surfaces[surface] = entry
+            others = sorted(name for name, value in surfaces.items()
+                            if name != surface and _active(value, now_ts))
+            if escalate is None:
+                escalate_global = bool(others)
+            else:
+                escalate_global = bool(escalate)
             payload = {key: value for key, value in raw.items()
                        if key != SURFACES_KEY}
             payload["schema"] = SCHEMA_VERSION
             payload["schema_version"] = SCHEMA_VERSION
             payload[SURFACES_KEY] = surfaces
+            if escalate_global:
+                # 已有更晚到期的顶层封锁时不得缩短（与域条目同一规则）。
+                shared_until = until_ts
+                current_shared = _active(raw, now_ts)
+                if current_shared:
+                    try:
+                        shared_until = max(shared_until, datetime.fromisoformat(
+                            str(current_shared.get("blocked_until"))
+                        ).timestamp())
+                    except (TypeError, ValueError):
+                        pass
+                shared = dict(entry)
+                shared.pop("surface", None)
+                shared["blocked_until"] = _iso(shared_until)
+                shared["seconds"] = round(shared_until - now_ts, 3)
+                shared["detail"] = (
+                    f"{entry['detail']}；同一冷却窗口内多个域命中 444"
+                    f"（{', '.join([*others, surface])}），判定为出口 IP 级封锁"
+                ).strip("；")
+                shared["scope"] = "shared"
+                shared["surfaces_blocked"] = [*others, surface]
+                payload.update(shared)
         else:
             payload = dict(entry)
             if surfaces:
@@ -424,7 +491,10 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
                       sort_keys=True)
             handle.write("\n")
         os.replace(tmp, target)
-    return entry
+    result = dict(entry)
+    if surface:
+        result["escalated_shared"] = bool(escalate_global)
+    return result
 
 
 def clear_cooldown(path=None, surface=None) -> None:
@@ -432,6 +502,10 @@ def clear_cooldown(path=None, surface=None) -> None:
 
     ``surface`` 给定时只删该域的条目（其它域 / 顶层共享封锁保留）；条目删空后
     不留下空的 ``surfaces`` 键。不给 ``surface`` 时删除整个文件（既有语义）。
+
+    若删完后**没有任何封锁记录**（无顶层块、无其它域条目），整个文件一并
+    删除 —— 否则残留一个空壳文件，运维容易误判成「还在冷却」。只删已过期的
+    条目时文件保留（是否生效由 ``cooldown_state()`` 按时间判定）。
     """
     target = path or state_path()
     if not surface:
@@ -440,6 +514,7 @@ def clear_cooldown(path=None, surface=None) -> None:
         except FileNotFoundError:
             pass
         return
+    surface = surface_of(surface)
     with _FileLock(_lock_path(target)):
         raw = _read_payload(target)
         if not raw:
@@ -453,6 +528,12 @@ def clear_cooldown(path=None, surface=None) -> None:
                    if key != SURFACES_KEY}
         if surfaces:
             payload[SURFACES_KEY] = surfaces
+        if not surfaces and not payload.get("blocked_until"):
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+            return
         tmp = f"{target}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=1,
@@ -516,6 +597,27 @@ def _domain(url) -> str:
     text = str(url or "")
     parsed = urlsplit(text)
     return (parsed.hostname or text).lower()
+
+
+#: push2 家族主机 → 同一个风控面（issue #130）。
+_PUSH2_HOSTS = {
+    "push2.eastmoney.com",
+    "push2delay.eastmoney.com",
+    "push2his.eastmoney.com",
+}
+
+
+def surface_of(host_or_url) -> str:
+    """主机名 / URL → 冷却用的规范 surface 键。
+
+    ``push2`` / ``push2delay`` / ``push2his`` 是同一套 L7 反爬规则，归并为
+    :data:`PUSH2_SURFACE`；``datacenter-web`` 与监控池（``mobappconfig``）
+    各自独立。未知主机原样返回（小写域名），不猜归属。
+    """
+    host = _domain(host_or_url)
+    if host in _PUSH2_HOSTS:
+        return PUSH2_SURFACE
+    return host
 
 
 # ---------------------------------------------------------------------------
@@ -582,11 +684,16 @@ class EmFetchGuard:
     「顶层共享封锁 ∪ 本域条目」（任一命中都 0 请求），**写**只写本域条目，
     因此 datacenter 被封不会让 push2 的任务整轮停摆。不给 ``surface`` 时
     行为与既有实现完全一致（只读写顶层共享封锁）。
+
+    ``escalate``（issue #130）只在带 ``surface`` 时有意义：``None``（默认）
+    交给 :func:`mark_cooldown` 自动判定 —— 同一冷却窗口内 ≥2 个不同域命中
+    444 才升级为顶层共享封锁；``True`` 强制升级，``False`` 永不升级。
     """
 
     def __init__(self, budget=None, path=None, cooldown_seconds_override=None,
                  block_exc=AntiScrapeBlocked, enforce_budget=True,
-                 now_fn=None, mark=True, respect_cooling=True, surface=None):
+                 now_fn=None, mark=True, respect_cooling=True, surface=None,
+                 escalate=None):
         if isinstance(budget, RequestBudget):
             self.budget = budget
         else:
@@ -599,12 +706,14 @@ class EmFetchGuard:
         self._now_fn = now_fn or time.time
         self._mark = bool(mark)
         self.respect_cooling = bool(respect_cooling)
-        self.surface = str(surface) if surface else None
+        self.surface = surface_of(surface) if surface else None
+        self.escalate = escalate
         self.requests = 0
         self.status_codes: list[int] = []
         self.block_reason: str | None = None
         self.block_detail: str | None = None
         self.blocked = False
+        self.shared_blocked = False
         self._module = None
         self._original = None
 
@@ -637,9 +746,13 @@ class EmFetchGuard:
         self.blocked = True
         if self._mark:
             try:
-                mark_cooldown(reason, detail, seconds=self.cooling_seconds,
-                              now=self._now(), path=self.path,
-                              surface=self.surface)
+                written = mark_cooldown(
+                    reason, detail, seconds=self.cooling_seconds,
+                    now=self._now(), path=self.path,
+                    surface=self.surface, escalate=self.escalate)
+                self.shared_blocked = bool(
+                    written.get("escalated_shared")
+                    or (self.surface is None and written.get("blocked_until")))
             except OSError as exc:
                 # 冷却写失败不能掩盖取数失败：异常照抛，但必须出声。
                 print(f"[WARN] 东财冷却写盘失败（{self.path}）：{exc}",

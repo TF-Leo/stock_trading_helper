@@ -52,6 +52,16 @@ CLI 只读这份缓存（``stock_analysis/data_loader/flow.py``），**绝不触
 * 每个域名本轮请求数硬上限 ``--budget``（默认 60），超限在发请求前抛出，
   提前退出并打印 ``BUDGET …``，剩余票不写缓存。
 
+冷却按**域**隔离（issue #130）
+------------------------------
+闸门带 ``surface=push2 家族``：444 只写 ``surfaces["push2.eastmoney.com"]``
+（``push2`` / ``push2delay`` / ``push2his`` 同一风控面，归并成一个键），
+**不写**顶层共享块。读取取「顶层共享封锁 ∪ 本域」，因此：
+
+* 本工具 18:30 被 444 → 只封 push2 域，18:45 的 datacenter 事件任务照常运行；
+* 同一冷却窗口内 ≥2 个不同域都命中 444（如 push2 + datacenter）→
+  ``mark_cooldown`` 自动升级写顶层共享块，之后所有域 0 请求。
+
 退出码：0 = 全部成功；1 = 有票失败 / 请求预算超限；2 = 参数/配置错误；
 3 = 东财反爬冷却中（未发请求）。
 """
@@ -99,6 +109,11 @@ SINA_ROW_FIELDS = ("date", "net_amount")
 # issue #108：预计算 run 级别的请求预算按域名分桶（不实际解 URL，只做计数键）。
 DOMAIN_EASTMONEY = "push2his.eastmoney.com"
 DOMAIN_SINA = "vip.stock.finance.sina.com.cn"
+# issue #130：冷却按**域**隔离 —— 本工具只写 push2 家族的条目
+# （``push2`` / ``push2delay`` / ``push2his`` 是同一套 L7 反爬规则，
+# ``eastmoney_guard.surface_of()`` 把它们归并成同一个键）。此前不传 surface，
+# 444 会写顶层共享块，把 18:45 的 datacenter 事件任务一起封死。
+SURFACE_EASTMONEY = em_guard.PUSH2_SURFACE
 
 
 def normalize_code(code) -> str:
@@ -254,6 +269,7 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
     request_budget = em_guard.RequestBudget(budget)
     guard = em_guard.EmFetchGuard(
         budget=request_budget, enforce_budget=False, mark=True,
+        surface=SURFACE_EASTMONEY,
         now_fn=lambda: now_fn().timestamp(), respect_cooling=not force)
 
     stats = {"out_dir": out_dir or OUT_DIR, "interval_seconds": float(interval),
