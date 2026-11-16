@@ -745,10 +745,23 @@ python tools/precompute_events.py
 python tools/precompute_events.py --codes 600000,000001 --json
 python tools/precompute_events.py --estimate        # 不触网，只算串行耗时
 python tools/precompute_events.py --probes-only     # 4 个对照探针，~4s，不写缓存
+python tools/precompute_events.py --budget 80       # 本轮请求硬上限（默认 80）
+python tools/precompute_events.py --clear-cooldown  # 只清本域冷却条目
 
 # CLI 主路径只读如下缓存（data/ 已 gitignore），不发起任何请求
 source/stock_analysis/data/state/events/events.json
 ```
+
+- **统一熔断**：整轮（含 `--probes-only`）包在 `eastmoney_guard.EmFetchGuard`
+  里，与资金流 / ST 名单 / 监控池同一套 444 与零字节 FIN 识别、持久冷却与
+  请求预算。冷却期内整轮 **0 请求**（退出码 3）；命中 444 / FIN 立即中止
+  （退出码 3，写冷却）；请求数超 `--budget` 在**发请求之前**拦截（退出码 4）。
+  三种情形都**不写缓存**，已有好缓存原样保留。
+- **冷却键按域隔离**：本工具的封锁写进 `eastmoney_cooldown.json` 的
+  `surfaces["datacenter-web.eastmoney.com"]`，不写顶层共享封锁 —— `push2` /
+  `push2his` 与 `datacenter-web` 是东财两套网关（历史上 push2 被 444 时
+  datacenter 仍 200），共用一个整域键会互相误伤。读取时取「顶层共享封锁 ∪
+  本域条目」并集：任一命中都 0 请求。
 
 ```
 evidence.events = {
