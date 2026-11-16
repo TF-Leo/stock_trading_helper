@@ -631,9 +631,10 @@ def mark_cooldown(reason: str, detail: Optional[str] = None,
     """写入跨进程冷却（``eastmoney_cooldown.json``，原子替换）。
 
     issue #130：默认只写 ST 自己的域条目（``surfaces["push2…"]``），不污染
-    顶层共享封锁；顶层块由 :func:`em_guard.mark_cooldown` 在同一冷却窗口内
-    ≥2 个域都命中 444 时自动升级（``escalate=True/False`` 可强制）。
-    ``surface=None`` 恢复旧语义（直接写顶层共享封锁）。
+    顶层共享封锁；顶层块由 :func:`em_guard.mark_cooldown` 在升级投票窗口内
+    **两个域都命中 ``http_444``** 时自动升级（``zero_byte_fin`` 瞬时断连不投票；
+    ``escalate=True/False`` 可强制）。``surface=None`` 恢复旧语义（直接写
+    顶层共享封锁）。
     """
     wait = (ST_LIST_COOLDOWN_SECONDS if seconds is None else float(seconds))
     return em_guard.mark_cooldown(reason, detail, seconds=wait, now=now,
@@ -641,15 +642,18 @@ def mark_cooldown(reason: str, detail: Optional[str] = None,
                                   escalate=escalate)
 
 
-def clear_cooldown(surface: Optional[str] = ST_LIST_SURFACE) -> None:
+def clear_cooldown(surface: Optional[str] = ST_LIST_SURFACE,
+                   include_shared: bool = False) -> None:
     """清除冷却（人工解除封锁后复跑预计算时用）。
 
     issue #130：默认只删 ST 自己的域条目，不碰其它域与顶层共享封锁；
-    ``surface=None`` 删除整个冷却文件（旧语义，``--clear-cooldown`` 之外的
-    人工排障用）。
+    ``include_shared=True``（``--clear-cooldown --all``）**连同顶层全域封锁
+    一起清除** —— 误升级成全域封锁后不必手删文件（PR #131 P2-3）；
+    ``surface=None`` 删除整个冷却文件（旧语义，人工排障用）。
     """
     if surface:
-        em_guard.clear_cooldown(path=cooldown_path(), surface=surface)
+        em_guard.clear_cooldown(path=cooldown_path(), surface=surface,
+                                include_shared=include_shared)
         return
     em_guard.clear_cooldown(path=cooldown_path())
 

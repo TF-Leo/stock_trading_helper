@@ -241,23 +241,27 @@ def test_two_domains_444_escalate_to_shared_block(tmp_path, monkeypatch):
     assert PUSH2_HOST in raw[em.SURFACES_KEY]
     assert "blocked_until" not in raw, "第一个域单独命中时不得写顶层块"
 
-    # 18:45 事件：datacenter 也 444（同一冷却窗口）。
+    # 18:40 事件：datacenter 也 444（仍在升级投票窗口 600s 内）。
     stats = pe.precompute(["600519"], out_dir=str(tmp_path / "events"),
                           retries=0, sleep_fn=lambda _s: None,
-                          now_fn=lambda: NOW + dt.timedelta(minutes=10))
+                          now_fn=lambda: NOW + dt.timedelta(minutes=5))
 
     assert stats["blocked"] is True
     raw = _raw_state()
     assert DATACENTER_HOST in raw[em.SURFACES_KEY]
     assert "blocked_until" in raw, "两个域都 444 → 判定 IP 级封锁，写顶层块"
-    assert set(raw.get("surfaces_blocked") or []) == {PUSH2_HOST,
-                                                      DATACENTER_HOST}
-    # 冷却按注入的 ``now_fn`` 写（NOW / NOW+10min），因此按同一时钟读。
-    assert em.cooldown_state(now=NOW + dt.timedelta(minutes=10)) is not None
+    # P3-1（PR #131）：``surfaces_blocked`` 每条带触发原因与时间戳；
+    # 域名清单在 ``surfaces_blocked_names``。
+    assert set(raw.get("surfaces_blocked_names") or []) == {PUSH2_HOST,
+                                                            DATACENTER_HOST}
+    assert all(item["reason"] == "http_444"
+               for item in raw["surfaces_blocked"])
+    # 冷却按注入的 ``now_fn`` 写（NOW / NOW+5min），因此按同一时钟读。
+    assert em.cooldown_state(now=NOW + dt.timedelta(minutes=5)) is not None
 
     # 第三个域（监控池）读「顶层 ∪ 本域」→ 也被封锁，0 请求。
     guard = em.EmFetchGuard(surface=MONITOR_HOST,
-                            now_fn=lambda: NOW_TS + 600)
+                            now_fn=lambda: NOW_TS + 300)
     cooling = guard.cooling()
     assert cooling is not None and cooling["scope"] == "shared"
 

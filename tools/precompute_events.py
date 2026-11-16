@@ -81,6 +81,7 @@ P2-2 「无事件 vs 接口坏了」：每轮先发 4 个对照探针（每报�
     python tools/precompute_events.py --budget 80        # 本轮请求硬上限
     python tools/precompute_events.py --force            # 忽略冷却（人工确认后）
     python tools/precompute_events.py --clear-cooldown   # 只清本域冷却条目
+    python tools/precompute_events.py --clear-cooldown --all  # 连全域封锁一起清
 
 退出码：0 = 全部子项成功；1 = 有子项失败 / 探针疑似异常；2 = 参数/配置错误；
 3 = 东财反爬冷却中（0 请求）或本轮命中 444/零字节 FIN（已写冷却，未写缓存）；
@@ -1159,6 +1160,9 @@ def build_parser():
                         help="忽略东财反爬冷却（仅人工确认封锁解除后使用）")
     parser.add_argument("--clear-cooldown", action="store_true",
                         help="只删除本工具的域级冷却条目后退出（不触网）")
+    parser.add_argument("--all", dest="clear_all", action="store_true",
+                        help="配合 --clear-cooldown：连同顶层全域封锁一起清除"
+                             "（误升级成全域封锁后用它解除）")
     parser.add_argument("--json", action="store_true", help="输出机读统计 JSON")
     return parser
 
@@ -1171,11 +1175,13 @@ def main(argv=None):
     if not codes:
         codes = list(DEFAULT_CODES)
     if args.clear_cooldown:
-        em_guard.clear_cooldown(surface=SURFACE)
-        message = f"已清除 {SURFACE} 冷却条目（{em_guard.state_path()}）"
+        em_guard.clear_cooldown(surface=SURFACE, include_shared=args.clear_all)
+        scope = "本域条目与顶层全域封锁" if args.clear_all else "本域条目"
+        message = f"已清除 {SURFACE} {scope}（{em_guard.state_path()}）"
         print(message)
         if args.json:
             print(json.dumps({"cleared": SURFACE,
+                              "include_shared": bool(args.clear_all),
                               "path": em_guard.state_path()},
                              ensure_ascii=False))
         return EXIT_OK

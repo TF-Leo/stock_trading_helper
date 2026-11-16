@@ -1,5 +1,67 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-16 · PR #131 P2 修复：升级投票收紧 + 窗口解耦 + 全域封锁可清除
+
+- **分支**：`TF-Leo/fix-pr131`（基于 PR #131 head `5cd4ed2`，父 `origin/main`
+  `4929f65`）；**push 同一分支，不合并**。未改 `decision/*`、未引入依赖、
+  盘前路径零联网不变、未探测东财真实端点（全部用桩）。
+- **问题（复验发现）**：
+  1. `zero_byte_fin`（ConnectionReset / SSLEOF 这类瞬时断连，线上冷却文件当天
+     就有实例）与 `http_444` **同权投票**：两个域各抖一次就写 30–60 分钟全域
+     封锁，把本来可用的第三、四个域一起关掉；
+  2. 升级判定复用冷却窗口（30–60 分钟），半小时前的一次失败与刚才的一次失败
+     被算成同一轮；
+  3. 升级写的是顶层块，而 `--clear-cooldown` 只删本域、`precompute_flow`
+     根本没有该开关 → 误升级只能手删文件。
+- **改动**：
+  1. **P2-1 只有 http_444 投票**：新增 `ESCALATION_VOTE_REASON = "http_444"`；
+     `_escalation_vote()` 要求条目**在窗口内命中过 http_444**（新字段
+     `last_http_444_at`，同域后续瞬时断连只覆盖 `reason`、不抹掉已投的票；
+     旧格式条目退回 `reason` + `updated_at`），且本次命中自身也必须是
+     `http_444` 才有资格升级。`zero_byte_fin` 仍写本域冷却（避免继续撞墙），
+     但从不投票。
+  2. **P2-2 独立短窗口**：新增 `DEFAULT_ESCALATION_WINDOW_SECONDS = 600.0` /
+     `escalation_window()` / `EASTMONEY_ESCALATION_WINDOW`（1–86400s 夹取）；
+     `mark_cooldown(..., window=…)` 可覆盖。窗口判据是「命中时间」而非冷却
+     到期时间，与冷却时长彻底解耦。
+  3. **P2-3 可清除**：`clear_cooldown(..., include_shared=True)` 删除顶层块
+     （含 `surfaces_blocked*` / `escalation_*` 留痕），域条目按 `surface`
+     参数处理；`status.clear_cooldown(include_shared=…)` 透传；
+     `precompute_events` / `precompute_st_list` / `precompute_flow` 三个脚本
+     统一支持 `--clear-cooldown --all`（不带 `--all` 时行为不变）。
+  4. **P3-1 留痕**：`surfaces_blocked` 由「域名列表」改为**结构化条目**
+     （`surface` / `reason` / `last_http_444_at` / `blocked_at` /
+     `updated_at`），域名清单另存 `surfaces_blocked_names`；顶层块另记
+     `escalated_at` / `escalation_reason` / `escalation_window_seconds`。
+  5. **P3-2 醒目日志**：升级时向 **stderr** 打印 `[ESCALATED] …` 并追加到
+     冷却文件同目录的 `eastmoney_escalation.log`（`EASTMONEY_ESCALATION_LOG`
+     可覆盖），文案明确写出「可用 `--clear-cooldown --all` 解除」；写日志
+     失败不影响冷却写入。
+- **阈值选择理由（600s）**：冷却 1800s 里「半小时前」与「刚才」不是同一轮；
+  600s 覆盖一次预计算 run 的正常墙钟（资金流 14 票 × 1s ≈ 20s、事件 60 请求
+  ≈ 90s），又远小于冷却时长，避免把两轮 run 的孤立抖动合并成一次「IP 级
+  封锁」判定。真实反爬封禁会在窗口内持续命中，仍会正常升级。
+- **测试**：新增 `source/tests/test_escalation_vote.py`（11 项）——
+  两个域各一次 `zero_byte_fin` → 不升级；444 + 瞬时断连 → 不升级；本次命中
+  是瞬时断连 → 不升级；同域 444 后瞬时断连 → 票不丢；两域各一次 `http_444`
+  窗口内 → 升级（含留痕字段、stderr/日志、第三域 `scope="shared"`）；
+  窗口外 444 + 窗口内 444 → 不升级；窗口可配置；三个脚本
+  `--clear-cooldown --all` 均清除顶层块且之后事件任务恢复发满 8 请求；
+  `--all` 不误清其它域的独立封锁；不带 `--all` 时不清顶层块（旧行为）。
+  另按新契约更新 `test_flow_surface.py` 一处断言（`surfaces_blocked` 结构与
+  时间差 10min→5min，确保落在 600s 投票窗口内）。
+- **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5，venv 取自
+  `astock-verify-flow`，与 requirements.txt 一致）**：
+  - `python -m pytest tests/ -q` → **1211 passed in 108.13s**（改动前基线
+    1200 passed）。
+  - `python -m pytest tests/test_escalation_vote.py -q` → **11 passed**。
+  - `python -m pytest tests/test_escalation_vote.py tests/test_flow_surface.py
+    tests/test_eastmoney_guard.py tests/test_events_guard.py
+    tests/test_st_precompute.py -q` → **67 passed**（更新断言前）/ 新增后
+    68 passed（分文件跑 11 + 6 + 11 + 18 + 22 = 68）。
+- **未验证**：`tools/check_gates.ps1` —— 本机无 `pwsh`（与前几轮同）；以
+  全量 pytest + `tools/probe.py` 为运行时裁定器。
+
 ## 2026-11-16 · 资金流等东财取数显式传 surface，域隔离在生产路径生效（issue #130）
 
 - **分支**：`TF-Leo/flow-surface`（父 `origin/main` `4929f65`）；关联 issue #130；

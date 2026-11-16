@@ -43,7 +43,7 @@ TLS / DNS / 路由均正常 → 这是**对本机出口 IP 的反爬封禁**，�
 
 * **写**：带 ``surface`` 的闸门只写 ``surfaces[<域名>]``，顶层共享字段原样保留
   —— 一个域被封不会让另一个域的任务整轮停摆（唯一例外是下面说的
-  「≥2 个不同域都命中 444」的显式全域封锁）；
+  「升级投票窗口内 ≥2 个不同域都命中 http_444」的显式全域封锁）；
 * **读**：``scoped_cooldown_state()`` 先看顶层共享封锁（任何域被封都视为
   "此刻别碰东财"，保守），再看本域条目；顶层封锁只会让本轮 **0 请求**并保留
   旧缓存，不会延长或升级封锁；
@@ -53,9 +53,22 @@ TLS / DNS / 路由均正常 → 这是**对本机出口 IP 的反爬封禁**，�
 ---------------------------------------------
 顶层块不再是「某个域 444」的副作用，而是「疑似 IP 级封禁」的判定结果：
 ``mark_cooldown(surface=…)`` 默认**自动升级** —— 若冷却文件里已有**另一个仍在
-生效的域条目**（同一冷却窗口内 ≥2 个不同域命中 444），说明不是单个网关的
-策略，而是整条出口 IP 被封，此时同时写顶层共享块（记录
-``surfaces_blocked``）。只有单个域命中时**只写本域**，其它域的任务照常运行。
+生效的域条目**，说明不是单个网关的策略，而是整条出口 IP 被封，此时同时写
+顶层共享块（记录 ``surfaces_blocked``）。只有单个域命中时**只写本域**，其它
+域的任务照常运行。
+
+升级投票的三条收紧（PR #131 P2 复验）
+-------------------------------------
+1. **只有 ``http_444`` 投票**（:data:`ESCALATION_VOTE_REASON`）。``zero_byte_fin``
+   覆盖 ConnectionReset / SSLEOF / 空 body 这类**瞬时断连**，线上日常就有实例；
+   它只写本域冷却，**不**参与升级。否则两个域各抖一次就会写 30–60 分钟全域
+   封锁，把本来可用的第三、第四个域一起关掉 —— 那是误伤，不是保护。
+2. **独立的短投票窗口**（:func:`escalation_window`，默认 600s，``EASTMONEY_
+   ESCALATION_WINDOW`` 可配）。升级判定不再复用 30–60 分钟的冷却时长：半小时前
+   的一次 444 与刚才的一次 444 不算同一轮。判定依据是域条目的 ``updated_at``
+   （该域最近一次命中时间）。
+3. **可清除**：``clear_cooldown(include_shared=True)`` 或各预计算脚本的
+   ``--clear-cooldown --all`` 能解除顶层全域封锁，不需要手删文件。
 
 升级判定可用参数覆盖：``escalate=True`` 强制写顶层（人工判定 / 测试），
 ``escalate=False`` 永不写顶层。因此：
@@ -91,10 +104,12 @@ TLS / DNS / 路由均正常 → 这是**对本机出口 IP 的反爬封禁**，�
 --------
 * ``EASTMONEY_COOLDOWN_PATH``：冷却文件路径（测试 / 运维覆盖）；
 * ``EASTMONEY_COOLDOWN_SECONDS``：冷却秒数（默认 1800，上限 86400）；
+* ``EASTMONEY_ESCALATION_WINDOW``：升级投票窗口秒数（默认 600，上限 86400）；
 * ``EASTMONEY_REQUEST_BUDGET``：单域名单轮请求硬上限（默认 60）。
 
 人工解除封锁后重跑预计算：``python tools/precompute_st_list.py
---clear-cooldown``，或删除冷却文件即可。
+--clear-cooldown`` 清本域，``--clear-cooldown --all`` 连同顶层全域封锁一起清；
+或删除冷却文件即可。
 """
 from __future__ import annotations
 
@@ -109,8 +124,11 @@ from urllib.parse import urlsplit
 __all__ = [
     "STATE_PATH_ENV",
     "COOLDOWN_SECONDS_ENV",
+    "ESCALATION_WINDOW_ENV",
+    "ESCALATION_LOG_ENV",
     "REQUEST_BUDGET_ENV",
     "DEFAULT_COOLDOWN_SECONDS",
+    "DEFAULT_ESCALATION_WINDOW_SECONDS",
     "DEFAULT_REQUEST_BUDGET",
     "BLOCKED_STATUS",
     "SCHEMA_VERSION",
@@ -118,11 +136,13 @@ __all__ = [
     "PUSH2_SURFACE",
     "DATACENTER_SURFACE",
     "MONITOR_SURFACE",
+    "ESCALATION_VOTE_REASON",
     "surface_of",
     "AntiScrapeBlocked",
     "EastmoneyCooling",
     "EastmoneyBudgetExceeded",
     "cooldown_seconds",
+    "escalation_window",
     "request_budget",
     "state_path",
     "cooldown_state",
@@ -139,13 +159,26 @@ __all__ = [
 STATE_PATH_ENV = "EASTMONEY_COOLDOWN_PATH"
 #: 冷却秒数覆盖（默认 1800s）。
 COOLDOWN_SECONDS_ENV = "EASTMONEY_COOLDOWN_SECONDS"
+#: 升级投票窗口覆盖（默认 600s）。
+ESCALATION_WINDOW_ENV = "EASTMONEY_ESCALATION_WINDOW"
+#: 升级日志文件路径覆盖（默认与冷却文件同目录的 eastmoney_escalation.log）。
+ESCALATION_LOG_ENV = "EASTMONEY_ESCALATION_LOG"
 #: 单域名单轮请求硬上限（默认 60）。
 REQUEST_BUDGET_ENV = "EASTMONEY_REQUEST_BUDGET"
 
 DEFAULT_COOLDOWN_SECONDS = 1800.0
+#: 升级投票窗口（PR #131 P2-2）：只统计这个窗口内的 444。600s 的理由 ——
+#: 冷却 1800s 里「半小时前失败」与「刚才失败」不是同一轮；600s 覆盖一次
+#: 预计算 run 的正常墙钟（资金流 14 票 × 1s ≈ 20s，事件 60 请求 ≈ 90s），
+#: 又远小于冷却，避免把两轮 run 的孤立抖动合并成一次「IP 级封锁」判定。
+DEFAULT_ESCALATION_WINDOW_SECONDS = 600.0
 DEFAULT_REQUEST_BUDGET = 60
 #: nginx 反爬状态码；零字节 FIN 在 requests 里通常表现为连接被对端关闭。
 BLOCKED_STATUS = 444
+#: 唯一参与全域升级投票的命中原因（PR #131 P2-1）。
+#: ``zero_byte_fin`` 是瞬时断连（ConnectionReset / SSLEOF / 空 body），线上
+#: 日常就有实例，与「反爬封禁」不等价 —— 它只写本域冷却，不投票。
+ESCALATION_VOTE_REASON = "http_444"
 SCHEMA_VERSION = 1
 #: 域级冷却条目的键（``surfaces[<hostname>]``）；顶层字段是共享封锁。
 SURFACES_KEY = "surfaces"
@@ -229,6 +262,20 @@ def cooldown_seconds() -> float:
         value = float(raw) if raw else DEFAULT_COOLDOWN_SECONDS
     except ValueError:
         value = DEFAULT_COOLDOWN_SECONDS
+    return min(max(value, 1.0), 86400.0)
+
+
+def escalation_window() -> float:
+    """升级投票窗口秒数：``EASTMONEY_ESCALATION_WINDOW`` 优先，非法值回默认。
+
+    下限 1s，上限 86400s。与冷却时长**解耦**：冷却决定「本域等多久」，
+    投票窗口决定「多久之内的两次 444 算同一轮」（PR #131 P2-2）。
+    """
+    raw = str(os.getenv(ESCALATION_WINDOW_ENV, "") or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_ESCALATION_WINDOW_SECONDS
+    except ValueError:
+        value = DEFAULT_ESCALATION_WINDOW_SECONDS
     return min(max(value, 1.0), 86400.0)
 
 
@@ -350,6 +397,61 @@ def _surface_entry(payload, surface):
     return surfaces.get(str(surface))
 
 
+def _entry_ts(entry, key: str):
+    """条目里 ``updated_at`` / ``blocked_at`` → epoch 秒；缺失或非法 → None。"""
+    try:
+        return datetime.fromisoformat(str((entry or {}).get(key))).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _escalation_vote(entry, now_ts: float, window: float):
+    """该域条目是否**为全域升级投了一票**（PR #131 P2-1 / P2-2）。
+
+    三条同时满足才算投票：
+
+    1. 该域在窗口内**命中过 http_444** —— 看 ``last_http_444_at``（同域后续
+       的瞬时断连会覆盖 ``reason``，但不会抹掉这张票），旧格式条目退回
+       ``reason`` + ``updated_at`` / ``blocked_at``；
+    2. 条目仍在生效（``blocked_until`` 未到）；
+    3. 那次 444 落在**升级投票窗口**内 —— 窗口与冷却时长解耦，半小时前的
+       一次 444 不算「同一轮」。
+
+    ``zero_byte_fin`` 从不投票：它是瞬时断连（ConnectionReset / SSLEOF / 空
+    body），线上日常就有实例，与反爬封禁不等价。
+    """
+    if not isinstance(entry, dict):
+        return False
+    if _active(entry, now_ts) is None:
+        return False
+    hit_ts = _entry_ts(entry, "last_http_444_at")
+    if hit_ts is None and str(entry.get("reason") or "") == ESCALATION_VOTE_REASON:
+        hit_ts = _entry_ts(entry, "updated_at")
+        if hit_ts is None:
+            hit_ts = _entry_ts(entry, "blocked_at")
+    if hit_ts is None:
+        return False
+    return 0.0 <= now_ts - hit_ts <= window
+
+
+def _log_escalation(target: str, message: str) -> None:
+    """升级为全域封锁时**醒目出声**：stderr + 日志文件（PR #131 P3-2）。
+
+    日志文件默认与冷却文件同目录的 ``eastmoney_escalation.log``，
+    ``EASTMONEY_ESCALATION_LOG`` 可覆盖。写日志失败不得影响冷却写入本身。
+    """
+    line = f"[{_iso(time.time())}] {message}"
+    print(f"[ESCALATED] {message}", file=sys.stderr)
+    log_path = str(os.getenv(ESCALATION_LOG_ENV, "") or "").strip() or os.path.join(
+        os.path.dirname(target) or ".", "eastmoney_escalation.log")
+    try:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
 def cooldown_state(now=None, path=None) -> dict | None:
     """读取**共享**冷却状态；仍在生效才返回（附带 ``remaining_seconds``），否则 None。
 
@@ -396,7 +498,8 @@ def scoped_cooldown_state(now=None, path=None, surface=None) -> dict | None:
 
 
 def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
-                  path=None, surface=None, escalate=None) -> dict:
+                  path=None, surface=None, escalate=None,
+                  window=None) -> dict:
     """写入跨进程冷却（原子替换），返回本次写下的那条冷却记录。
 
     「读-改-写」在文件锁内完成：并发进程各自只追加自己知道的封锁，不会用
@@ -406,20 +509,29 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
     其它域条目原样保留 —— 一个域被封不会误伤另一个域。``surface`` 为空时
     写顶层共享封锁（显式全域封锁），同样保留已有域级条目。
 
-    顶层共享封锁的升级（issue #130）
-    --------------------------------
-    ``escalate=None``（默认）时**自动判定**：若冷却文件里已有**另一个仍在生效
-    的域条目**（同一冷却窗口内 ≥2 个不同域都命中 444），则不是单个网关的策略
-    而是整条出口 IP 被封 —— 本次除写本域条目外**同时写顶层共享块**
-    （``surfaces_blocked`` 列出当时生效的域名）。只有单个域命中时只写本域。
+    顶层共享封锁的升级（issue #130 + PR #131 P2）
+    ---------------------------------------------
+    ``escalate=None``（默认）时**自动判定**：冷却文件里已有**另一个仍在生效、
+    且为 ``http_444``、最近一次命中在升级投票窗口内**的域条目，才判定为整条
+    出口 IP 被封 —— 本次除写本域条目外**同时写顶层共享块**
+    （``surfaces_blocked`` 列出投票的域名）。其余情况只写本域：
+
+    * 本次 ``reason`` 不是 ``http_444``（如 ``zero_byte_fin`` 瞬时断连）→ 不升级；
+    * 另一个域只有 ``zero_byte_fin`` 条目 → 不算票；
+    * 另一个域的 444 命中时间早于 ``window``（默认 :func:`escalation_window`，
+      600s）→ 不算同一轮。
+
     ``escalate=True`` 强制写顶层，``escalate=False`` 永不写顶层（测试 /
-    人工判定用）。
+    人工判定用）。``window`` 可覆盖本次的投票窗口（测试用）。
     """
     now_ts = _now_ts(now)
     wait = cooldown_seconds() if seconds is None else max(0.0, float(seconds))
     until_ts = now_ts + wait
     target = path or state_path()
     surface = surface_of(surface) if surface else None
+    vote_window = escalation_window() if window is None else max(0.0, float(window))
+    escalate_global = False
+    voters = []
     with _FileLock(_lock_path(target)):
         raw = _read_payload(target) or {}
         surfaces = raw.get(SURFACES_KEY)
@@ -446,11 +558,25 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
         }
         if surface:
             entry["surface"] = surface
+            # P2-1：记住本域**最近一次 http_444 的时间**。同域后续的瞬时断连
+            # 会覆盖 reason，但不会抹掉这张已经投出的票。
+            previous_444 = (_entry_ts(_surface_entry(raw, surface),
+                                      "last_http_444_at"))
+            if str(entry["reason"]) == ESCALATION_VOTE_REASON:
+                entry["last_http_444_at"] = _iso(now_ts)
+            elif previous_444 is not None:
+                entry["last_http_444_at"] = _iso(previous_444)
             surfaces[surface] = entry
-            others = sorted(name for name, value in surfaces.items()
-                            if name != surface and _active(value, now_ts))
+            # P2-1 / P2-2：只有窗口内命中过 http_444、且仍在生效的**其它域**
+            # 条目才投一票。
+            voters = sorted(
+                name for name, value in surfaces.items()
+                if name != surface
+                and _escalation_vote(value, now_ts, vote_window))
             if escalate is None:
-                escalate_global = bool(others)
+                # 本次命中自身必须也是 http_444 才有资格升级。
+                escalate_global = (
+                    entry["reason"] == ESCALATION_VOTE_REASON and bool(voters))
             else:
                 escalate_global = bool(escalate)
             payload = {key: value for key, value in raw.items()
@@ -469,16 +595,33 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
                         ).timestamp())
                     except (TypeError, ValueError):
                         pass
+                blocked = [*voters, surface] if voters else [surface]
                 shared = dict(entry)
                 shared.pop("surface", None)
                 shared["blocked_until"] = _iso(shared_until)
                 shared["seconds"] = round(shared_until - now_ts, 3)
                 shared["detail"] = (
-                    f"{entry['detail']}；同一冷却窗口内多个域命中 444"
-                    f"（{', '.join([*others, surface])}），判定为出口 IP 级封锁"
+                    f"{entry['detail']}；{int(vote_window)}s 内多个域命中 "
+                    f"http_444（{', '.join(blocked)}），判定为出口 IP 级封锁"
                 ).strip("；")
                 shared["scope"] = "shared"
-                shared["surfaces_blocked"] = [*others, surface]
+                # P3-1：``surfaces_blocked`` 每条都带**触发原因与时间戳**，
+                # 事后可据此判断这次升级是不是误判（瞬时断连 / 跨轮次）。
+                shared["surfaces_blocked"] = [
+                    {
+                        "surface": name,
+                        "reason": str(surfaces[name].get("reason") or ""),
+                        "last_http_444_at": str(
+                            surfaces[name].get("last_http_444_at") or ""),
+                        "blocked_at": str(surfaces[name].get("blocked_at") or ""),
+                        "updated_at": str(surfaces[name].get("updated_at") or ""),
+                    }
+                    for name in blocked
+                ]
+                shared["surfaces_blocked_names"] = blocked
+                shared["escalated_at"] = _iso(now_ts)
+                shared["escalation_reason"] = ESCALATION_VOTE_REASON
+                shared["escalation_window_seconds"] = int(vote_window)
                 payload.update(shared)
         else:
             payload = dict(entry)
@@ -491,41 +634,54 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
                       sort_keys=True)
             handle.write("\n")
         os.replace(tmp, target)
+    if escalate_global:
+        _log_escalation(
+            target,
+            f"已升级为全域封锁（{ESCALATION_VOTE_REASON}，{int(vote_window)}s 内 "
+            f"{', '.join(voters)}），所有域暂停请求；确认解除后运行 "
+            f"`python tools/precompute_st_list.py --clear-cooldown --all`"
+            f"（或对应预计算脚本的同一开关）解除")
     result = dict(entry)
     if surface:
         result["escalated_shared"] = bool(escalate_global)
     return result
 
 
-def clear_cooldown(path=None, surface=None) -> None:
+def clear_cooldown(path=None, surface=None, include_shared=False) -> None:
     """删除冷却状态（人工确认封锁解除后复跑预计算时用）。
 
-    ``surface`` 给定时只删该域的条目（其它域 / 顶层共享封锁保留）；条目删空后
-    不留下空的 ``surfaces`` 键。不给 ``surface`` 时删除整个文件（既有语义）。
+    ``surface`` 给定时只删该域的条目（其它域条目保留）；``include_shared=True``
+    时**连同顶层共享封锁一起清除**（PR #131 P2-3：误升级成全域封锁后可用
+    ``--clear-cooldown --all`` 解除，不必手删文件）。不给 ``surface`` 时删除
+    整个文件（既有语义）。
 
     若删完后**没有任何封锁记录**（无顶层块、无其它域条目），整个文件一并
     删除 —— 否则残留一个空壳文件，运维容易误判成「还在冷却」。只删已过期的
     条目时文件保留（是否生效由 ``cooldown_state()`` 按时间判定）。
     """
     target = path or state_path()
-    if not surface:
+    if not surface and not include_shared:
         try:
             os.unlink(target)
         except FileNotFoundError:
             pass
         return
-    surface = surface_of(surface)
+    surface = surface_of(surface) if surface else None
     with _FileLock(_lock_path(target)):
         raw = _read_payload(target)
         if not raw:
             return
         surfaces = raw.get(SURFACES_KEY)
-        if not isinstance(surfaces, dict) or str(surface) not in surfaces:
-            return
-        surfaces = dict(surfaces)
-        surfaces.pop(str(surface), None)
+        surfaces = dict(surfaces) if isinstance(surfaces, dict) else {}
+        if surface:
+            surfaces.pop(str(surface), None)
         payload = {key: value for key, value in raw.items()
                    if key != SURFACES_KEY}
+        if include_shared:
+            # 顶层共享封锁 = 显式全域封锁，整段删除（含 surfaces_blocked /
+            # escalation_* 留痕字段）。域条目按上面的规则处理。
+            payload = {key: value for key, value in payload.items()
+                       if key in ("schema", "schema_version")}
         if surfaces:
             payload[SURFACES_KEY] = surfaces
         if not surfaces and not payload.get("blocked_until"):
@@ -686,8 +842,9 @@ class EmFetchGuard:
     行为与既有实现完全一致（只读写顶层共享封锁）。
 
     ``escalate``（issue #130）只在带 ``surface`` 时有意义：``None``（默认）
-    交给 :func:`mark_cooldown` 自动判定 —— 同一冷却窗口内 ≥2 个不同域命中
-    444 才升级为顶层共享封锁；``True`` 强制升级，``False`` 永不升级。
+    交给 :func:`mark_cooldown` 自动判定 —— 升级投票窗口（默认 600s）内
+    另一个域也命中 **http_444** 才升级为顶层共享封锁（``zero_byte_fin``
+    瞬时断连不投票）；``True`` 强制升级，``False`` 永不升级。
     """
 
     def __init__(self, budget=None, path=None, cooldown_seconds_override=None,

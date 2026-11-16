@@ -27,6 +27,8 @@ CLI 只读这份缓存（``stock_analysis/data_loader/flow.py``），**绝不触
     python tools/precompute_flow.py --codes 600519,002415 --json
     python tools/precompute_flow.py --interval 1.2 --retries 3
     python tools/precompute_flow.py --budget 60        # 单域名单轮请求硬上限
+    python tools/precompute_flow.py --clear-cooldown   # 只清本域冷却条目
+    python tools/precompute_flow.py --clear-cooldown --all  # 连全域封锁一起清
 
 行为
 ----
@@ -59,8 +61,10 @@ CLI 只读这份缓存（``stock_analysis/data_loader/flow.py``），**绝不触
 **不写**顶层共享块。读取取「顶层共享封锁 ∪ 本域」，因此：
 
 * 本工具 18:30 被 444 → 只封 push2 域，18:45 的 datacenter 事件任务照常运行；
-* 同一冷却窗口内 ≥2 个不同域都命中 444（如 push2 + datacenter）→
-  ``mark_cooldown`` 自动升级写顶层共享块，之后所有域 0 请求。
+* 升级投票窗口（默认 600s，``EASTMONEY_ESCALATION_WINDOW`` 可配）内 ≥2 个
+  不同域都命中 **http_444** → ``mark_cooldown`` 自动升级写顶层共享块，之后
+  所有域 0 请求。``zero_byte_fin``（瞬时断连）只写本域，不参与升级；
+  误升级后 ``--clear-cooldown --all`` 可解除。
 
 退出码：0 = 全部成功；1 = 有票失败 / 请求预算超限；2 = 参数/配置错误；
 3 = 东财反爬冷却中（未发请求）。
@@ -490,12 +494,29 @@ def build_parser():
                              "EASTMONEY_REQUEST_BUDGET 可覆盖）")
     parser.add_argument("--force", action="store_true",
                         help="忽略东财反爬冷却（仅人工确认封锁解除后使用）")
+    parser.add_argument("--clear-cooldown", action="store_true",
+                        help="只删除本工具的域级冷却条目后退出（不触网）")
+    parser.add_argument("--all", dest="clear_all", action="store_true",
+                        help="配合 --clear-cooldown：连同顶层全域封锁一起清除"
+                             "（误升级成全域封锁后用它解除）")
     parser.add_argument("--json", action="store_true", help="输出机读统计 JSON")
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.clear_cooldown:
+        em_guard.clear_cooldown(surface=SURFACE_EASTMONEY,
+                                include_shared=args.clear_all)
+        scope = "本域条目与顶层全域封锁" if args.clear_all else "本域条目"
+        message = f"已清除 {SURFACE_EASTMONEY} {scope}（{em_guard.state_path()}）"
+        print(message)
+        if args.json:
+            print(json.dumps({"cleared": SURFACE_EASTMONEY,
+                              "include_shared": bool(args.clear_all),
+                              "path": em_guard.state_path()},
+                             ensure_ascii=False))
+        return 0
     codes = list(args.codes)
     if args.codes_csv:
         codes += [c.strip() for c in args.codes_csv.split(",") if c.strip()]
