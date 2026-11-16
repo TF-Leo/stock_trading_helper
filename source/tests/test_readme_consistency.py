@@ -165,7 +165,11 @@ def test_evidence_plan_waf_rows_carry_date():
 # ---------------------------------------------------------------------------
 LEDGER_RUN_KEYS = {"cli_exit", "elapsed_s", "recorded_at", "missing",
                    "instrument_type", "price_source", "price_caliber",
-                   "instrument_basis", "basis_uncertain"}
+                   "instrument_basis", "basis_uncertain",
+                   # issue #134 additive：数据截止日与滞后自然日数
+                   "data_end", "data_lag_calendar_days",
+                   # issue #134 P3 additive：降级标记与原因
+                   "degraded", "degraded_reason"}
 
 
 def test_readme_ledger_run_row_matches_build_record_keys(readme_text):

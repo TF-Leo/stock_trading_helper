@@ -16,7 +16,10 @@ R4 的 C 路径（校准，Brier 改善 ≥0.02）要求 **≥200 条已到期�
     把当次 ``recommendation`` / ``evidence.flow`` / ``evidence.valuation`` /
     ``market_regime`` 的关键字段冻结进
     ``source/stock_analysis/data/forward/<YYYY-MM-DD>.json``（``data/`` 已 gitignore）。
-    **同一天重复跑覆盖同 code 的记录，不追加**（幂等）。
+    **同一天同一 code 默认拒绝重复写入**（issue #134）：已有记录时抛
+    :class:`DuplicateRecordError`，需显式 ``overwrite=True``（CLI
+    ``--overwrite``）才覆盖。旧实现静默覆盖，净值迟到时会把前一交易日的既有
+    记录改写掉。
     任何字段取不到都写 ``null`` 并把原因记进 ``missing``，**不省略键**；
     CLI 整体失败（断网 / 无缓存 / 退出码 30）时同样落盘一条全 null 的记录。
 
@@ -32,15 +35,23 @@ R4 的 C 路径（校准，Brier 改善 ≥0.02）要求 **≥200 条已到期�
 
 口径说明（写死在这里，供 README 与测试共用）
 --------------------------------------------
-* ``as_of`` = CLI 返回的最后一根行情日期（``data.end``），不是运行日。盘后跑
-  得到的是当日；周末/节假日跑得到的是上一个交易日，因此同一交易日的重复运行
-  天然落在同一个文件里。
+* ``as_of`` = **建议日期**（issue #134）：优先 ``request.as_of``，缺省为运行日
+  （``now``）。**不再取** ``data.end``：场外基金 T 日净值约 20:45 才入库，18:55
+  跑时 ``data.end`` 仍是 T-1，按它落盘会把 T 日的建议写进 T-1 的文件。
+* ``data_end`` / ``data_lag_calendar_days`` 是 additive 字段：前者是本次建议用到
+  的最后一根行情日期（CLI 的 ``data.end``），后者是 ``as_of - data_end`` 的
+  **自然日**数（不滞后为 0；拿不到 ``data.end`` 时为 ``null``）。刻意不叫
+  ``data_lag_days``：CLI payload 的 ``data.lag_days`` 是**交易日**口径
+  （``meta.py`` 的「缓存末日 → 期望最新交易日」），同名不同义会把两个数混用。
+  结算仍按 ``as_of`` 找「建议日期之后第一根可成交行情」，不再借用 ``data.end``
+  决定文件。
 * 收益用**前复权**开盘价（``stock_{code}_qfq.csv`` 的 ``open``）。前复权让分红
   送转在比值里自然抵消；用未复权价会把除权当成亏损。
 * 「交易日」以**该票自己的行情索引**为准：停牌日没有开盘价，本来就不能成交，
   把它算成一个交易日会凭空多出一格。行情缓存缺失时结算直接给
   ``settled=null, settle_reason="no_price_data"``，**不退回日历推算、不猜价格**。
-  （交易日历只用于记录阶段在拿不到 ``data.end`` 时决定落哪个文件。）
+  （交易日历只用于 ``tools/forward_log.py record`` 在休市日拒绝写入，不参与
+  落盘日期与结算。）
 * ``hit``：``buy`` 记 ``ret > 0``，``sell`` 记 ``ret < 0``；``hold`` / ``avoid`` /
   ``insufficient_data`` **没有方向**，不参与命中率与校准（只在 ``by_action`` 里
   计数），避免把「不动作」当成猜对。
@@ -193,6 +204,38 @@ def has_settlement(record):
     return all(settled.get(key) is not None
                for key in SETTLEMENT_REQUIRED_FIELDS)
 
+
+#: 「未降级」的 ``status``（issue #134 P3）。与消费脚本
+#: ``~/.hermes/scripts/forward_ledger_daily.py::coverage_stats`` 的判据一致：
+#: ``status`` 既非 ok / no_edge / market_closed 就视为**降级**（CLI 没产出可用
+#: 建议）。``insufficient_data`` / ``untradeable`` 也算 —— 那是「本轮不可用」，
+#: 不是「已经给出结论」，重跑有可能修好，正是 ``--overwrite`` 的适用场景。
+HEALTHY_STATUSES = ("ok", "no_edge", "market_closed")
+
+
+def degraded_state(record):
+    """``(degraded, reason)``：这条记录是否降级、为什么（issue #134 P3）。
+
+    判据只看 ``status``（与消费脚本一致），因此**旧台账**（没有 ``degraded``
+    键）也能在覆盖时正确留痕，不必回头补写。``status`` 为空时给出降级原因：
+    先取 ``missing["status"]``（``cli_failed`` / ``runner_error:...`` 等），
+    没有再退回 ``cli_exit``。
+    """
+    record = record if isinstance(record, dict) else {}
+    status = record.get("status")
+    if status in HEALTHY_STATUSES:
+        return False, None
+    if status:
+        return True, f"status:{status}"
+    missing = record.get("missing")
+    reason = missing.get("status") if isinstance(missing, dict) else None
+    if not reason:
+        exit_code = record.get("cli_exit")
+        reason = (f"cli_exit:{exit_code}" if exit_code not in (None, 0)
+                  else "status_absent")
+    return True, reason
+
+
 #: 场内基金代码段：沪市 5 开头（510/511/512/513/515/516/518/588…），
 #: 深市 15/16/18（159 ETF、160/161/162/163/164/165/166/167/168 LOF、180）。
 #: 这些**不是**场外基金，结算走 ``stock_*_qfq.csv``（前复权），与历史口径一致。
@@ -225,7 +268,7 @@ def ledger_dir_path(ledger_dir=None):
 
 def day_path(day, ledger_dir=None):
     """``<ledger>/<YYYY-MM-DD>.json``；``day`` 可以是字符串 / date / datetime。"""
-    text = str(day)[:10]
+    text = _date_text(day)
     return os.path.join(ledger_dir_path(ledger_dir), f"{text}.json")
 
 
@@ -269,20 +312,95 @@ def _atomic_write(path, payload):
 
 
 def _now_iso(now=None):
-    return (now or _dt.datetime.now()).isoformat(timespec="seconds")
+    current = now or _dt.datetime.now()
+    if not isinstance(current, _dt.datetime):
+        # 测试注入 date（建议日期）时也能落 ``recorded_at``：取当天 00:00。
+        current = _dt.datetime.combine(current, _dt.time())
+    return current.isoformat(timespec="seconds")
 
 
-def _local_expected_trade_date(now=None):
-    """**纯本地**的「最近一个交易日」；日历缺失时退回周末推算。"""
+class DuplicateRecordError(RuntimeError):
+    """同一 ``(日期, 标的)`` 已有记录，且未显式允许覆盖（issue #134）。
+
+    ``conflicts`` 是 ``[(day, code), ...]``（升序），供调用方逐条打印。默认
+    **在写任何文件之前**整体拒绝，不会出现「一半写了、一半拒绝」的台账。
+    """
+
+    def __init__(self, conflicts):
+        self.conflicts = sorted(conflicts)
+        detail = "、".join(f"{day}/{code}" for day, code in self.conflicts)
+        super().__init__(
+            f"台账已有同 (日期, 标的) 记录：{detail}；默认拒绝覆盖"
+            "（防止静默改写既有记录）。确认要覆盖请显式加 --overwrite。")
+
+
+def _date_text(value):
+    """``date`` / ``datetime`` / ``YYYYMMDD`` / ``YYYY-MM-DD`` → ``YYYY-MM-DD``。
+
+    ``cli.py --as-of`` 接受两种写法且**原样回显**（``request.as_of``），所以
+    回放路径真接上以后，台账这里必须自己归一：否则 ``20261112`` 会落成
+    ``20261112.json``，而 :func:`list_days` 只认 15 字符的 ``YYYY-MM-DD.json``，
+    整份记录对 ``report`` / ``evaluate`` 不可见。
+    """
+    text = str(value)[:10]
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text
+
+
+def _day_text(now=None):
+    """``now``（datetime / date / None）→ ``YYYY-MM-DD``。"""
+    current = now or _dt.datetime.now()
+    if isinstance(current, _dt.datetime):
+        current = current.date()
+    return _date_text(current)
+
+
+def advice_date(as_of=None, payload=None, now=None):
+    """写入日期 = **建议日期**（issue #134）。
+
+    优先级：显式 ``as_of``（库调用方 / CLI ``--as-of`` 回放）> payload 的
+    ``request.as_of``（CLI 回显）> ``now`` 当天。**绝不读 ``data.end``** ——
+    净值迟到时它是 T-1，会把 T 日的建议写进前一交易日的文件。
+    """
+    if as_of:
+        return _date_text(as_of)
+    request = payload.get("request") if isinstance(payload, dict) else None
+    if isinstance(request, dict) and request.get("as_of"):
+        return _date_text(request["as_of"])
+    return _day_text(now)
+
+
+def _data_end_of(payload):
+    """CLI 输出里的 ``data.end``（最后一根行情日期）；缺失 / 不可解析返回 ``None``。"""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict) or not data.get("end"):
+        return None
+    return _date_text(data["end"])
+
+
+def data_lag_calendar_days(as_of, data_end):
+    """``as_of - data_end`` 的**自然日**数（issue #134）。
+
+    不滞后为 ``0``；拿不到任一日期时返回 ``None``（写 ``null``，不猜）。
+    显式 ``--as-of`` 早于数据截止日（回放）时差值为负，按 ``0`` 记 —— 只有
+    「数据落后于建议日期」才叫滞后，反向情况由 ``data_end`` 本身可见。
+
+    **口径**：这里数自然日，CLI payload 的 ``data.lag_days`` 数交易日
+    （``data_loader/meta.py`` 的「缓存末日 → 期望最新交易日」）。两者名字
+    刻意不同，避免同一次运行出现 ``lag_days=0`` / ``data_lag_calendar_days=1``
+    时被误读成自相矛盾。
+    """
+    if not as_of or not data_end:
+        return None
     try:
-        from stock_analysis.data_loader.flow import _expected_trade_date
-        day, _source = _expected_trade_date(now=now)
-        return day.isoformat()
-    except Exception:
-        day = (now or _dt.datetime.now()).date()
-        while day.weekday() >= 5:
-            day -= _dt.timedelta(days=1)
-        return day.isoformat()
+        lag = (_dt.date.fromisoformat(_date_text(as_of))
+               - _dt.date.fromisoformat(_date_text(data_end))).days
+    except ValueError:
+        return None
+    return max(0, lag)
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +568,7 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
     """把一次 CLI 输出折成一条台账记录（键集合固定，缺失写 null + reason）。"""
     code = _normalize_code(code)
     rec = {
-        "as_of": str(as_of)[:10],
+        "as_of": _date_text(as_of),
         "code": code,
         "action": None,
         "status": None,
@@ -469,6 +587,19 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
         "cli_exit": cli_exit,
         "elapsed_s": elapsed_s,
         "recorded_at": _now_iso(now),
+        # issue #134 additive：``as_of`` 是**建议日期**（决定落哪个文件），
+        # ``data_end`` 是这次建议用到的最后一根行情日期。``data_lag_calendar_days``
+        # 为两者相差的**自然日**数（不滞后 0；无 data.end 时 null），滞后时汇总与
+        # record 日志都会显式列出 —— 目的是让「净值还没入库」可见，而不是
+        # 让记录悄悄落到前一交易日的文件里。刻意不叫 ``data_lag_days``：CLI
+        # payload 的 ``data.lag_days`` 是交易日口径，同名不同义。
+        "data_end": None,
+        "data_lag_calendar_days": None,
+        # issue #134 P3 additive：这条记录是否为「降级记录」（CLI 未产出可用
+        # 建议）与原因。``--overwrite`` 重跑修好降级记录后 ``degraded`` 变
+        # False；被替换的旧记录连同它当时的 degraded 原因保留在 ``superseded``。
+        "degraded": False,
+        "degraded_reason": None,
         # PR #96 复验 P1-2/P1-3 additive：记录**当时实际使用的**标的类型与价源。
         # 结算严格按这里走，绝不换源。老记录没有这些键时按 brief 默认 stock/qfq，
         # 只有明确的净值缓存且无 stock 缓存才判 fund（见 :func:`classify_instrument`）。
@@ -492,6 +623,9 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
         "settle_status": None,
     }
     missing = rec["missing"]
+    rec["data_end"] = _data_end_of(payload)
+    rec["data_lag_calendar_days"] = data_lag_calendar_days(
+        rec["as_of"], rec["data_end"])
 
     # 类型/价源在**记录时**就定下来（不依赖结算时的文件状态，否则缓存一变
     # 口径就跟着变）。payload 只用于确认「这只标的确实跑过 CLI」，不参与
@@ -519,6 +653,7 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
         for prefix in ("market_regime", "index_regime"):
             for key in REGIME_KEYS:
                 missing[f"{prefix}.{key}"] = reason
+        rec["degraded"], rec["degraded_reason"] = degraded_state(rec)
         return rec
 
     rec_block = payload.get("recommendation") if isinstance(payload, dict) else None
@@ -550,6 +685,7 @@ def build_record(code, payload, cli_exit, elapsed_s, as_of, now=None):
     rec["market_regime"] = _sub_block(market, REGIME_KEYS, missing, "market_regime")
     index = market.get("index") if isinstance(market, dict) else None
     rec["index_regime"] = _sub_block(index, REGIME_KEYS, missing, "index_regime")
+    rec["degraded"], rec["degraded_reason"] = degraded_state(rec)
     return rec
 
 
@@ -563,12 +699,16 @@ def source_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def default_runner(code):
+def default_runner(code, as_of=None):
     """默认记录器：真实子进程跑 CLI，返回 ``(payload, exit_code, elapsed_s)``。
 
     用子进程而不是 ``import cli``：``cli.py`` 的退出码契约（0/10/20/30/40）
     本身就是证据的一部分，直接 import 会把它丢掉。``--fast`` 与生产用法一致
     （README「性能」一节：≈9.8s/票）。
+
+    ``as_of``（issue #134）：``tools/forward_log.py record --as-of`` 的历史回放
+    会把它透传给 ``cli.py --as-of``，让 payload 真正按该日期截断行情（并回显
+    ``request.as_of``），而不只是改台账文件的日期。
     """
     import subprocess
     import sys
@@ -577,9 +717,11 @@ def default_runner(code):
     src = source_dir()
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    cmd = [sys.executable, "cli.py", str(code), "--json", "--fast"]
+    if as_of:
+        cmd += ["--as-of", _date_text(as_of)]
     start = time.time()
-    proc = subprocess.run([sys.executable, "cli.py", str(code), "--json", "--fast"],
-                          cwd=src, capture_output=True, text=True,
+    proc = subprocess.run(cmd, cwd=src, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", env=env)
     elapsed = round(time.time() - start, 2)
     try:
@@ -600,29 +742,92 @@ def collect_record(code, as_of=None, runner=None, now=None):
     避免为了写旧格式再跑一遍 CLI。``runner`` 抛异常 / 返回非 JSON 时记录仍是
     完整键集合（全 null + ``missing`` 原因），**不会静默缺行**。
     """
-    runner = runner or default_runner
+    # 只有显式回放时才给默认 runner 传 ``as_of``：测试/调用方注入的单参数
+    # runner（``runner(code)``）保持原契约，不必为了新参数改写。
+    if runner is None:
+        runner = ((lambda c: default_runner(c, as_of=as_of)) if as_of
+                  else default_runner)
     try:
         payload, exit_code, elapsed = runner(code)
     except Exception as exc:
         payload, exit_code, elapsed = None, None, None
-        fallback = as_of or _local_expected_trade_date(now)
+        fallback = advice_date(as_of, None, now)
         rec = build_record(code, None, exit_code, elapsed, fallback, now=now)
         rec["missing"] = {key: f"runner_error:{type(exc).__name__}"
                           for key in rec["missing"]}
+        # 换掉 ``missing`` 后按新原因重算降级原因（build_record 里用的是
+        # ``cli_failed``，这里能精确到异常类型）。
+        rec["degraded"], rec["degraded_reason"] = degraded_state(rec)
         return rec, None
 
-    day = as_of
-    if day is None and isinstance(payload, dict):
-        data = payload.get("data")
-        if isinstance(data, dict) and data.get("end"):
-            day = str(data["end"])[:10]
-    if day is None:
-        day = _local_expected_trade_date(now)
+    # issue #134：落盘日期取**建议日期**（显式 as_of > request.as_of > 当天），
+    # 不再取 data.end。净值迟到（data.end=T-1、建议日期=T）时，记录仍落在 T
+    # 的文件里，并带 data_lag_calendar_days=1；data.end 只作为 additive 字段留痕。
+    day = advice_date(as_of, payload, now)
     return build_record(code, payload, exit_code, elapsed, day, now=now), payload
 
 
-def write_records(records_by_day, ledger_dir=None, now=None):
-    """把 ``{day: {code: record}}`` 合并进台账文件（同 code 覆盖，不追加）。"""
+def find_conflicts(records_by_day, ledger_dir=None):
+    """``{day: {code: record}}`` 里**台账已存在**的 ``(day, code)``（升序）。
+
+    只读台账、不写盘。``write_records`` 用它做「写前整体检查」：任何冲突都
+    在打开文件之前抛出，避免半写。
+    """
+    conflicts = []
+    for day in sorted(records_by_day):
+        payload = load_day(day, ledger_dir)
+        if not payload:
+            continue
+        existing = payload.get("records") or {}
+        for code in sorted(records_by_day[day]):
+            if code in existing:
+                conflicts.append((day, code))
+    return conflicts
+
+
+def _superseded_entry(record, now=None):
+    """被 ``--overwrite`` 替换的旧记录的**留痕摘要**（issue #134 P2/P3）。
+
+    只留复盘需要的字段，不整条复制：``recorded_at`` / ``action`` /
+    ``confidence`` / ``status`` / ``cli_exit`` / ``degraded`` 与降级原因
+    （``degraded_reason``）。已结算的旧记录额外带上 ``settled`` 与
+    ``settle_status`` —— 覆盖会丢历史数值正是这条留痕要堵的口子。
+    旧台账没有 ``degraded`` 键时用 :func:`degraded_state` 现算。
+    """
+    record = record if isinstance(record, dict) else {}
+    degraded, reason = degraded_state(record)
+    entry = {
+        "recorded_at": record.get("recorded_at"),
+        "action": record.get("action"),
+        "confidence": record.get("confidence"),
+        "status": record.get("status"),
+        "cli_exit": record.get("cli_exit"),
+        "degraded": degraded,
+        "degraded_reason": reason,
+        "settle_status": record.get("settle_status"),
+        "superseded_at": _now_iso(now),
+    }
+    if has_settlement(record):
+        entry["settled"] = record.get("settled")
+    return entry
+
+
+def write_records(records_by_day, ledger_dir=None, now=None, overwrite=False):
+    """把 ``{day: {code: record}}`` 合并进台账文件。
+
+    issue #134：同 ``(day, code)`` 已有记录时**默认拒绝**，在任何文件落盘
+    之前抛 :class:`DuplicateRecordError`；``overwrite=True``（CLI
+    ``--overwrite``）才替换。旧实现无条件覆盖：净值迟到时同一标的当天的记录
+    会改写前一交易日的记录（``recorded_at`` / ``confidence`` 变了、条数不变），
+    已结算记录也会被抹掉，事后无法复盘「当天到底给了什么建议」。
+
+    ``overwrite=True`` 时**不丢历史**：被替换的旧记录摘要追加进新记录的
+    ``superseded``（additive 数组，见 :func:`_superseded_entry`），多次覆盖
+    形成按时间递增的链条（旧记录自己的 ``superseded`` 也一并保留）。
+    """
+    conflicts = find_conflicts(records_by_day, ledger_dir)
+    if conflicts and not overwrite:
+        raise DuplicateRecordError(conflicts)
     written = {}
     for day, recs in records_by_day.items():
         payload = load_day(day, ledger_dir) or {
@@ -634,23 +839,39 @@ def write_records(records_by_day, ledger_dir=None, now=None):
         payload["schema_version"] = SCHEMA_VERSION
         payload["as_of"] = day
         payload["updated_at"] = _now_iso(now)
-        payload["records"].update(recs)
+        existing = payload["records"]
+        final = {}
+        for code, rec in recs.items():
+            if code in existing and isinstance(rec, dict):
+                old = existing[code]
+                history = list(
+                    (old.get("superseded") if isinstance(old, dict) else None)
+                    or [])
+                history.append(_superseded_entry(old, now))
+                rec = dict(rec)
+                rec["superseded"] = history
+            final[code] = rec
+        existing.update(final)
         _atomic_write(day_path(day, ledger_dir), payload)
-        written[day] = recs
+        written[day] = final
     return written
 
 
-def record_day(codes, as_of=None, ledger_dir=None, runner=None, now=None):
-    """记录一批票的当日建议；返回 ``{as_of: {code: record}}``。
+def record_day(codes, as_of=None, ledger_dir=None, runner=None, now=None,
+               overwrite=False):
+    """记录一批票的当日建议；返回 ``{建议日期: {code: record}}``。
 
-    幂等：同一天同一 code 覆盖写，不追加。按实际 ``as_of`` 分文件落盘
-    （不同票可能因停牌/缓存滞后落在不同日期）。
+    issue #134：``as_of`` 是**建议日期**（不是 ``data.end``），缺省为
+    ``now`` 当天；同一 ``(日期, code)`` 已有记录时默认抛
+    :class:`DuplicateRecordError`，``overwrite=True`` 才覆盖。不同票的
+    ``request.as_of`` 可以不同，因此仍可能分文件落盘。
     """
     grouped = {}
     for code in codes:
         rec, _payload = collect_record(code, as_of=as_of, runner=runner, now=now)
         grouped.setdefault(rec["as_of"], {})[rec["code"]] = rec
-    return write_records(grouped, ledger_dir=ledger_dir, now=now)
+    return write_records(grouped, ledger_dir=ledger_dir, now=now,
+                         overwrite=overwrite)
 
 
 # ---------------------------------------------------------------------------
@@ -1226,12 +1447,21 @@ def build_report(ledger_dir=None):
     settle_counts = {SETTLE_STATUS_SETTLED: 0, SETTLE_STATUS_NOT_MATURED: 0,
                      SETTLE_STATUS_PENDING: 0, SETTLE_STATUS_FAILED: 0}
     uncertain = 0
+    # issue #134：数据滞后（data_end < as_of）的条数与按**自然日**的分布。
+    # 老记录没有 data_lag_calendar_days 键时不计 —— 不能把「未记录」当成
+    # 「不滞后」。（CLI payload 的 data.lag_days 是交易日口径，不在此列。）
+    lag_records = 0
+    lag_by_days = {}
     for _day, _code, record in all_records:
         status = infer_settle_status(record)
         if status in settle_counts:
             settle_counts[status] += 1
         if _is_basis_uncertain(record):
             uncertain += 1
+        lag = record.get("data_lag_calendar_days")
+        if isinstance(lag, int) and lag > 0:
+            lag_records += 1
+            lag_by_days[lag] = lag_by_days.get(lag, 0) + 1
     pending = settle_counts[SETTLE_STATUS_PENDING]
     failed = settle_counts[SETTLE_STATUS_FAILED]
 
@@ -1321,6 +1551,13 @@ def build_report(ledger_dir=None):
         # issue #99：口径未确认（记录时无可用缓存）的记录条数。这些记录在首次
         # 结算成功前会被重判一次；数量长期不降说明缓存一直没补齐。
         "basis_uncertain": uncertain,
+        # issue #134：数据滞后可见（0 条 = 全部记录都拿到了建议日期当天/之后的数据）。
+        "data_lag": {
+            "records": lag_records,
+            "max_days": max(lag_by_days) if lag_by_days else 0,
+            "by_days": {str(day): lag_by_days[day]
+                        for day in sorted(lag_by_days)},
+        },
         "directional_matured": hit_n,
         "hit_rate": hit_rate,
         "horizon_days": HORIZON_DAYS,
@@ -1355,6 +1592,12 @@ def format_report(report):
         # issue #99：口径未确认的记录单独提示，避免「pending 一堆」却看不出原因。
         lines.append(f"  口径未确认 {report['basis_uncertain']} 条"
                      f"（记录时无可用缓存，首次结算成功前重判一次）")
+    lag = report.get("data_lag") or {}
+    if lag.get("records"):
+        # issue #134：数据滞后在汇总里可见，不只在单条记录里。
+        lines.append(f"  数据滞后 {lag['records']} 条"
+                     f"（data_end < as_of，最大 {lag['max_days']} 天；"
+                     f"按滞后天数 {lag['by_days']}）")
     if report["by_action"]:
         lines.append("  按 action：")
         for action in sorted(report["by_action"], key=lambda item: str(item)):
