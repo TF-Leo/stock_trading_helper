@@ -1,5 +1,50 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-16 · 每日建议口径：置信分级 + 解释性文本可关闭
+
+- **分支**：`TF-Leo/advice-tone`（父 `origin/main` `369b609`）；关联 issue #1；
+  **PR 待建，不合并**。未改 `decision/*`，`--json` 不变，未引入依赖，渲染零联网。
+- **背景**：首次真实投递里置信度在 Hermes 侧压缩中丢失（盘前 prompt 的
+  「必须保留五项」不含置信）；用户自用，不需要免责声明与「大盘顺风/逆风…
+  仅口径提示」，但 `⚠️ 数据:` 告警必须保留。
+- **改动**：
+  - `stock_analysis/advice_render.py`：动作行 → `动作 hold｜置信 63%（中）`；
+    新增常量 `CONFIDENCE_HIGH_MIN=0.75` / `CONFIDENCE_MEDIUM_MIN=0.5` /
+    `CONFIDENCE_GRADE_LABELS`（≥0.75 高、≥0.5 中、<0.5 低）；分级只映射
+    `recommendation.confidence` **已有数值**，不重算；缺失/非有限数时整段
+    「置信 …」消失。
+    **P3 修正（评审）**：置信百分数改为**向下取整到 1 位小数**
+    （`_fmt_confidence_pct`，0.7499 → 74.9%、0.4999 → 49.9%），不再
+    四舍五入成「75%（中）」「50%（低）」；0.5/0.75 是 0.1% 整数倍，向下
+    取整不会跨档，显示值推出的档位恒等于实际分级。其余百分比仍走
+    `_fmt_pct` 的四舍五入口径，默认输出其余部分不变。
+  - `render_advice(payload, compact=False, *, include_disclaimer=True,
+    include_regime_note=True)`：关 regime 只去掉「⚠️ 大盘逆风/顺风」行，
+    关免责只去掉末尾免责行；`⚠️ 数据:` 告警与「今日不建议执行」闸门不受影响。
+  - `tools/render_advice.py` 新增 `--no-disclaimer` / `--no-regime-note`。
+  - README 增补分级常量表与开关说明。
+- **golden 再基线（显式说明）**：要求 1 本身改变了动作行文本，因此 9 个
+  `tests/fixtures/advice_render/*.expected.txt` 按新默认输出更新一次后继续
+  逐字节锁定（`test_render_snapshot` 参数化 9 项）；默认值仍等于显式
+  `include_disclaimer=True, include_regime_note=True`（`test_tone_defaults_*`）。
+  同步更新 3 处既有断言里的动作行字面量（只是追加分级，不改断言意图）：
+  `test_advice_render.py::test_t2_action_and_confidence_are_not_rewritten`、
+  `test_market_watch.py` / `test_events_context.py` 的
+  `test_render_does_not_rewrite_action_or_confidence`。
+- **新增测试 14 项**：置信阈值常量、0.75 高边界（含 0.749→中）、0.5 中边界
+  （含 0.499→低）、缺失不编造（None/"abc"/True）、渲染不改入参、四种开关组合
+  各一条、默认等价显式 True、工具两种开关；P3 回归（0.7499→74.9% 中、
+  0.4999→49.9% 低）与性质测试（0.0001–0.9999 全网格 + 阈值邻值，显示档位 ==
+  分级且显示值 ≤ 原值×100）。全部使用 600519 / 600000。
+- **证据（本机 Linux，Python 3.14.9 / akshare 1.18.29 / pandas 3.0.1 /
+  pytest 8.3.5）**：
+  - `python -m pytest tests/ -q` → **1154 passed**（基线 1140 + 新增 14）。
+  - `python tools/probe.py all` → **41/41 PASS**（本机无 pwsh，
+    `tools/check_gates.ps1` 不可运行；以 probe 为运行时裁定器）。
+- **未覆盖（仓库外）**：Hermes 盘前 prompt（`~/.hermes/cron/jobs.json`）的
+  「必须保留五项」仍未包含置信，需协调者在仓库外单独改 prompt，否则渲染侧
+  有分级也可能在压缩时再次丢失。
+
 ## 2026-11-15 · ST 名单交易所官方备胎（东财长时间封禁兜底）
 
 - **分支**：`TF-Leo/st-exchange-fallback`（父 `origin/main` `b77d509`）；

@@ -13,6 +13,10 @@
   配对完整的内部引用括号，再按模块级封闭词表 ``COMPACT_GLOSSARY`` 把少量
   内部术语换成固定中文表述；词表之外只许删除），盘前投递建议开启；不传时输出
   与默认渲染逐字节一致。
+* ``--no-disclaimer``：去掉末尾免责行（自用场景）；不传时照常输出。
+* ``--no-regime-note``：去掉「⚠️ 大盘逆风/顺风 …（仅提示口径差异）」括注行；
+  不传时照常输出。两个开关都**不影响** ``⚠️ 数据:`` 告警与「今日不建议执行」
+  闸门，也不改变任何判定。
 
 设计边界：
 * 只做 I/O 包装，渲染逻辑全部在 ``stock_analysis.advice_render.render_advice``；
@@ -59,6 +63,12 @@ def main(argv=None) -> int:
     parser.add_argument("--compact", action="store_true",
                         help="压缩 diagnostics.warnings（整段删除 URL/堆栈/内部引用括号，"
                              "并按封闭词表 COMPACT_GLOSSARY 替换少量内部术语）")
+    parser.add_argument("--no-disclaimer", dest="include_disclaimer",
+                        action="store_false",
+                        help="不输出末尾免责行（不影响数据告警与可执行性闸门）")
+    parser.add_argument("--no-regime-note", dest="include_regime_note",
+                        action="store_false",
+                        help="不输出「大盘逆风/顺风」口径提示行（不影响任何判定）")
     args = parser.parse_args(argv)
 
     try:
@@ -75,7 +85,11 @@ def main(argv=None) -> int:
         payload = dict(payload)
         payload["display_name"] = args.name
 
-    print(render_advice(payload, compact=args.compact))
+    print(render_advice(
+        payload, compact=args.compact,
+        include_disclaimer=args.include_disclaimer,
+        include_regime_note=args.include_regime_note,
+    ))
     return 0
 
 
