@@ -123,21 +123,24 @@ def test_t1_partial_optional_fields():
 
 
 def test_t1_zero_position_is_rendered():
-    """0.0 是有效值，不能被当成 None 吃掉。"""
-    assert "建议仓位 0%" in _render("suspended")
+    """0.0 是有效值，不能被当成 None 吃掉；issue #132 起写作「目标仓位 0%」。"""
+    output = _render("suspended")
+    assert "目标仓位 0%" in output
+    assert "建议仓位" not in output
 
 
 # ---------------------------------------------------------------------------
 # T1b：触发事实行（issue #92）
 # ---------------------------------------------------------------------------
 def test_trigger_line_matches_json_values():
-    """触发价与距触发百分比逐值取自 JSON，渲染层不得重算。"""
+    """触发价逐值取自 JSON，渲染层不得重算；已触发态不再写「距触发」。"""
     payload = _payload("normal_buy")
     trigger = payload["evidence"]["triggers"][0]
-    distance = payload["recommendation"]["distance_to_trigger"]["buy_pct"]
-    assert trigger["buy_price"] == 12.0 and distance == 0.0
-    assert "触发：均线趋势(3-5-8) 买信号已触发（触发价 12，现价距触发 0%）" \
-        in render_advice(payload)
+    assert trigger["buy_price"] == 12.0
+    output = render_advice(payload)
+    assert "触发：均线趋势(3-5-8) 买信号已触发（参考价 12，历史参考价，日期未知）" \
+        in output
+    assert "距触发" not in output
 
 
 def test_trigger_line_sits_between_advice_and_reason():
@@ -164,13 +167,21 @@ def test_trigger_line_disappears_without_triggers(mutate):
     lambda p: p["evidence"]["triggers"][0].__setitem__("buy_price", None),
     lambda p: p["evidence"]["triggers"][0].__setitem__("indicator", ""),
     lambda p: p["evidence"]["triggers"][0].__setitem__("state", "near_buy"),
-    lambda p: p["recommendation"].pop("distance_to_trigger"),
-    lambda p: p["recommendation"]["distance_to_trigger"].__setitem__("buy_pct", None),
 ])
 def test_trigger_line_disappears_when_fields_missing(mutate):
     payload = _payload("normal_buy")
     mutate(payload)
     assert "触发：" not in render_advice(payload)
+
+
+def test_trigger_line_renders_without_distance_block():
+    """issue #132：已触发态的参考价不再依赖 ``distance_to_trigger``。"""
+    payload = _payload("normal_buy")
+    payload["recommendation"].pop("distance_to_trigger")
+    output = render_advice(payload)
+    assert "触发：均线趋势(3-5-8) 买信号已触发（参考价 12，历史参考价，日期未知）" \
+        in output
+    assert "距触发" not in output
 
 
 def test_trigger_line_uses_sell_side_fields():
@@ -184,7 +195,7 @@ def test_trigger_line_uses_sell_side_fields():
     }
     line = next(line for line in render_advice(payload).splitlines()
                 if line.startswith("触发："))
-    assert line == "触发：示例指标 卖信号已触发（触发价 10.5，现价距触发 -12.5%）"
+    assert line == "触发：示例指标 卖信号已触发（参考价 10.5，历史参考价，日期未知）"
 
 
 def test_trigger_line_lists_multiple_triggered_signals():
@@ -198,12 +209,12 @@ def test_trigger_line_lists_multiple_triggered_signals():
     payload["recommendation"]["distance_to_trigger"] = {
         "buy_pct": -4.17, "sell_pct": None,
     }
-    assert ("触发：甲 买信号已触发（触发价 11.5，现价距触发 -4.17%）；"
-            "乙 买信号已触发（触发价 11.8，现价距触发 -4.17%）") in render_advice(payload)
+    assert ("触发：甲 买信号已触发（参考价 11.5，历史参考价，日期未知）；"
+            "乙 买信号已触发（参考价 11.8，历史参考价，日期未知）") in render_advice(payload)
 
 
 def test_trigger_line_avoids_current_price_wording_when_stale():
-    """行情非当日时不得写「现价」；距离值仍照抄 JSON。"""
+    """行情非当日时不得写「现价」；issue #132：历史参考价也不写「距触发」。"""
     payload = _payload("data_stale_lag4")
     payload["evidence"]["triggers"] = [{
         "indicator": "甲", "state": "buy_triggered",
@@ -214,8 +225,9 @@ def test_trigger_line_avoids_current_price_wording_when_stale():
     }
     line = next(line for line in render_advice(payload).splitlines()
                 if line.startswith("触发："))
-    assert "距触发 0%" in line
-    assert "现价距触发" not in line
+    assert "参考价 18.7" in line
+    assert "距触发" not in line
+    assert "现价" not in line
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +545,7 @@ def test_t3_missing_index_no_line_no_error():
     output = _render("suspended")  # market_regime 无 index 键
     assert "大盘逆风" not in output
     assert "大盘顺风" not in output
-    assert "建议仓位 0%" in output  # 其余建议仍然正常渲染
+    assert "目标仓位 0%" in output  # 其余建议仍然正常渲染
 
 
 # ---------------------------------------------------------------------------
