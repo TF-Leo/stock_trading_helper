@@ -31,6 +31,9 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
   ``>= 0.75`` 高、``>= 0.5`` 中、``< 0.5`` 低（常量见
   :data:`CONFIDENCE_HIGH_MIN` / :data:`CONFIDENCE_MEDIUM_MIN`）。渲染层
   **不重算、不调整**置信；置信缺失时整段「置信 …」消失，绝不编造。
+  置信百分数**向下取整到 1 位小数**（0.7499 → ``74.9%``、0.4999 → ``49.9%``），
+  保证「显示值落在哪一档，分级就是哪一档」；其余百分比仍走
+  :func:`_fmt_pct` 的四舍五入口径。
 * **None 整段消失**：任何可选字段缺失时，对应句子/段落整体不出现，输出中
   不允许出现字符串 ``None``。
 * **零新依赖**。
@@ -112,6 +115,7 @@ from __future__ import annotations
 import datetime as _dt
 import math
 import re
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any, Dict, List, Optional
 
 __all__ = [
@@ -325,6 +329,23 @@ def _fmt_pct(ratio) -> Optional[str]:
     if number is None:
         return None
     text = f"{number * 100.0:.1f}".rstrip("0").rstrip(".")
+    return f"{text}%"
+
+
+def _fmt_confidence_pct(ratio) -> Optional[str]:
+    """置信度百分比：**向下取整**到 1 位小数（0.7499 → ``74.9%``）。
+
+    四舍五入会把 0.7499 显示成 ``75%``，而分级按原值仍是「中」，并排看像
+    分错了档。这里对置信数值向下取整，保证「显示值落在哪一档，分级就是哪
+    一档」：阈值 0.5 / 0.75 恰好是 0.1% 的整数倍，向下取整永远不会跨过
+    档位边界。其余百分比仍走 :func:`_fmt_pct` 的四舍五入口径。
+    """
+    number = _num(ratio)
+    if number is None:
+        return None
+    scaled = Decimal(str(number)) * 100
+    floored = scaled.quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+    text = format(floored, "f").rstrip("0").rstrip(".")
     return f"{text}%"
 
 
@@ -827,11 +848,12 @@ def _action_line(rec: Dict[str, Any]) -> Optional[str]:
 
     置信与分级都只展示 ``recommendation.confidence`` 的**已有数值**：分级是
     常量阈值的查表映射（:data:`CONFIDENCE_HIGH_MIN` /
-    :data:`CONFIDENCE_MEDIUM_MIN`），渲染层不重算、不调整。置信缺失时整段
-    「置信 …」消失，绝不编造数值或分级。
+    :data:`CONFIDENCE_MEDIUM_MIN`），渲染层不重算、不调整。百分数向下取整到
+    1 位小数（见 :func:`_fmt_confidence_pct`），使显示档位与分级恒一致。
+    置信缺失时整段「置信 …」消失，绝不编造数值或分级。
     """
     action = _text(rec.get("action"))
-    confidence = _fmt_pct(rec.get("confidence"))
+    confidence = _fmt_confidence_pct(rec.get("confidence"))
     grade = _confidence_grade(rec.get("confidence"))
     parts = []
     if action:

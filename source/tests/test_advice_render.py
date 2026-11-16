@@ -647,6 +647,44 @@ def test_confidence_grade_medium_boundary_is_inclusive():
         _confidence_payload(0.499))) == "动作 hold｜置信 49.9%（低）"
 
 
+def test_confidence_display_is_floored_not_rounded():
+    """P3 回归：显示值向下取整，不能把 0.7499 四舍五入成「75%（中）」。"""
+    assert _action_line_of(render_advice(
+        _confidence_payload(0.7499))) == "动作 hold｜置信 74.9%（中）"
+    assert _action_line_of(render_advice(
+        _confidence_payload(0.4999))) == "动作 hold｜置信 49.9%（低）"
+
+
+def test_confidence_display_tier_matches_grade_on_grid():
+    """性质测试：0.0001–0.9999 网格上，显示值推出的档位 == 实际分级。
+
+    同时校验显示值确实是对置信数值向下取整（不会向上越档）。
+    """
+    from decimal import Decimal
+
+    values = [i / 10000 for i in range(1, 10000)]
+    # 阈值附近的密集补点（浮点里 0.5 / 0.75 的两侧邻值）。
+    values += [
+        0.5 - 1e-12, 0.5, 0.5 + 1e-12,
+        0.75 - 1e-12, 0.75, 0.75 + 1e-12,
+        0.7499, 0.4999,
+    ]
+    for confidence in values:
+        line = _action_line_of(render_advice(_confidence_payload(confidence)))
+        match = re.search(r"置信 ([0-9.]+)%（([高中低])）", line)
+        assert match, line
+        shown = float(match.group(1)) / 100.0
+        expected = (
+            CONFIDENCE_GRADE_LABELS["high"] if shown >= CONFIDENCE_HIGH_MIN
+            else CONFIDENCE_GRADE_LABELS["medium"]
+            if shown >= CONFIDENCE_MEDIUM_MIN
+            else CONFIDENCE_GRADE_LABELS["low"]
+        )
+        assert match.group(2) == expected, (confidence, line)
+        assert (Decimal(match.group(1))
+                <= Decimal(str(confidence)) * 100), (confidence, line)
+
+
 @pytest.mark.parametrize("confidence", [None, "abc", True])
 def test_confidence_missing_is_omitted_never_invented(confidence):
     """confidence 缺失/不可用：整段「置信 …」消失，不编数值也不编分级。"""
