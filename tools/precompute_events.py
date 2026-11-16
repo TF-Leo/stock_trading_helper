@@ -44,12 +44,31 @@ P2-2 「无事件 vs 接口坏了」：每轮先发 4 个对照探针（每报�
 并跳过该子项的逐票请求。零成本兜底：全票池该子项皆空且上一轮有数据 →
 ``empty_pool_suspected`` + warning。
 
-限流
-----
+限流与统一熔断（2026-11-16 接入 ``eastmoney_guard``）
+------------------------------------------------------
 所有请求一律走 ``_astock_generated.em_get()``：模块级 ≥1s 最小间隔 + 随机
 抖动 + Keep-Alive 会话复用。本工具在调用侧再加一层「相邻请求（含重试）间隔
 ≥ ``--interval``」的节流，默认 1.0s，不得调到 1.0 以下 —— 两层时间戳都取
 「上一次请求返回之后」，因此不会叠加成 2s。
+
+**统一闸门**：整轮（含 ``--probes-only``）包在
+``eastmoney_guard.EmFetchGuard`` 里，于是自动获得：
+
+* HTTP 444 / 零字节 FIN 识别 → 立即熔断、写**持久冷却**，本轮剩余请求一个
+  都不发（不再照常发满 60+ 次撞墙）；
+* 冷却期内整轮**直接退出**：0 请求、退出码 3、**不写缓存**（已有好缓存原样
+  保留），stderr 只出一行 ``SKIP …``；
+* **请求预算**：本轮 datacenter 请求硬上限 ``--budget``（默认 80，环境变量
+  ``EASTMONEY_REQUEST_BUDGET`` 可覆盖），在**发请求之前**扣减，超限即抛
+  ``EastmoneyBudgetExceeded``，退出码 4、不写缓存。
+
+冷却键按**域**隔离：本工具的封锁写进
+``eastmoney_cooldown.json`` 的 ``surfaces["datacenter-web.eastmoney.com"]``，
+而不是顶层共享封锁。理由：``push2``/``push2his`` 与 ``datacenter-web`` 是
+东财的两套网关，历史上 push2 返回 444 时 datacenter-web 仍正常 200；若共用
+一个整域封锁键，事件预计算一次 444 就会让资金流 / ST 名单整轮停摆（误伤），
+反之亦然。读取时取「顶层共享封锁 ∪ 本域条目」的并集 —— 任一命中都 0 请求，
+因为顶层封锁代表「此刻整条东财出口都别碰」。
 
 用法
 ----
@@ -59,8 +78,13 @@ P2-2 「无事件 vs 接口坏了」：每轮先发 4 个对照探针（每报�
     python tools/precompute_events.py --estimate         # 只估算耗时，不触网
     python tools/precompute_events.py --probes-only      # 只跑 4 个对照探针
     python tools/precompute_events.py --out-dir /tmp/events
+    python tools/precompute_events.py --budget 80        # 本轮请求硬上限
+    python tools/precompute_events.py --force            # 忽略冷却（人工确认后）
+    python tools/precompute_events.py --clear-cooldown   # 只清本域冷却条目
 
-退出码：0 = 全部子项成功；1 = 有子项失败；2 = 参数/配置错误。
+退出码：0 = 全部子项成功；1 = 有子项失败 / 探针疑似异常；2 = 参数/配置错误；
+3 = 东财反爬冷却中（0 请求）或本轮命中 444/零字节 FIN（已写冷却，未写缓存）；
+4 = 本轮请求预算超限（发请求前拦截，未写缓存）。
 """
 from __future__ import annotations
 
@@ -81,9 +105,22 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 from stock_analysis.data_loader import events as events_loader  # noqa: E402
+from stock_analysis.data_sources import eastmoney_guard as em_guard  # noqa: E402
 
 OUT_DIR = events_loader.EVENTS_DIR
 CACHE_FILENAME = events_loader.CACHE_FILENAME
+
+#: 本工具守护的东财域名（冷却按域隔离，见模块 docstring）。
+SURFACE = "datacenter-web.eastmoney.com"
+
+#: 本轮 datacenter 请求硬上限：默认 14 只 × 4 + 4 探针 = 60，留 20 次重试余量。
+DEFAULT_BUDGET = 80
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_ARGS = 2
+EXIT_COOLDOWN = 3
+EXIT_BUDGET = 4
 
 #: 默认票池不在本文件重复维护：直接复用 tools/precompute_flow.py 的 14 只自选，
 #: 两边共用同一份常量（同一批标的，便于交叉核对；也避免票池被复制成多份）。
@@ -308,6 +345,11 @@ def _datacenter(report: str, filter_str: str = "", sort_columns: str = "ALL",
     }
     try:
         response = _http_get(DATACENTER_URL, params=params, timeout=15)
+    except (em_guard.AntiScrapeBlocked, em_guard.EastmoneyBudgetExceeded):
+        # 反爬熔断 / 预算超限是**整轮**信号，不是单个子项失败：绝不能在这里
+        # 包装成 EventsFetchError，否则调用方会把它当成「这个子项坏了」而继续
+        # 发剩下几十个请求 —— 那正是 444 冷却期继续撞墙的路径。
+        raise
     except Exception as exc:
         raise EventsFetchError(
             f"东财 {report} 请求失败：{type(exc).__name__}: {exc}") from exc
@@ -719,6 +761,9 @@ def _run_probes(probe_specs, run_day, throttle, stats) -> set:
             rows = throttle.call(probe, run_day)
             if not rows:
                 error = "对照探针返回 0 行"
+        except (em_guard.AntiScrapeBlocked, em_guard.EastmoneyBudgetExceeded):
+            # 整轮熔断 / 预算：不当作「这个探针坏了」，直接中止本轮。
+            raise
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         stats["probes"][key] = {"ok": error is None, "rows": len(rows),
@@ -739,9 +784,48 @@ def _run_probes(probe_specs, run_day, throttle, stats) -> set:
     return suspected
 
 
+def _budget_limit(budget=None) -> int:
+    """本轮请求上限：``--budget`` 优先，其次 ``EASTMONEY_REQUEST_BUDGET``，
+    最后默认 :data:`DEFAULT_BUDGET`（80）。
+
+    注意不能直接用 ``eastmoney_guard.request_budget()`` 的默认值（60）——那是
+    资金流 / ST 名单的单轮上限；事件预计算默认票池 14×4+4=60，需要留重试余量。
+    """
+    if budget is not None:
+        return em_guard.request_budget(budget)
+    raw = str(os.getenv(em_guard.REQUEST_BUDGET_ENV, "") or "").strip()
+    if not raw:
+        return DEFAULT_BUDGET
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_BUDGET
+    return max(1, min(value, 10000))
+
+
+def _make_guard(budget=None, now_fn=_dt.datetime.now, force=False,
+                path=None):
+    """构造本轮统一闸门：域级冷却 + 444/FIN 熔断 + 请求预算。
+
+    ``surface=SURFACE`` 让冷却按域隔离（见模块 docstring）；``enforce_budget``
+    保持默认 True —— 本工具的每个请求都是一次真实 HTTP 调用，没有「逻辑请求
+    合并」的层，闸门扣减即等于实际请求数。
+    """
+    request_budget = em_guard.RequestBudget(_budget_limit(budget))
+    guard = em_guard.EmFetchGuard(
+        budget=request_budget, path=path, surface=SURFACE,
+        now_fn=lambda: now_fn().timestamp(), respect_cooling=not force)
+    return guard, request_budget
+
+
 def run_probes(interval=DEFAULT_INTERVAL, probes=None, sleep_fn=time.sleep,
-               now_fn=_dt.datetime.now, as_of=None):
-    """只跑 4 个对照探针（不写缓存）；用于实测探针耗时 / 体检接口。"""
+               now_fn=_dt.datetime.now, as_of=None, budget=None,
+               force=False):
+    """只跑 4 个对照探针（不写缓存）；用于实测探针耗时 / 体检接口。
+
+    与 :func:`precompute` 走**同一个**闸门：冷却期内 0 请求，命中 444 / 零字节
+    FIN 立即熔断，请求预算同样生效。
+    """
     if interval < 1.0:
         raise ValueError("interval 不得小于 1.0 秒（东财防封铁律）")
     if probes is None:
@@ -754,10 +838,36 @@ def run_probes(interval=DEFAULT_INTERVAL, probes=None, sleep_fn=time.sleep,
     run_day = (_dt.date.fromisoformat(as_of).isoformat()
                if as_of else started.date().isoformat())
     throttle = _Throttle(interval, now_fn, sleep_fn)
+    guard, request_budget = _make_guard(budget, now_fn, force)
     stats = {"as_of": run_day, "requests": 0, "probe_requests": 0,
              "probes": {}, "interface_suspected": [], "failed_sections": 0,
-             "failed": [], "warnings": []}
-    _run_probes(probe_specs, run_day, throttle, stats)
+             "failed": [], "warnings": [], "skipped_cooldown": False,
+             "blocked": False, "block_reason": None, "block_detail": None,
+             "budget_exceeded": False, "reason": None,
+             "requests_sent": 0,
+             "request_limits": request_budget.snapshot()}
+    try:
+        with guard:
+            _run_probes(probe_specs, run_day, throttle, stats)
+    except em_guard.EastmoneyCooling as exc:
+        stats["skipped_cooldown"] = True
+        stats["reason"] = str(exc)
+        print(f"SKIP {exc}", file=sys.stderr)
+    except (em_guard.AntiScrapeBlocked, em_guard.EastmoneyBudgetExceeded) as exc:
+        if isinstance(exc, em_guard.EastmoneyBudgetExceeded):
+            stats["budget_exceeded"] = True
+            print(f"BUDGET {exc}", file=sys.stderr)
+        else:
+            stats["blocked"] = True
+            print(f"BLOCKED {exc}", file=sys.stderr)
+        stats["reason"] = str(exc)
+    finally:
+        stats["request_limits"] = request_budget.snapshot()
+        stats["requests_sent"] = guard.requests
+    if guard.block_reason:
+        stats["blocked"] = True
+        stats["block_reason"] = guard.block_reason
+        stats["block_detail"] = guard.block_detail
     stats["requests"] = throttle.requests
     stats["wall_seconds"] = round(now_fn().timestamp() - started.timestamp(), 2)
     return stats
@@ -766,7 +876,8 @@ def run_probes(interval=DEFAULT_INTERVAL, probes=None, sleep_fn=time.sleep,
 def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
                retries=DEFAULT_RETRIES, retry_wait=DEFAULT_RETRY_WAIT,
                fetchers=None, probes=None, sleep_fn=time.sleep,
-               now_fn=_dt.datetime.now, as_of=None):
+               now_fn=_dt.datetime.now, as_of=None, budget=None, force=False,
+               guard_path=None):
     """逐票、逐子项串行预计算；返回统计字典（不抛异常，失败逐子项记录）。
 
     ``fetchers`` / ``probes`` 可注入（测试用）；默认 :data:`FETCHERS` /
@@ -776,6 +887,19 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
     P2-2：先跑 4 个对照探针（每报表 1 次）。探针抛错或 0 行 → 本轮该子项对
     **所有代码**标 ``available=false, reason=interface_suspected``，且跳过该子项
     的逐票请求（反正接口已疑似异常，省请求）。
+
+    统一熔断（2026-11-16）：整轮包在 :class:`eastmoney_guard.EmFetchGuard` 里。
+
+    * 冷却期（``EASTMONEY_COOLDOWN_PATH`` 未到期）→ **0 请求**，返回的
+      ``stats["skipped_cooldown"]=True``，**不写缓存**（已有好缓存原样保留）；
+    * 命中 444 / 零字节 FIN → 闸门写持久冷却并抛
+      :class:`AntiScrapeBlocked`，本轮立即中止（剩余请求一个不发），同样
+      **不写缓存**（``stats["blocked"]=True``）；
+    * 请求数超 ``budget``（默认 80）→ 在发请求**之前**抛
+      :class:`EastmoneyBudgetExceeded`（``stats["budget_exceeded"]=True``），
+      同样不写缓存。
+
+    ``force=True`` 只用于人工确认封锁解除后的复跑（忽略冷却，不忽略预算）。
     """
     if interval < 1.0:
         raise ValueError("interval 不得小于 1.0 秒（东财防封铁律）")
@@ -799,6 +923,7 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
     existing = existing or {}
 
     throttle = _Throttle(interval, now_fn, sleep_fn)
+    guard, request_budget = _make_guard(budget, now_fn, force, guard_path)
     stats = {
         "out_dir": out_dir or OUT_DIR,
         "as_of": run_day,
@@ -814,6 +939,15 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
         "ok": [],
         "failed": [],
         "warnings": [],
+        "skipped_cooldown": False,
+        "blocked": False,
+        "block_reason": None,
+        "block_detail": None,
+        "budget_exceeded": False,
+        "reason": None,
+        "requests_sent": 0,
+        "request_limits": request_budget.snapshot(),
+        "path": None,
     }
 
     seen, ordered = set(), []
@@ -828,67 +962,106 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
             seen.add(code)
             ordered.append(code)
 
-    # --- P2-2 第一层：对照探针（每报表 1 次，与票池大小无关）-------------
-    suspected = _run_probes(probe_specs, run_day, throttle, stats)
+    def _abort(message: str, label: str) -> dict:
+        """整轮中止：**只写一行日志**，不碰已有缓存（旧缓存原样保留）。"""
+        stats["reason"] = message
+        stats["requests"] = throttle.requests
+        stats["wall_seconds"] = round(
+            now_fn().timestamp() - started.timestamp(), 2)
+        stats["requests_sent"] = guard.requests
+        stats["request_limits"] = request_budget.snapshot()
+        print(f"{label} {message}（requests_sent={guard.requests}，未写缓存）",
+              file=sys.stderr)
+        return stats
 
-    # --- 逐票取数 --------------------------------------------------------
     payload = dict(existing)
-    for code in ordered:
-        previous = existing.get(code) if isinstance(existing.get(code), dict) else {}
-        sections = {}
-        for key, fetch in fetchers:
-            if key in suspected:
-                error = stats["probes"].get(key, {}).get("error") or "探针失败"
-                sections[key] = _suspected_section(previous.get(key), error)
-                continue
-            last_error = None
-            result = None
-            for attempt in range(int(retries) + 1):
-                try:
-                    result = throttle.call(fetch, code, run_day)
+    try:
+        with guard:
+            # --- P2-2 第一层：对照探针（每报表 1 次，与票池大小无关）-------
+            suspected = _run_probes(probe_specs, run_day, throttle, stats)
+
+            # --- 逐票取数 -------------------------------------------------
+            for code in ordered:
+                previous = (existing.get(code)
+                            if isinstance(existing.get(code), dict) else {})
+                sections = {}
+                for key, fetch in fetchers:
+                    if key in suspected:
+                        error = stats["probes"].get(key, {}).get("error") or "探针失败"
+                        sections[key] = _suspected_section(previous.get(key), error)
+                        continue
                     last_error = None
-                    break
-                except Exception as exc:
-                    last_error = f"{type(exc).__name__}: {exc}"
-                    if attempt < int(retries):
-                        sleep_fn(retry_wait)
-            if result is None:
-                stats["failed_sections"] += 1
-                stats["failed"].append({"code": code, "section": key,
-                                        "reason": last_error})
-                sections[key] = _failed_section(previous.get(key), last_error)
-                print(f"FAIL {code} {key}: {last_error}", file=sys.stderr)
-                continue
-            try:
-                items, warnings, reason = _coerce_result(result)
-            except EventsFetchError as exc:
-                stats["failed_sections"] += 1
-                stats["failed"].append({"code": code, "section": key,
-                                        "reason": str(exc)})
-                sections[key] = _failed_section(previous.get(key), str(exc))
-                print(f"FAIL {code} {key}: {exc}", file=sys.stderr)
-                continue
-            if reason == "not_supported":
-                # P3-1：口径不适用 ≠ 取数失败 ≠ 无事件。保留 reason 供渲染。
-                section = events_loader.empty_section(
-                    reason="not_supported", available=False, stale=False,
-                    as_of=run_day, fetched_at=run_stamp, warnings=warnings)
-                sections[key] = section
-                stats["not_supported_sections"] += 1
-                print(f"N/A  {code} {key}: 该市场无此统计口径", file=sys.stderr)
-                continue
-            section = _section_ok(items, warnings)
-            section["as_of"] = run_day
-            section["fetched_at"] = run_stamp
-            sections[key] = section
-            stats["ok_sections"] += 1
-            stats["ok"].append({"code": code, "section": key,
-                                "items": len(items), "as_of": run_day,
-                                "warnings": list(warnings)})
-            for warning in warnings:
-                stats["warnings"].append(f"{code} {key}: {warning}")
-            print(f"OK   {code} {key}: {len(items)} 条", file=sys.stderr)
-        payload[code] = sections
+                    result = None
+                    for attempt in range(int(retries) + 1):
+                        try:
+                            result = throttle.call(fetch, code, run_day)
+                            last_error = None
+                            break
+                        except (em_guard.AntiScrapeBlocked,
+                                em_guard.EastmoneyBudgetExceeded):
+                            # 整轮信号：不重试、不当成子项失败，直接冒泡中止。
+                            raise
+                        except Exception as exc:
+                            last_error = f"{type(exc).__name__}: {exc}"
+                            if attempt < int(retries):
+                                sleep_fn(retry_wait)
+                    if result is None:
+                        stats["failed_sections"] += 1
+                        stats["failed"].append({"code": code, "section": key,
+                                                "reason": last_error})
+                        sections[key] = _failed_section(previous.get(key),
+                                                        last_error)
+                        print(f"FAIL {code} {key}: {last_error}", file=sys.stderr)
+                        continue
+                    try:
+                        items, warnings, reason = _coerce_result(result)
+                    except EventsFetchError as exc:
+                        stats["failed_sections"] += 1
+                        stats["failed"].append({"code": code, "section": key,
+                                                "reason": str(exc)})
+                        sections[key] = _failed_section(previous.get(key),
+                                                        str(exc))
+                        print(f"FAIL {code} {key}: {exc}", file=sys.stderr)
+                        continue
+                    if reason == "not_supported":
+                        # P3-1：口径不适用 ≠ 取数失败 ≠ 无事件。
+                        section = events_loader.empty_section(
+                            reason="not_supported", available=False,
+                            stale=False, as_of=run_day, fetched_at=run_stamp,
+                            warnings=warnings)
+                        sections[key] = section
+                        stats["not_supported_sections"] += 1
+                        print(f"N/A  {code} {key}: 该市场无此统计口径",
+                              file=sys.stderr)
+                        continue
+                    section = _section_ok(items, warnings)
+                    section["as_of"] = run_day
+                    section["fetched_at"] = run_stamp
+                    sections[key] = section
+                    stats["ok_sections"] += 1
+                    stats["ok"].append({"code": code, "section": key,
+                                        "items": len(items), "as_of": run_day,
+                                        "warnings": list(warnings)})
+                    for warning in warnings:
+                        stats["warnings"].append(f"{code} {key}: {warning}")
+                    print(f"OK   {code} {key}: {len(items)} 条", file=sys.stderr)
+                payload[code] = sections
+    except em_guard.EastmoneyCooling as exc:
+        stats["skipped_cooldown"] = True
+        return _abort(str(exc), "SKIP")
+    except em_guard.EastmoneyBudgetExceeded as exc:
+        stats["budget_exceeded"] = True
+        return _abort(str(exc), "BUDGET")
+    except em_guard.AntiScrapeBlocked as exc:
+        stats["blocked"] = True
+        return _abort(str(exc), "BLOCKED")
+    finally:
+        if guard.block_reason:
+            stats["blocked"] = True
+            stats["block_reason"] = guard.block_reason
+            stats["block_detail"] = guard.block_detail
+        stats["requests_sent"] = guard.requests
+        stats["request_limits"] = request_budget.snapshot()
 
     # --- P2-2 第二层（零成本兜底）：全票池皆空且上一轮有数据 -----------
     for key, _fetch in fetchers:
@@ -977,7 +1150,15 @@ def build_parser():
     parser.add_argument("--estimate", action="store_true",
                         help="只输出串行耗时估算，不触网")
     parser.add_argument("--probes-only", action="store_true",
-                        help="只跑 4 个对照探针（体检接口，不写缓存）")
+                        help="只跑 4 个对照探针（体检接口，不写缓存；同样受冷却"
+                             "与请求预算约束）")
+    parser.add_argument("--budget", type=int, default=None,
+                        help=f"本轮 datacenter 请求硬上限（默认 {DEFAULT_BUDGET}；"
+                             "环境变量 EASTMONEY_REQUEST_BUDGET 可覆盖）")
+    parser.add_argument("--force", action="store_true",
+                        help="忽略东财反爬冷却（仅人工确认封锁解除后使用）")
+    parser.add_argument("--clear-cooldown", action="store_true",
+                        help="只删除本工具的域级冷却条目后退出（不触网）")
     parser.add_argument("--json", action="store_true", help="输出机读统计 JSON")
     return parser
 
@@ -989,25 +1170,46 @@ def main(argv=None):
         codes += [c.strip() for c in args.codes_csv.split(",") if c.strip()]
     if not codes:
         codes = list(DEFAULT_CODES)
+    if args.clear_cooldown:
+        em_guard.clear_cooldown(surface=SURFACE)
+        message = f"已清除 {SURFACE} 冷却条目（{em_guard.state_path()}）"
+        print(message)
+        if args.json:
+            print(json.dumps({"cleared": SURFACE,
+                              "path": em_guard.state_path()},
+                             ensure_ascii=False))
+        return EXIT_OK
     try:
         if args.estimate:
             stats = estimate(len(set(codes)), interval=args.interval)
             print(json.dumps(stats, ensure_ascii=False, indent=2))
-            return 0
+            return EXIT_OK
         if args.probes_only:
-            stats = run_probes(interval=args.interval, as_of=args.as_of)
+            stats = run_probes(interval=args.interval, as_of=args.as_of,
+                               budget=args.budget, force=args.force)
             print(f"probe_requests={stats['requests']} "
+                  f"requests_sent={stats.get('requests_sent', 0)} "
                   f"suspected={','.join(stats['interface_suspected']) or '-'} "
                   f"wall={stats['wall_seconds']}s")
             if args.json:
                 print(json.dumps(stats, ensure_ascii=False, indent=2))
-            return 0 if not stats["interface_suspected"] else 1
+            return _exit_code(stats)
         stats = precompute(codes, out_dir=args.out_dir, interval=args.interval,
                            retries=args.retries, retry_wait=args.retry_wait,
-                           as_of=args.as_of)
+                           as_of=args.as_of, budget=args.budget,
+                           force=args.force)
     except ValueError as exc:
         print(f"ERROR {exc}", file=sys.stderr)
-        return 2
+        return EXIT_ARGS
+
+    limits = stats.get("request_limits") or {}
+    if stats.get("skipped_cooldown") or stats.get("blocked") \
+            or stats.get("budget_exceeded"):
+        # 整轮跳过 / 熔断 / 预算：precompute 已写下**唯一**一行日志
+        # （``SKIP`` / ``BLOCKED`` / ``BUDGET``），这里不再重复，也不写缓存。
+        if args.json:
+            print(json.dumps(stats, ensure_ascii=False, indent=2))
+        return _exit_code(stats)
 
     print(f"requests={stats['requests']} "
           f"(probe={stats['probe_requests']}) "
@@ -1016,13 +1218,29 @@ def main(argv=None):
           f"not_supported={stats['not_supported_sections']} "
           f"suspected={','.join(stats['interface_suspected']) or '-'} "
           f"wall={stats['wall_seconds']}s interval={stats['interval_seconds']}s "
-          f"-> {stats['path']}")
+          f"budget={limits.get('counts') or {}}/"
+          f"{limits.get('limit_per_domain')} -> {stats['path']}")
     for item in stats["failed"]:
         print(f"  - {item['code']} {item.get('section') or '-'}: {item['reason']}",
               file=sys.stderr)
     if args.json:
         print(json.dumps(stats, ensure_ascii=False, indent=2))
-    return 0 if not stats["failed_sections"] else 1
+    return _exit_code(stats)
+
+
+def _exit_code(stats: dict) -> int:
+    """统计字典 → 退出码。
+
+    3 = 冷却中（0 请求）/ 本轮命中 444 或零字节 FIN（已写冷却）；
+    4 = 请求预算超限（发请求前拦截）；1 = 有子项失败 / 探针疑似异常；0 = 全绿。
+    """
+    if stats.get("skipped_cooldown") or stats.get("blocked"):
+        return EXIT_COOLDOWN
+    if stats.get("budget_exceeded"):
+        return EXIT_BUDGET
+    if stats.get("failed_sections") or stats.get("interface_suspected"):
+        return EXIT_FAILED
+    return EXIT_OK
 
 
 if __name__ == "__main__":

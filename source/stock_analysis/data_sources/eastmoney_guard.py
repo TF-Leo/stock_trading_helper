@@ -22,6 +22,33 @@ TLS / DNS / 路由均正常 → 这是**对本机出口 IP 的反爬封禁**，�
    超限抛 :class:`EastmoneyBudgetExceeded`，调用方必须提前退出并告警，
    不得静默继续。
 
+域级冷却（2026-11-16，issue #1 事件预计算接入）
+----------------------------------------------
+东财内部并非一个风控面：``push2`` / ``push2his`` 与 ``datacenter-web`` 是两套
+网关，历史实测 ``push2`` 被 444 时 ``datacenter-web`` 仍正常 200。若共用同一个
+"整域封锁"键，事件预计算（datacenter）一次 444 就会让资金流 / ST 名单
+（push2）整轮停摆 —— 那是**误伤**。
+
+因此冷却文件支持**域级条目**（additive，schema 仍为 1）::
+
+    {
+      "schema": 1, "schema_version": 1,
+      "surfaces": {
+        "datacenter-web.eastmoney.com": {
+          "schema": 1, "reason": "http_444", "blocked_until": "...",
+          "seconds": 1800.0, ...
+        }
+      }
+    }
+
+* **写**：带 ``surface`` 的闸门只写 ``surfaces[<域名>]``，顶层共享字段原样保留
+  —— 一个域被封不会让另一个域的任务整轮停摆；
+* **读**：``scoped_cooldown_state()`` 先看顶层共享封锁（任何域被封都视为
+  "此刻别碰东财"，保守），再看本域条目；顶层封锁只会让本轮 **0 请求**并保留
+  旧缓存，不会延长或升级封锁；
+* 不带 ``surface`` 的既有调用（资金流 / ST 名单 / 监控池）行为完全不变：
+  只读写顶层字段。
+
 与 ``tencent_throttle`` 的关系
 ------------------------------
 腾讯的跨进程冷却是**另一条上游**（429/空响应限流 + 501 WAF），状态文件与
@@ -70,6 +97,7 @@ __all__ = [
     "DEFAULT_REQUEST_BUDGET",
     "BLOCKED_STATUS",
     "SCHEMA_VERSION",
+    "SURFACES_KEY",
     "AntiScrapeBlocked",
     "EastmoneyCooling",
     "EastmoneyBudgetExceeded",
@@ -77,6 +105,7 @@ __all__ = [
     "request_budget",
     "state_path",
     "cooldown_state",
+    "scoped_cooldown_state",
     "mark_cooldown",
     "clear_cooldown",
     "classify_response",
@@ -97,6 +126,8 @@ DEFAULT_REQUEST_BUDGET = 60
 #: nginx 反爬状态码；零字节 FIN 在 requests 里通常表现为连接被对端关闭。
 BLOCKED_STATUS = 444
 SCHEMA_VERSION = 1
+#: 域级冷却条目的键（``surfaces[<hostname>]``）；顶层字段是共享封锁。
+SURFACES_KEY = "surfaces"
 
 #: 零字节 FIN / 连接被反爬层直接切断的常见文案（requests / ssl / 原生 socket）。
 _BLOCK_MARKERS = (
@@ -245,11 +276,11 @@ class _FileLock:
 # ---------------------------------------------------------------------------
 # 冷却状态
 # ---------------------------------------------------------------------------
-def cooldown_state(now=None, path=None) -> dict | None:
-    """读取冷却状态；仍在生效才返回（附带 ``remaining_seconds``），否则 None。
+def _read_payload(path=None):
+    """读冷却文件原文；文件不存在 / 损坏 / schema 不符 → ``None``。
 
-    文件不存在 / 损坏 / 已过期一律返回 ``None`` —— 冷却文件是**可选加速器**，
-    不能因为它坏了把整条取数路径卡死。
+    冷却文件是**可选加速器**：坏了不能把取数路径卡死，因此所有解析失败都
+    退化成"没有冷却"。
     """
     try:
         with open(path or state_path(), "r", encoding="utf-8") as handle:
@@ -264,33 +295,98 @@ def cooldown_state(now=None, path=None) -> dict | None:
         return None
     if schema != SCHEMA_VERSION:
         return None
-    until = payload.get("blocked_until")
+    return payload
+
+
+def _active(entry, now_ts: float):
+    """单条冷却记录 → 仍在生效则补 ``remaining_seconds`` 返回，否则 None。"""
+    if not isinstance(entry, dict):
+        return None
     try:
-        until_ts = datetime.fromisoformat(str(until)).timestamp()
+        until_ts = datetime.fromisoformat(str(entry.get("blocked_until"))).timestamp()
     except (TypeError, ValueError):
         return None
-    now_ts = _now_ts(now)
     remaining = until_ts - now_ts
     if remaining <= 0:
         return None
-    result = dict(payload)
+    result = dict(entry)
     result["remaining_seconds"] = remaining
     return result
 
 
+def _surface_entry(payload, surface):
+    surfaces = payload.get(SURFACES_KEY)
+    if not isinstance(surfaces, dict):
+        return None
+    return surfaces.get(str(surface))
+
+
+def cooldown_state(now=None, path=None) -> dict | None:
+    """读取**共享**冷却状态；仍在生效才返回（附带 ``remaining_seconds``），否则 None。
+
+    文件不存在 / 损坏 / 已过期一律返回 ``None`` —— 冷却文件是**可选加速器**，
+    不能因为它坏了把整条取数路径卡死。
+    """
+    payload = _read_payload(path)
+    if payload is None:
+        return None
+    return _active(payload, _now_ts(now))
+
+
+def scoped_cooldown_state(now=None, path=None, surface=None) -> dict | None:
+    """读取**本域**冷却状态：顶层共享封锁 ∪ ``surfaces[surface]``。
+
+    为什么取并集而不是只看本域
+    --------------------------
+    顶层共享封锁（既有资金流 / ST 名单写入，不带域）代表"此刻整条东财出口
+    都不该再碰"。域级条目只证明"这个域被封"。两者任一生效都必须 **0 请求**，
+    否则 444 冷却期间仍会继续撞墙。
+
+    返回的记录带 ``scope``：``"shared"``（顶层）或 ``"surface"``（本域），
+    以及 ``surface``（本域条目时为域名）。两者同时生效取到期更晚的那条 ——
+    它才决定本轮要等多久。
+    """
+    payload = _read_payload(path)
+    if payload is None:
+        return None
+    now_ts = _now_ts(now)
+    candidates = []
+    shared = _active(payload, now_ts)
+    if shared is not None:
+        shared = dict(shared, scope="shared", surface=None)
+        candidates.append(shared)
+    if surface:
+        scoped = _active(_surface_entry(payload, surface), now_ts)
+        if scoped is not None:
+            scoped = dict(scoped, scope="surface", surface=str(surface))
+            candidates.append(scoped)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item["remaining_seconds"])
+
+
 def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
-                  path=None) -> dict:
-    """写入跨进程冷却（原子替换），返回合并后的冷却状态。
+                  path=None, surface=None) -> dict:
+    """写入跨进程冷却（原子替换），返回本次写下的那条冷却记录。
 
     「读-改-写」在文件锁内完成：并发进程各自只追加自己知道的封锁，不会用
     旧状态覆盖对方刚写下的更晚到期时间（取 ``max``）。
+
+    ``surface`` 给定时只写 ``surfaces[<域名>]``（域级封锁），顶层共享字段与
+    其它域条目原样保留 —— 一个域被封不会误伤另一个域。``surface`` 为空时
+    写顶层共享封锁（资金流 / ST 名单 / 监控池的既有语义），同样保留已有
+    域级条目。
     """
     now_ts = _now_ts(now)
     wait = cooldown_seconds() if seconds is None else max(0.0, float(seconds))
     until_ts = now_ts + wait
     target = path or state_path()
     with _FileLock(_lock_path(target)):
-        existing = cooldown_state(now=now_ts, path=target)
+        raw = _read_payload(target) or {}
+        surfaces = raw.get(SURFACES_KEY)
+        surfaces = dict(surfaces) if isinstance(surfaces, dict) else {}
+        existing = (_active(_surface_entry(raw, surface), now_ts) if surface
+                    else _active(raw, now_ts))
         if existing:
             try:
                 existing_until = datetime.fromisoformat(
@@ -298,7 +394,7 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
             except (TypeError, ValueError):
                 existing_until = 0.0
             until_ts = max(until_ts, existing_until)
-        payload = {
+        entry = {
             "schema": SCHEMA_VERSION,
             "schema_version": SCHEMA_VERSION,
             "reason": str(reason or "unknown"),
@@ -309,6 +405,18 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
             "updated_at": _iso(now_ts),
             "pid": os.getpid(),
         }
+        if surface:
+            entry["surface"] = str(surface)
+            surfaces[str(surface)] = entry
+            payload = {key: value for key, value in raw.items()
+                       if key != SURFACES_KEY}
+            payload["schema"] = SCHEMA_VERSION
+            payload["schema_version"] = SCHEMA_VERSION
+            payload[SURFACES_KEY] = surfaces
+        else:
+            payload = dict(entry)
+            if surfaces:
+                payload[SURFACES_KEY] = surfaces
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         tmp = f"{target}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
@@ -316,15 +424,41 @@ def mark_cooldown(reason: str, detail=None, seconds=None, now=None,
                       sort_keys=True)
             handle.write("\n")
         os.replace(tmp, target)
-    return payload
+    return entry
 
 
-def clear_cooldown(path=None) -> None:
-    """删除冷却状态（人工确认封锁解除后复跑预计算时用）。"""
-    try:
-        os.unlink(path or state_path())
-    except FileNotFoundError:
-        pass
+def clear_cooldown(path=None, surface=None) -> None:
+    """删除冷却状态（人工确认封锁解除后复跑预计算时用）。
+
+    ``surface`` 给定时只删该域的条目（其它域 / 顶层共享封锁保留）；条目删空后
+    不留下空的 ``surfaces`` 键。不给 ``surface`` 时删除整个文件（既有语义）。
+    """
+    target = path or state_path()
+    if not surface:
+        try:
+            os.unlink(target)
+        except FileNotFoundError:
+            pass
+        return
+    with _FileLock(_lock_path(target)):
+        raw = _read_payload(target)
+        if not raw:
+            return
+        surfaces = raw.get(SURFACES_KEY)
+        if not isinstance(surfaces, dict) or str(surface) not in surfaces:
+            return
+        surfaces = dict(surfaces)
+        surfaces.pop(str(surface), None)
+        payload = {key: value for key, value in raw.items()
+                   if key != SURFACES_KEY}
+        if surfaces:
+            payload[SURFACES_KEY] = surfaces
+        tmp = f"{target}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=1,
+                      sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, target)
 
 
 # ---------------------------------------------------------------------------
@@ -443,11 +577,16 @@ class EmFetchGuard:
     ``enforce_budget=False`` 用于预计算自己按「逻辑请求」计数并在调用前
     ``budget.reserve`` 的场景（资金流）：此时闸门仍共享同一个
     :class:`RequestBudget` 做报告，但不重复扣减。
+
+    ``surface``（2026-11-16）指定本闸门所守护的域名：冷却**读**取
+    「顶层共享封锁 ∪ 本域条目」（任一命中都 0 请求），**写**只写本域条目，
+    因此 datacenter 被封不会让 push2 的任务整轮停摆。不给 ``surface`` 时
+    行为与既有实现完全一致（只读写顶层共享封锁）。
     """
 
     def __init__(self, budget=None, path=None, cooldown_seconds_override=None,
                  block_exc=AntiScrapeBlocked, enforce_budget=True,
-                 now_fn=None, mark=True, respect_cooling=True):
+                 now_fn=None, mark=True, respect_cooling=True, surface=None):
         if isinstance(budget, RequestBudget):
             self.budget = budget
         else:
@@ -460,6 +599,7 @@ class EmFetchGuard:
         self._now_fn = now_fn or time.time
         self._mark = bool(mark)
         self.respect_cooling = bool(respect_cooling)
+        self.surface = str(surface) if surface else None
         self.requests = 0
         self.status_codes: list[int] = []
         self.block_reason: str | None = None
@@ -478,12 +618,15 @@ class EmFetchGuard:
     def cooling(self):
         if not self.respect_cooling:
             return None
-        return cooldown_state(now=self._now(), path=self.path)
+        return scoped_cooldown_state(now=self._now(), path=self.path,
+                                     surface=self.surface)
 
     @staticmethod
     def cooling_message(state) -> str:
         remaining = int(round(float(state.get("remaining_seconds") or 0)))
-        return (f"东财反爬冷却中（剩余 {remaining}s，原因 "
+        scope = state.get("scope")
+        where = f"本域 {state.get('surface')}" if scope == "surface" else "共享封锁"
+        return (f"东财反爬冷却中（{where}，剩余 {remaining}s，原因 "
                 f"{state.get('reason') or 'unknown'}），本次未发起请求")
 
     # -- 阻断 -------------------------------------------------------------
@@ -495,7 +638,8 @@ class EmFetchGuard:
         if self._mark:
             try:
                 mark_cooldown(reason, detail, seconds=self.cooling_seconds,
-                              now=self._now(), path=self.path)
+                              now=self._now(), path=self.path,
+                              surface=self.surface)
             except OSError as exc:
                 # 冷却写失败不能掩盖取数失败：异常照抛，但必须出声。
                 print(f"[WARN] 东财冷却写盘失败（{self.path}）：{exc}",

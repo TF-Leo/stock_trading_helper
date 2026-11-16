@@ -1,5 +1,46 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-16 · 事件预计算接入统一东财熔断与请求预算（issue #1 敞口）
+
+- **分支**：`TF-Leo/events-guard`（父 `origin/main` `f75ed82`）；关联 issue #1；
+  **PR 待建，不合并**。未改 `decision/*`、未引入依赖、盘前路径零联网不变。
+- **暴露的缺口**：`tools/precompute_events.py` 的 `_http_get` 直接调
+  `em_get`，**绕过** `eastmoney_guard` 的熔断/冷却/预算 —— 即使
+  `datacenter-web` 已在 444 冷却，它仍会照常发满 14×4+4 = 60 次请求。
+- **改动（5 个文件 + 1 个新测试文件）**：
+  1. `eastmoney_guard` 增加**域级冷却**（additive，schema 仍为 1）：
+     `surfaces[<hostname>]` 存单域封锁；`mark_cooldown(surface=…)` 只写本域、
+     `clear_cooldown(surface=…)` 只删本域、新增
+     `scoped_cooldown_state()`（顶层共享封锁 ∪ 本域条目，取到期更晚者，
+     记录带 `scope`）。不带 `surface` 的既有调用行为完全不变。
+  2. `EmFetchGuard(surface=…)`：冷却**读**并集、封锁**写**本域。
+  3. `precompute_events`：整轮（含 `--probes-only`）包进
+     `EmFetchGuard(surface="datacenter-web.eastmoney.com")`；
+     `AntiScrapeBlocked` / `EastmoneyBudgetExceeded` 在 `_datacenter` 与
+     `_run_probes` 里**不**被包装成 `EventsFetchError`（否则会被当成单个子项
+     失败而继续发剩余请求）；整轮中止时**不写缓存**、只写一行日志。
+     新增 `--budget`（默认 80，`EASTMONEY_REQUEST_BUDGET` 可覆盖）、
+     `--force`、`--clear-cooldown`；退出码 3 = 冷却中/命中 444，4 = 预算超限。
+- **冷却键设计（任务第 6 条）**：`push2`/`push2his` 与 `datacenter-web` 是
+  东财两套网关（2026-11-15 实测 push2 返回 444 时 datacenter 仍 200），因此
+  **不共用同一个键**：本工具只写 `surfaces["datacenter-web.eastmoney.com"]`，
+  资金流 / ST 名单 / 监控池继续写顶层共享封锁。读取取并集 —— 顶层封锁代表
+  「整条出口都别碰」，任一命中都 0 请求，不会因为一个域被封而误伤另一个域。
+- **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5 / pandas 3.0.1）**：
+  - `python -m pytest tests/ -q` → **1194 passed in 99.30s**。
+  - `python -m pytest tests/test_events_guard.py -q` → **18 passed**（新增）。
+  - `python tools/probe.py all` → **41/41 PASS**，退出码 0。
+  - 新增用例覆盖：冷却 → 0 请求 + 退出码 3 + 缓存逐字节不变 + 不建目录；
+    444 → 只发 1 次、写域级冷却、不写缓存、push2 不受影响；预算 3 → 只发
+    3 次即拦截、不写缓存、退出码 4；正常路径 14 只 = **60 请求**（与改动前
+    一致）；`--probes-only` 受同一冷却/预算约束；域级冷却互不误伤。
+- **操作失误（如实登记）**：手工验证时一条 heredoc 因缺 `PYTHONPATH` 失败，
+  随后误跑了 `precompute_events.py 600519`，**真实请求东财 8 次**（4 探针 +
+  4 端点到 datacenter-web，全部 200）。未触发 444、未写仓库缓存（`--out-dir`
+  指向 /tmp）、未改动任何状态文件。此后验证全部走桩。
+- `tools/check_gates.ps1`：本机无 `pwsh`，**未验证**（与前几轮同；以
+  `probe.py all` + 全量 pytest 为运行时裁定器）。
+
 ## 2026-11-16 · ST 官方备胎四项残留（issue #123）
 
 - **分支**：`TF-Leo/st-tabkey`（父 `origin/main` `d800336`）；关联 issue #123；
