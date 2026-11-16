@@ -1,5 +1,52 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-17 · PR #133 复验返工：参考价带日期/归属 + 仓位信息找回
+
+- **分支**：`task/trigger-semantics`（PR #133 head `c173f46`，未合并）；只改
+  渲染层 `source/stock_analysis/advice_render.py` 与对应测试/fixture，
+  **未改 `decision/*`**、未引入依赖、`--json` 既有键与含义不变（**未新增 JSON
+  字段**）。
+- **问题 1（参考价与当日触发不是同一事件）**：`buy_price` / `sell_price` 是
+  「最近一次买点/卖点所在 bar 收盘价」，与当日 `sell_triggered` 未必同源。
+  复验实例：当日触发来自风控止损，而渲染出的 4.0527 是 2026-09-24（31 个
+  交易日之前）的卖点收盘。旧文案「最近一次卖点收盘」让人误以为是今日卖点价。
+  **改法**：参考价一律带日期并说明归属——
+  - 日期取 `recommendation.signal.last_buy_date` / `last_sell_date`，
+    当日信号日取 `signal.as_of`；两者相同 →「参考价 P（D 收盘），本次触发价」；
+  - 当日 `action=sell`（本项目 sell 只由风控出场产生）且历史卖点更早 →
+    「本次触发为风控止损；最近一次卖点参考价 P（D 收盘），非本次触发价」；
+    类型从 `action_reason` 的「触发{止损/止盈/时间止损}」读取，读不到写
+    「风控离场」，不编造；
+  - 无法判断来源（无 signal 块 / 日期缺失 / 日期更早但非风控）→ 只写
+    「参考价 P（D 收盘），历史参考价」，不暗示与本次触发相关；
+  - 无历史卖点：风控离场写「本次触发为风控止损；样本内无历史卖点」，
+    否则整条消失。
+- **问题 2（9/10 丢建议仓位）**：`target_position==0` 不再抑制建议仓位。
+  只要 `position_fraction` 非空且 > 0 就写「建议仓位 x%」；`target_position
+  == 0` 或 `action ∈ {sell, avoid}` 时**追加**「目标仓位 0%」，顺序固定为
+  「建议仓位 …｜目标仓位 0%」。极小正仓位显示为 `0%` 时抑制建议仓位，杜绝
+  「建议仓位 0%｜目标仓位 0%」重复。
+- **测试**：`source/tests/test_trigger_semantics_132.py` 扩到 16 项——五种
+  形态快照（买/未触发/卖风控/avoid/场外基金风控止盈）＋三种触发形态（风控
+  止损、指标信号当日、无历史卖点）＋来源不可判定/无 signal 块两种兜底＋
+  仓位三形态（空仓 hold 双列、0 仓位不重复、极小正仓位不重复、非 0 目标不
+  追加）。`test_advice_render.py` 同步更新 6 处旧文案断言与 1 份 fixture
+  `normal_buy.expected.txt`（**契约变更导致的文案变化，不是放宽判定**）。
+  标的只用 600519 / 600000。
+- **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5，venv 取自
+  `astock-verify-flow`，与 requirements.txt 一致）**：
+  - `python -m pytest tests/test_trigger_semantics_132.py
+    tests/test_advice_render.py -q` → **227 passed in 1.63s**。
+  - `python -m pytest tests/ -q` → **1226 passed in 111.01s**（返工前基线
+    1217 passed；净增 9 项）。
+  - `python tools/probe.py` 退出码 0；JSON 41 项中 39 PASS、1 FAIL
+    (`error_shape`：错误路径缺 `diagnostics/source_attempts[]/*` 六键，属 CLI
+    错误响应、本轮未触碰)、1 BLOCKED (`as_of`：本 worktree 无
+    `stock_analysis/data/stock_002415_qfq.csv` 缓存)。两项均与渲染层改动无
+    因果关系。
+- **未验证**：`tools/check_gates.ps1` —— 本机无 `pwsh`（与前几轮同）；以
+  全量 pytest + `tools/probe.py` 为运行时裁定器。
+
 ## 2026-11-17 · issue #132 已触发态「距触发」语义 + 仓位/入场区渲染矛盾
 
 - **分支**：`task/trigger-semantics`（父 `origin/main` `e2ed022`）；只改渲染层

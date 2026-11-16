@@ -138,7 +138,7 @@ def test_trigger_line_matches_json_values():
     trigger = payload["evidence"]["triggers"][0]
     assert trigger["buy_price"] == 12.0
     output = render_advice(payload)
-    assert "触发：均线趋势(3-5-8) 买信号已触发（参考价 12，最近一次买点收盘）" \
+    assert "触发：均线趋势(3-5-8) 买信号已触发（参考价 12，历史参考价，日期未知）" \
         in output
     assert "距触发" not in output
 
@@ -179,7 +179,7 @@ def test_trigger_line_renders_without_distance_block():
     payload = _payload("normal_buy")
     payload["recommendation"].pop("distance_to_trigger")
     output = render_advice(payload)
-    assert "触发：均线趋势(3-5-8) 买信号已触发（参考价 12，最近一次买点收盘）" \
+    assert "触发：均线趋势(3-5-8) 买信号已触发（参考价 12，历史参考价，日期未知）" \
         in output
     assert "距触发" not in output
 
@@ -195,7 +195,7 @@ def test_trigger_line_uses_sell_side_fields():
     }
     line = next(line for line in render_advice(payload).splitlines()
                 if line.startswith("触发："))
-    assert line == "触发：示例指标 卖信号已触发（参考价 10.5，最近一次卖点收盘）"
+    assert line == "触发：示例指标 卖信号已触发（参考价 10.5，历史参考价，日期未知）"
 
 
 def test_trigger_line_lists_multiple_triggered_signals():
@@ -209,8 +209,8 @@ def test_trigger_line_lists_multiple_triggered_signals():
     payload["recommendation"]["distance_to_trigger"] = {
         "buy_pct": -4.17, "sell_pct": None,
     }
-    assert ("触发：甲 买信号已触发（参考价 11.5，最近一次买点收盘）；"
-            "乙 买信号已触发（参考价 11.8，最近一次买点收盘）") in render_advice(payload)
+    assert ("触发：甲 买信号已触发（参考价 11.5，历史参考价，日期未知）；"
+            "乙 买信号已触发（参考价 11.8，历史参考价，日期未知）") in render_advice(payload)
 
 
 def test_trigger_line_avoids_current_price_wording_when_stale():

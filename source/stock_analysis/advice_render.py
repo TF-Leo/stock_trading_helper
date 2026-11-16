@@ -42,10 +42,12 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
 字段口径直接沿用 CLI 当前 JSON（``cli.py`` 的成功/错误响应同构）：
 
 * ``position_fraction`` 是「策略建议权重」（小数，0.15 = 15%），不是用户应买
-  金额；文案必须保留「建议仓位」四个字。**例外**：动作后目标仓位为 0
-  （``target_position == 0`` 或 ``action`` 为 ``sell`` / ``avoid``）时只写
-  「目标仓位 0%」，不再并列「建议仓位」—— 两个数并列会自相矛盾
-  （issue #132）。
+  金额；文案必须保留「建议仓位」四个字。**只要它非空且 > 0 就显示
+  「建议仓位 {x}%」**（含空仓 hold：``target_position == 0`` 不等于「没有仓
+  位信息」）。动作后目标仓位为 0（``target_position == 0`` 或 ``action`` 为
+  ``sell`` / ``avoid``）时**追加**「目标仓位 0%」，顺序固定为
+  「建议仓位 …｜目标仓位 0%」。显示为 ``0%`` 的极小正仓位不输出建议仓位，
+  避免出现「建议仓位 0%｜目标仓位 0%」的重复（issue #132 复验）。
 * ``horizon_days`` 当前是 ``[20, 20]``（低/高），渲染取第一个正值。
 * ``instrument.limit_up`` / ``limit_down`` 是**价格**，不是布尔。一字板优先
   读取显式字段 ``instrument.one_word_limit``（``"up"`` / ``"down"``），缺失时
@@ -53,10 +55,22 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
 * ``evidence.triggers[]`` 只描述**已触发**的买卖信号（``state`` 为
   ``buy_triggered`` / ``sell_triggered``）；触发价取 ``buy_price`` /
   ``sell_price``，**逐值照抄、不重算**。这两个值按定义是「最近一次买点/卖点
-  所在 bar 的收盘价」——**历史参考价**，不是当日可成交价。因此已触发态只写
-  「参考价 {P}，最近一次买点/卖点收盘」，不再输出「距触发 X%」：把历史价位
-  与现价做百分比会被读成「离触发很近」（issue #132）。未触发态本就没有这一
-  行，语义不变。字段缺失或没有已触发信号时整行消失。
+  所在 bar 的收盘价」——**历史参考价**，不是当日可成交价，也**不一定与本次
+  触发同源**。因此已触发态不再输出「距触发 X%」，并把参考价**连同日期**和
+  **归属**一起写出（issue #132 复验）：
+
+  - 日期取 ``recommendation.signal.last_buy_date`` / ``last_sell_date``；
+    与 ``signal.as_of`` 相同 → 「参考价 P（D 收盘），本次触发价」；
+  - 当日动作是风控离场（``action=sell``，本项目 sell 只能由止损/止盈/时间
+    止损产生）而历史卖点更早 → 「本次触发为风控止损；最近一次卖点参考价
+    P（D 收盘），非本次触发价」。具体类型从 ``action_reason`` 的「触发{类型}」
+    读取，读不到时写「风控离场」，不编造；
+  - 无法判断来源（无 signal 块、日期缺失或与当日无关）→ 只写
+    「参考价 P（D 收盘），历史参考价」，绝不暗示与本次触发相关；
+  - 有已触发状态但样本内根本没有该向卖点/买点（价格为 null）时：若当次是
+    风控离场则写「本次触发为风控止损；样本内无历史卖点」，否则整条消失。
+
+  未触发态本就没有这一行，语义不变。
 * ``recommendation.entry_zone`` 为 ``null``（例如 ``action=sell`` 按设计不
   给入场区）时，价位行仍保留「入场区 —」占位，不能把字段名整段丢掉——读者
   需要区分「缺数据」与「不适用」（issue #132）。
@@ -873,11 +887,83 @@ def _action_line(rec: Dict[str, Any]) -> Optional[str]:
     return "｜".join(parts) or None
 
 
-#: 已触发状态 → (用户可读方向, 触发价字段, 参考价所属点位)。
+#: 已触发状态 → (用户可读方向, 触发价字段, 参考价所属点位, 信号日期字段)。
 _TRIGGER_STATES = {
-    "buy_triggered": ("买信号", "buy_price", "买点"),
-    "sell_triggered": ("卖信号", "sell_price", "卖点"),
+    "buy_triggered": ("买信号", "buy_price", "买点", "last_buy_date"),
+    "sell_triggered": ("卖信号", "sell_price", "卖点", "last_sell_date"),
 }
+
+#: 风控出场类型（与 ``decision.actions.EXIT_LABELS`` 同一口径）。这里写常量
+#: 而不 import，保持渲染层只依赖标准库；顺序保证「时间止损」先于「止损」命中。
+_TRIGGER_EXIT_KINDS = ("时间止损", "止盈", "止损")
+_TRIGGER_EXIT_RE = re.compile(r"触发(" + "|".join(_TRIGGER_EXIT_KINDS) + r")")
+#: ``action_reason`` 里的出场类型 → 用户可读标签（与 ``decision.actions`` 同源，
+#: 前缀「风控」明确它是风控离场，而不是趋势卖点）。
+_TRIGGER_EXIT_LABELS = {
+    "止损": "风控止损",
+    "止盈": "风控止盈",
+    "时间止损": "时间止损",
+}
+
+
+def _today_exit_kind(rec: Dict[str, Any]) -> Optional[str]:
+    """当日动作若是风控离场，返回用户可读类型（风控止损/风控止盈/时间止损）。
+
+    ``action=sell`` 在本项目**只**由风控出场产生（``decision.actions.decide``：
+    仅 pending 为 stop/target/time 时给出 sell），因此来源可判定为风控；具体
+    类型从 ``action_reason`` 的「触发{类型}」读已有事实。动作不是 sell 时返回
+    ``None``（说明当次不是风控离场）。读不到具体类型时退回「风控离场」，绝不
+    把未知类型编造成止损。
+    """
+    if _text(rec.get("action")) != "sell":
+        return None
+    for reason in rec.get("action_reason") or []:
+        match = _TRIGGER_EXIT_RE.search(str(reason))
+        if match:
+            return _TRIGGER_EXIT_LABELS[match.group(1)]
+    return "风控离场"
+
+
+def _trigger_reference_note(rec: Dict[str, Any], state: str, point: str,
+                            date_field: str,
+                            price: Optional[str]) -> Optional[str]:
+    """触发价括注：必须带日期，并说明它属于哪一次触发（issue #132 复验）。
+
+    ``buy_price`` / ``sell_price`` 是「最近一次买点/卖点所在 bar 的收盘价」。
+    日期取 ``recommendation.signal.last_buy_date`` / ``last_sell_date``；当日
+    信号日取 ``signal.as_of``：
+
+    * 两者相同 → 这根 bar 就是本次触发 bar，写「本次触发价」；
+    * 当次是风控离场（``action=sell``）→ 风控触发价是止损/止盈价，历史 bar
+      收盘价即使日期相同也不是本次触发价，必须写「非本次触发价」；
+    * 其余情况（无 signal 块 / 日期缺失 / 日期更早且来源不可判定）→ 只写
+      日期与「历史参考价」，不暗示与本次触发相关。
+
+    价格为 ``None`` 时：风控离场可写「样本内无历史卖点」；其余返回 ``None``，
+    调用方整条不出（没有可核对的事实就保持沉默）。
+    """
+    signal = _dict(rec.get("signal"))
+    as_of = _date_text(signal.get("as_of"))
+    date = _date_text(signal.get(date_field))
+
+    exit_kind = (_today_exit_kind(rec)
+                 if state == "sell_triggered" else None)
+    if exit_kind:
+        if price is None:
+            return f"本次触发为{exit_kind}；样本内无历史{point}"
+        if date:
+            return (f"本次触发为{exit_kind}；最近一次{point}参考价 {price}"
+                    f"（{date} 收盘），非本次触发价")
+        return (f"本次触发为{exit_kind}；最近一次{point}参考价 {price}"
+                "（日期未知），非本次触发价")
+
+    if price is None:
+        return None
+    if date and as_of and date == as_of:
+        return f"参考价 {price}（{date} 收盘），本次触发价"
+    if date:
+        return f"参考价 {price}（{date} 收盘），历史参考价"
+    return f"参考价 {price}，历史参考价，日期未知"
 
 
 def _trigger_line(payload: Dict[str, Any]) -> Optional[str]:
@@ -885,13 +971,14 @@ def _trigger_line(payload: Dict[str, Any]) -> Optional[str]:
 
     触发价**逐值取自 JSON**（``buy_price`` / ``sell_price``），绝不重算。
     这两个字段的语义是「最近一次买点/卖点所在 bar 的收盘价」，属于**历史
-    参考价**：已触发态因此只写「参考价 {P}，最近一次买点/卖点收盘」，不再
-    输出「距触发 X%」—— 把历史价位和现价做百分比会被误读成「离触发很近」
-    （issue #132）。未触发态没有这一行，语义不变。
+    参考价**：已触发态因此只写日期 + 归属（本次触发价 / 历史参考价 / 风控
+    离场的历史卖点），不再输出「距触发 X%」—— 把历史价位和现价做百分比会被
+    误读成「离触发很近」（issue #132）。未触发态没有这一行，语义不变。
     """
     triggers = _dict(payload.get("evidence")).get("triggers")
     if not isinstance(triggers, (list, tuple)):
         return None
+    rec = _dict(payload.get("recommendation"))
 
     parts: List[str] = []
     for item in triggers:
@@ -900,35 +987,44 @@ def _trigger_line(payload: Dict[str, Any]) -> Optional[str]:
         mapping = _TRIGGER_STATES.get(state or "")
         if mapping is None:
             continue
-        label, price_field, point = mapping
+        label, price_field, point, date_field = mapping
         indicator = _text(trigger.get("indicator"))
         price = _fmt_num(trigger.get(price_field))
-        if not indicator or price is None:
+        if not indicator:
             continue
-        parts.append(f"{indicator} {label}已触发"
-                     f"（参考价 {price}，最近一次{point}收盘）")
+        note = _trigger_reference_note(rec, state or "", point, date_field,
+                                       price)
+        if note is None:
+            continue
+        parts.append(f"{indicator} {label}已触发（{note}）")
     return "触发：" + "；".join(parts) if parts else None
 
 
 def _position_line(rec: Dict[str, Any]) -> Optional[str]:
-    """T1：目标仓位 / 建议仓位 / 持有期 / 复审日；缺失段整体消失。
+    """T1：建议仓位 / 目标仓位 / 持有期 / 复审日；缺失段整体消失。
 
-    ``target_position == 0`` 或 ``action`` 为 ``sell`` / ``avoid`` 时只写
-    「目标仓位 0%」：此时 ``position_fraction`` 可能因止损距离而算出一个
-    非零的「建议仓位」（例如 0.2%），与「目标仓位 0%」并列会自相矛盾
-    （issue #132）。其余情况保持原「建议仓位 {w}%」措辞不变。
+    ``position_fraction`` 非空且 > 0 时**总是**输出「建议仓位 {w}%」——空仓
+    ``hold`` 的 ``target_position`` 也是 0，不能因此丢掉仓位信息。动作后目标
+    仓位为 0（``target_position == 0`` 或 ``action`` 为 ``sell`` / ``avoid``）
+    时再**追加**「目标仓位 0%」，顺序固定为「建议仓位 …｜目标仓位 0%」。
+    显示为 ``0%`` 的极小正仓位不输出建议仓位，避免出现
+    「建议仓位 0%｜目标仓位 0%」的重复（issue #132 复验）。
     """
     parts = []
+    fraction = _num(rec.get("position_fraction"))
+    suggestion = (_fmt_pct(fraction)
+                  if fraction is not None and fraction > 0 else None)
+    if suggestion == "0%":  # 极小正数显示为 0%，与目标 0% 并列会重复。
+        suggestion = None
+    if suggestion is not None:
+        parts.append(f"建议仓位 {suggestion}")
+
     action = _text(rec.get("action"))
     target = _num(rec.get("target_position"))
     zero_target = (action in ("sell", "avoid")
                    or (target is not None and target == 0.0))
     if zero_target:
         parts.append("目标仓位 0%")
-    else:
-        position = _fmt_pct(rec.get("position_fraction"))
-        if position is not None:
-            parts.append(f"建议仓位 {position}")
 
     horizon = _horizon_value(rec)
     review_date = _date_text(rec.get("review_date"))
