@@ -1,5 +1,60 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-16 · 测试隔离真实 state 目录（issue #124）
+
+- **分支**：`TF-Leo/test-state-isolation`（父 `origin/main` `23af90f`）；
+  关联 issue #124；**PR 待建，不合并**。未改 `decision/*`、未改生产默认路径、
+  未引入依赖。
+- **问题取证（本机，2026-11-16）**：用 Python audit hook（`open` 事件）在
+  隔离前跑全量，真实 `source/stock_analysis/data/` 被打开 **136 次**（涉及
+  11 个文件）：flow/valuation 600519/600000/600568/600001、
+  `index_sh000300.csv`、`stock_600519_qfq.csv`，且
+  `calendar/szse_2026-11.json.tmp` 被**写盘**。即测试结果确实依赖机器上
+  是否恰好有这些文件；未隔离的一轮还会把行情/指数缓存写进真实 `data/`。
+- **改动（4 个文件 + 新增 1 个测试文件）**：
+  - `tests/conftest.py`：autouse fixture 增加 `ST_LIST_STATE_DIR`、
+    `ASTOCK_CALENDAR_DIR`；把 `flow.FLOW_DIR`、`valuation.VALUATION_DIR`、
+    `forward_ledger.LEDGER_DIR/DATA_DIR`、`meta.DATA_DIR`、`bars.DATA_DIR`
+    （行情/指数/名称缓存）逐用例指向 `tmp_path`；fund 侧目录仅在模块已导入时
+    改写（不额外触发 import）。移除旧的 `status.cache_path` 补丁，改由
+    `ST_LIST_STATE_DIR` 统一控制，`cache_path`/`cooldown_path` 同源。
+  - `stock_analysis/data_sources/astock.py`：交易日历目录此前是**硬编码**，
+    新增 `CALENDAR_DIR_ENV="ASTOCK_CALENDAR_DIR"` 覆盖（默认值不变）。
+  - `tools/forward_log.py`：`_load_close` 不再直接拼
+    `SRC/stock_analysis/data`，改用可注入的 `ledger.DATA_DIR`（默认同目录）。
+  - `tests/test_st_precompute.py`：`test_cli_main_path_makes_zero_st_list_requests`
+    原先依赖**同一会话别的用例写进真实 data/ 的行情缓存**（打桩的
+    `cli.get_stock_daily` 不是实际调用点），改为显式注入
+    `meta.resolve_and_fetch`；断言未改。
+  - 新增 `tests/test_state_isolation.py`：
+    1) 参数化守卫 12 条 state/缓存访问器必须解析到用例 tmp 且不在真实
+    `stock_analysis/data` / `fund_analysis/data`；2) 去掉注入后默认路径
+    仍是生产原路径；3) **全量守卫**：把仓库复制到临时目录，在副本真实
+    data 下写入毒数据（东财/腾讯活跃冷却、把 600519 标成 ST 的名单、
+    flow/valuation/events/market_watch/日历/行情/指数毒缓存），子进程跑
+    全量 pytest 必须全绿，且毒文件哈希前后**逐字节不变**（子进程用
+    `STATE_ISOLATION_GUARD_CHILD` 哨兵跳过自身，防递归）。
+- **证据（本机 Linux，Python 3.14.7 / pytest 8.3.5 / pandas 3.0.1 /
+  akshare 1.18.29；`source/.venv` 按 requirements.txt 安装）**：
+  - 基线（改动前）：`python -m pytest tests/ -q` → **1154 passed**；
+    真实 data 下 audit hook 记录 **66 次 open**（见上）。
+  - 隔离后：`python -m pytest tests/ -q` → **1168 passed in 105.04s**；
+    同样的 audit hook → 真实 data 目录 **0 次 open**（真实 data 里此时
+    有 probe 生成的 55 个缓存文件，仍一次未读）。
+  - **条件 A（真实 state 不存在）**：把真实 `stock_analysis/data` 整个移走
+    后跑全量 → **1168 passed in 96.03s**。
+  - **条件 B（真实 state 带毒）**：在真实 `stock_analysis/data` 写入活跃
+    冷却 + 假 ST 名单 + flow/valuation/events/market_watch/日历/行情/指数
+    毒数据后跑全量 → **1168 passed in 100.01s**。
+  - **守卫反证**：临时移除 conftest 里 flow 目录隔离后，守卫测试变红
+    （子进程 `test_state_accessor_resolves_under_test_root[flow_cache]`
+    FAIL，1 failed / 1166 passed），证明守卫能抓住回归。
+  - `tools/check_gates.ps1`：本机无 `pwsh`，**未验证**（与前几轮同）。
+  - `python tools/probe.py all`：本机冷克隆无缓存数据，exit 0 但 3 项
+    FAIL（replay / a1 / idempotent）。在 `origin/main` 干净 worktree 用
+    同一解释器对照，同样有环境性失败（as_of BLOCKED / error_shape FAIL），
+    故 probe 在本机不是可用裁定器；本次以 pytest 全量 + 守卫为准。
+
 ## 2026-11-16 · 每日建议口径：置信分级 + 解释性文本可关闭
 
 - **分支**：`TF-Leo/advice-tone`（父 `origin/main` `369b609`）；关联 issue #1；

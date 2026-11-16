@@ -49,6 +49,7 @@ __all__ = [
     "calendar_days_from_disk",
     "calendar_source",
     "calendar_last_error",
+    "CALENDAR_DIR_ENV",
     "OFFLINE_ENV",
     "TencentThrottled",
     "TencentWafBlocked",
@@ -56,6 +57,10 @@ __all__ = [
 ]
 
 OFFLINE_ENV = "ASTOCK_CALENDAR_OFFLINE"
+# issue #124：交易日历磁盘缓存目录覆盖（测试 / 运维）。缺省行为不变：
+# ``source/stock_analysis/data/calendar``。此前该目录是硬编码常量，测试
+# 无法把它指向临时目录，只能读到/写入开发者本机的真实缓存。
+CALENDAR_DIR_ENV = "ASTOCK_CALENDAR_DIR"
 # 断源演练开关（issue #3 验收 3）：置 1 时腾讯通道必失败，用于验证渠道池降级。
 FORCE_FAIL_ENV = "ASTOCK_FORCE_FAIL"
 
@@ -513,6 +518,9 @@ def fetch_quote(symbol: str) -> dict:
 # 官方交易日历（§12，深交所）
 # ---------------------------------------------------------------------------
 def _calendar_dir() -> str:
+    override = str(os.getenv(CALENDAR_DIR_ENV, "") or "").strip()
+    if override:
+        return override
     # <repo>/source/stock_analysis/data/calendar —— data/ 已在 .gitignore 中
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "data", "calendar")

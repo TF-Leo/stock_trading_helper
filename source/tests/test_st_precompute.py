@@ -436,6 +436,13 @@ def test_cli_main_path_makes_zero_st_list_requests(monkeypatch, capsys):
 
     df = _toy()
     monkeypatch.setattr(cli, "get_stock_daily", lambda *a, **k: df)
+    # issue #124：``advise_internal`` 实际走 ``meta.resolve_and_fetch``（函数内
+    # import），旧的 ``cli.get_stock_daily`` 打桩不是调用点。此前这条用例能过，
+    # 是因为同一会话里别的用例把缓存写进了真实 ``data/``；隔离 state 后必须
+    # 显式注入行情，否则会落到渠道池失败分支。
+    import stock_analysis.data_loader.meta as meta_mod
+    monkeypatch.setattr(meta_mod, "resolve_and_fetch",
+                        lambda *a, **k: (df, "stock", None))
     monkeypatch.setattr(cli, "get_stock_name", lambda code: code)
 
     names = list(cli.build_strategy_signals().keys())[:3]
