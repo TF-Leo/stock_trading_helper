@@ -48,9 +48,15 @@ push2/push2delay 的请求数为 **0**。
 零字节 FIN 时**立即中止东财本轮**（不换域、不重试），写
 ``data/state/eastmoney_cooldown.json``（issue #108 起与资金流预计算**共用
 同一份冷却文件**），默认冷却 1800 秒（``EASTMONEY_COOLDOWN_SECONDS`` 可覆盖）。
-冷却期内**不再请求东财**，但仍会尝试官方备胎（官方是不同主机，不受东财
-冷却影响）。每轮对东财同一域名的请求数有硬上限（默认 60，``--budget`` /
-``EASTMONEY_REQUEST_BUDGET`` 可覆盖）。
+issue #130 起冷却**按域隔离**：只写 ``surfaces["push2 家族"]``
+（``push2`` / ``push2delay`` / ``push2his`` 同一风控面，归并成一个键），
+不写顶层共享块 —— 事件（``datacenter-web``）或监控池被 444 不会让 ST 名单
+整轮停摆，反之亦然。顶层共享块只在**升级投票窗口**（默认 600s，
+``EASTMONEY_ESCALATION_WINDOW`` 可覆盖）内 ≥2 个不同域都命中 **http_444**
+时自动升级（``zero_byte_fin`` 瞬时断连只写本域、不投票）；误升级后用
+``--clear-cooldown --all`` 解除。冷却期内**不再请求东财**，但仍会尝试官方备胎（官方是不同主机，
+不受东财冷却影响）。每轮对东财同一域名的请求数有硬上限（默认 60，
+``--budget`` / ``EASTMONEY_REQUEST_BUDGET`` 可覆盖）。
 
 cron（实际接线由协调者安排）
 ----------------------------
@@ -76,7 +82,8 @@ cron（实际接线由协调者安排）
     python tools/precompute_st_list.py --state-dir /tmp/st-state
     python tools/precompute_st_list.py --now 2026-11-15T18:35:00
     python tools/precompute_st_list.py --force            # 忽略东财冷却
-    python tools/precompute_st_list.py --clear-cooldown   # 只删冷却文件
+    python tools/precompute_st_list.py --clear-cooldown   # 只删本域冷却条目
+    python tools/precompute_st_list.py --clear-cooldown --all  # 连全域封锁一起清
     python tools/precompute_st_list.py --dry-run          # 只说明计划，不触网
     python tools/precompute_st_list.py --no-official      # 只用东财（维护/对照）
 """
@@ -381,7 +388,8 @@ def precompute(now=None, force=False, dry_run=False, budget=None,
     stats["conflict_summary"] = chosen.warning
     stats["reason"] = chosen.warning
     if east_ok:
-        # 东财成功说明封锁已解除：清掉可能残留的过期/已强制跳过的冷却文件。
+        # 东财成功说明封锁已解除：清掉本域可能残留的过期/已强制跳过的条目
+        # （issue #130：只清 push2 家族，不碰其它域与顶层共享封锁）。
         # 官方备胎成功**不**清东财冷却（东财可能仍在封禁）。
         try:
             st.clear_cooldown()
@@ -401,7 +409,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true",
                         help="忽略东财冷却状态（人工确认封锁解除后使用）")
     parser.add_argument("--clear-cooldown", action="store_true",
-                        help="只删除冷却文件后退出（不触网）")
+                        help="只删除本域冷却条目后退出（不触网）")
+    parser.add_argument("--all", dest="clear_all", action="store_true",
+                        help="配合 --clear-cooldown：连同顶层全域封锁一起清除"
+                             "（误升级成全域封锁后用它解除）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只说明将做什么，不发任何请求")
     parser.add_argument("--budget", type=int, default=None,
@@ -418,11 +429,16 @@ def main(argv=None) -> int:
         os.environ[st.ST_LIST_STATE_DIR_ENV] = str(args.state_dir)
 
     if args.clear_cooldown:
-        st.clear_cooldown()
-        message = f"已清除冷却文件 {st.cooldown_path()}"
+        st.clear_cooldown(include_shared=args.clear_all)
+        scope = "本域条目与顶层全域封锁" if args.clear_all else "本域条目"
+        message = (f"已清除 {st.ST_LIST_SURFACE} {scope}"
+                   f"（{st.cooldown_path()}）")
         print(message)
         if args.json:
-            print(json.dumps({"cleared": st.cooldown_path()}, ensure_ascii=False))
+            print(json.dumps({"cleared": st.ST_LIST_SURFACE,
+                              "include_shared": bool(args.clear_all),
+                              "path": st.cooldown_path()},
+                             ensure_ascii=False))
         return EXIT_OK
 
     try:

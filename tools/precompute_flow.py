@@ -27,6 +27,8 @@ CLI 只读这份缓存（``stock_analysis/data_loader/flow.py``），**绝不触
     python tools/precompute_flow.py --codes 600519,002415 --json
     python tools/precompute_flow.py --interval 1.2 --retries 3
     python tools/precompute_flow.py --budget 60        # 单域名单轮请求硬上限
+    python tools/precompute_flow.py --clear-cooldown   # 只清本域冷却条目
+    python tools/precompute_flow.py --clear-cooldown --all  # 连全域封锁一起清
 
 行为
 ----
@@ -51,6 +53,18 @@ CLI 只读这份缓存（``stock_analysis/data_loader/flow.py``），**绝不触
   sina_total_net，原因 …``；
 * 每个域名本轮请求数硬上限 ``--budget``（默认 60），超限在发请求前抛出，
   提前退出并打印 ``BUDGET …``，剩余票不写缓存。
+
+冷却按**域**隔离（issue #130）
+------------------------------
+闸门带 ``surface=push2 家族``：444 只写 ``surfaces["push2.eastmoney.com"]``
+（``push2`` / ``push2delay`` / ``push2his`` 同一风控面，归并成一个键），
+**不写**顶层共享块。读取取「顶层共享封锁 ∪ 本域」，因此：
+
+* 本工具 18:30 被 444 → 只封 push2 域，18:45 的 datacenter 事件任务照常运行；
+* 升级投票窗口（默认 600s，``EASTMONEY_ESCALATION_WINDOW`` 可配）内 ≥2 个
+  不同域都命中 **http_444** → ``mark_cooldown`` 自动升级写顶层共享块，之后
+  所有域 0 请求。``zero_byte_fin``（瞬时断连）只写本域，不参与升级；
+  误升级后 ``--clear-cooldown --all`` 可解除。
 
 退出码：0 = 全部成功；1 = 有票失败 / 请求预算超限；2 = 参数/配置错误；
 3 = 东财反爬冷却中（未发请求）。
@@ -99,6 +113,11 @@ SINA_ROW_FIELDS = ("date", "net_amount")
 # issue #108：预计算 run 级别的请求预算按域名分桶（不实际解 URL，只做计数键）。
 DOMAIN_EASTMONEY = "push2his.eastmoney.com"
 DOMAIN_SINA = "vip.stock.finance.sina.com.cn"
+# issue #130：冷却按**域**隔离 —— 本工具只写 push2 家族的条目
+# （``push2`` / ``push2delay`` / ``push2his`` 是同一套 L7 反爬规则，
+# ``eastmoney_guard.surface_of()`` 把它们归并成同一个键）。此前不传 surface，
+# 444 会写顶层共享块，把 18:45 的 datacenter 事件任务一起封死。
+SURFACE_EASTMONEY = em_guard.PUSH2_SURFACE
 
 
 def normalize_code(code) -> str:
@@ -254,6 +273,7 @@ def precompute(codes, out_dir=None, interval=DEFAULT_INTERVAL,
     request_budget = em_guard.RequestBudget(budget)
     guard = em_guard.EmFetchGuard(
         budget=request_budget, enforce_budget=False, mark=True,
+        surface=SURFACE_EASTMONEY,
         now_fn=lambda: now_fn().timestamp(), respect_cooling=not force)
 
     stats = {"out_dir": out_dir or OUT_DIR, "interval_seconds": float(interval),
@@ -474,12 +494,29 @@ def build_parser():
                              "EASTMONEY_REQUEST_BUDGET 可覆盖）")
     parser.add_argument("--force", action="store_true",
                         help="忽略东财反爬冷却（仅人工确认封锁解除后使用）")
+    parser.add_argument("--clear-cooldown", action="store_true",
+                        help="只删除本工具的域级冷却条目后退出（不触网）")
+    parser.add_argument("--all", dest="clear_all", action="store_true",
+                        help="配合 --clear-cooldown：连同顶层全域封锁一起清除"
+                             "（误升级成全域封锁后用它解除）")
     parser.add_argument("--json", action="store_true", help="输出机读统计 JSON")
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.clear_cooldown:
+        em_guard.clear_cooldown(surface=SURFACE_EASTMONEY,
+                                include_shared=args.clear_all)
+        scope = "本域条目与顶层全域封锁" if args.clear_all else "本域条目"
+        message = f"已清除 {SURFACE_EASTMONEY} {scope}（{em_guard.state_path()}）"
+        print(message)
+        if args.json:
+            print(json.dumps({"cleared": SURFACE_EASTMONEY,
+                              "include_shared": bool(args.clear_all),
+                              "path": em_guard.state_path()},
+                             ensure_ascii=False))
+        return 0
     codes = list(args.codes)
     if args.codes_csv:
         codes += [c.strip() for c in args.codes_csv.split(",") if c.strip()]

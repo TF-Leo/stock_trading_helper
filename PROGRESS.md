@@ -1,5 +1,130 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-16 · PR #131 P2 修复：升级投票收紧 + 窗口解耦 + 全域封锁可清除
+
+- **分支**：`TF-Leo/fix-pr131`（基于 PR #131 head `5cd4ed2`，父 `origin/main`
+  `4929f65`）；**push 同一分支，不合并**。未改 `decision/*`、未引入依赖、
+  盘前路径零联网不变、未探测东财真实端点（全部用桩）。
+- **问题（复验发现）**：
+  1. `zero_byte_fin`（ConnectionReset / SSLEOF 这类瞬时断连，线上冷却文件当天
+     就有实例）与 `http_444` **同权投票**：两个域各抖一次就写 30–60 分钟全域
+     封锁，把本来可用的第三、四个域一起关掉；
+  2. 升级判定复用冷却窗口（30–60 分钟），半小时前的一次失败与刚才的一次失败
+     被算成同一轮；
+  3. 升级写的是顶层块，而 `--clear-cooldown` 只删本域、`precompute_flow`
+     根本没有该开关 → 误升级只能手删文件。
+- **改动**：
+  1. **P2-1 只有 http_444 投票**：新增 `ESCALATION_VOTE_REASON = "http_444"`；
+     `_escalation_vote()` 要求条目**在窗口内命中过 http_444**（新字段
+     `last_http_444_at`，同域后续瞬时断连只覆盖 `reason`、不抹掉已投的票；
+     旧格式条目退回 `reason` + `updated_at`），且本次命中自身也必须是
+     `http_444` 才有资格升级。`zero_byte_fin` 仍写本域冷却（避免继续撞墙），
+     但从不投票。
+  2. **P2-2 独立短窗口**：新增 `DEFAULT_ESCALATION_WINDOW_SECONDS = 600.0` /
+     `escalation_window()` / `EASTMONEY_ESCALATION_WINDOW`（1–86400s 夹取）；
+     `mark_cooldown(..., window=…)` 可覆盖。窗口判据是「命中时间」而非冷却
+     到期时间，与冷却时长彻底解耦。
+  3. **P2-3 可清除**：`clear_cooldown(..., include_shared=True)` 删除顶层块
+     （含 `surfaces_blocked*` / `escalation_*` 留痕），域条目按 `surface`
+     参数处理；`status.clear_cooldown(include_shared=…)` 透传；
+     `precompute_events` / `precompute_st_list` / `precompute_flow` 三个脚本
+     统一支持 `--clear-cooldown --all`（不带 `--all` 时行为不变）。
+  4. **P3-1 留痕**：`surfaces_blocked` 由「域名列表」改为**结构化条目**
+     （`surface` / `reason` / `last_http_444_at` / `blocked_at` /
+     `updated_at`），域名清单另存 `surfaces_blocked_names`；顶层块另记
+     `escalated_at` / `escalation_reason` / `escalation_window_seconds`。
+  5. **P3-2 醒目日志**：升级时向 **stderr** 打印 `[ESCALATED] …` 并追加到
+     冷却文件同目录的 `eastmoney_escalation.log`（`EASTMONEY_ESCALATION_LOG`
+     可覆盖），文案明确写出「可用 `--clear-cooldown --all` 解除」；写日志
+     失败不影响冷却写入。
+- **阈值选择理由（600s）**：冷却 1800s 里「半小时前」与「刚才」不是同一轮；
+  600s 覆盖一次预计算 run 的正常墙钟（资金流 14 票 × 1s ≈ 20s、事件 60 请求
+  ≈ 90s），又远小于冷却时长，避免把两轮 run 的孤立抖动合并成一次「IP 级
+  封锁」判定。真实反爬封禁会在窗口内持续命中，仍会正常升级。
+- **测试**：新增 `source/tests/test_escalation_vote.py`（11 项）——
+  两个域各一次 `zero_byte_fin` → 不升级；444 + 瞬时断连 → 不升级；本次命中
+  是瞬时断连 → 不升级；同域 444 后瞬时断连 → 票不丢；两域各一次 `http_444`
+  窗口内 → 升级（含留痕字段、stderr/日志、第三域 `scope="shared"`）；
+  窗口外 444 + 窗口内 444 → 不升级；窗口可配置；三个脚本
+  `--clear-cooldown --all` 均清除顶层块且之后事件任务恢复发满 8 请求；
+  `--all` 不误清其它域的独立封锁；不带 `--all` 时不清顶层块（旧行为）。
+  另按新契约更新 `test_flow_surface.py` 一处断言（`surfaces_blocked` 结构与
+  时间差 10min→5min，确保落在 600s 投票窗口内）。
+- **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5，venv 取自
+  `astock-verify-flow`，与 requirements.txt 一致）**：
+  - `python -m pytest tests/ -q` → **1211 passed in 108.13s**（改动前基线
+    1200 passed）。
+  - `python -m pytest tests/test_escalation_vote.py -q` → **11 passed**。
+  - `python -m pytest tests/test_escalation_vote.py tests/test_flow_surface.py
+    tests/test_eastmoney_guard.py tests/test_events_guard.py
+    tests/test_st_precompute.py -q` → **67 passed**（更新断言前）/ 新增后
+    68 passed（分文件跑 11 + 6 + 11 + 18 + 22 = 68）。
+- **未验证**：`tools/check_gates.ps1` —— 本机无 `pwsh`（与前几轮同）；以
+  全量 pytest + `tools/probe.py` 为运行时裁定器。
+
+## 2026-11-16 · 资金流等东财取数显式传 surface，域隔离在生产路径生效（issue #130）
+
+- **分支**：`TF-Leo/flow-surface`（父 `origin/main` `4929f65`）；关联 issue #130；
+  **PR #131 已建，不合并**。未改 `decision/*`、未引入依赖、盘前路径零联网不变。
+- **暴露的缺口**：`tools/precompute_flow.py` 调 guard 不传 `surface` → 444 写
+  **顶层共享冷却**；读取是「顶层 ∪ 本域」，于是 18:30 资金流被封会连坐 18:45
+  的事件任务（0 请求跳过）。#128 的域隔离只在 guard 单测里成立，生产上失效。
+  `precompute_st_list`（经 `status.StListFetchGuard` / `status.mark_cooldown`）与
+  `market_watch` 同样不传 surface，存在同类问题，一并修。
+- **改动（6 个文件 + 1 个新测试文件 + 4 份文档）**：
+  1. `eastmoney_guard`：新增 `surface_of()` 把 `push2` / `push2delay` /
+     `push2his` 归并为同一个 surface 键（`PUSH2_SURFACE`，同一套 L7 反爬规则，
+     不能算「两个不同域」）；`DATACENTER_SURFACE` / `MONITOR_SURFACE` 常量。
+     `mark_cooldown(surface=…, escalate=None)`：默认**自动升级** —— 同一冷却
+     窗口内已有另一个仍在生效的域条目（≥2 个不同域命中 444）时，除本域条目外
+     同时写顶层共享块（`surfaces_blocked` 列出当时生效的域，且不缩短已有更长
+     的顶层封锁）；单个域只写本域。`escalate=True/False` 可强制/禁止。
+     `clear_cooldown(surface=…)` 删空且无顶层块时连文件一起删。
+     `EmFetchGuard(escalate=…)` 透传并记录 `shared_blocked`。
+  2. `precompute_flow`：`EmFetchGuard(surface=PUSH2_SURFACE)`。
+  3. `status`：新增 `ST_LIST_SURFACE`；`cooldown_state` / `mark_cooldown` /
+     `clear_cooldown` 默认按本域（`surface=None` 保留旧的顶层语义）；
+     `StListFetchGuard(surface=ST_LIST_SURFACE, escalate=None)`。
+  4. `market_watch`：`EmFetchGuard(surface=SURFACE)`，`SURFACE` 为
+     `mobappconfig.securities.eastmoney.com`。
+  5. `precompute_events`：已带 `surface=SURFACE`（#128），无需改动；
+     其 `--clear-cooldown` 只删本域，行为不变。
+- **双域封锁判定逻辑**：`mark_cooldown` 在文件锁内读旧状态 → 收集
+  `surfaces` 里**除本次域之外、按 `now` 仍生效**的条目 → 非空即
+  `escalate_global=True`（除非显式 `escalate`）→ 写本域条目 + 顶层共享块
+  （`reason`/`detail` 注明「同一冷却窗口内多个域命中 444，判定为出口 IP 级
+  封锁」、`surfaces_blocked`、`scope="shared"`）。读取不变：顶层 ∪ 本域。
+- **surface 传参清单**：资金流 → `push2 家族`；ST 名单 → `push2 家族`
+  （clist 主域 + 延迟镜像）；事件 → `datacenter-web.eastmoney.com`；
+  监控池 → `mobappconfig.securities.eastmoney.com`。
+- **测试（新增 `tests/test_flow_surface.py`，6 项，全部走真实生产调用路径，
+  只替换 `EM_SESSION.get`）**：
+  1. push2 444 → 只写本域、无顶层块 → datacenter 事件照常发满 8 请求（4 探针
+     + 4 端点）；
+  2. datacenter 444 → 只写本域 → 资金流照常运行；
+  3. push2 444 后再 datacenter 444（同一窗口）→ 顶层块 + `surfaces_blocked`
+     = {push2, datacenter}，第三个域（监控池）读到 `scope="shared"`；
+  4. `push2his` + `push2` 两次命中**不**升级（同一风控面）；
+  5. 顶层块存在 → 资金流 / 事件 / ST 名单 / 监控池全部 0 请求；
+  6. 每个生产调用点的闸门都带上了自己的 surface（防将来又漏传）。
+  另按新契约更新 3 处旧断言（资金流 / ST / events 的 `--clear-cooldown`）：
+  单个域 444 断言从「顶层块存在」改为「本域条目存在且顶层块干净」。
+- **证据（本机 Linux，Python 3.14.9 / pytest 8.3.5 / pandas 3.0.1 /
+  akshare 1.18.29；venv 取自 `astock-verify-flow`，与 requirements.txt 一致）**：
+  - `python -m pytest tests/ -q` → **1200 passed in 108.19s**（改动前后各跑一次，
+    均 1200 通过）。
+  - `python -m pytest tests/test_flow_surface.py -q` → **6 passed**。
+  - `python -m pytest tests/test_eastmoney_guard.py tests/test_events_guard.py
+    tests/test_flow_degradation.py tests/test_st_precompute.py -q` → **57 passed**。
+  - `python tools/probe.py as_of` → PASS（2026-10-22 / 10-23 两日 bars 与
+    last_close 与缓存一致）；`python tools/probe.py error_shape` → PASS
+    （600519 / 510300 错误路径 missing_paths=0）。首次 `probe.py all` 与全量
+    pytest 并发跑，两项因此 BLOCKED/FAIL（读本地行情缓存争用）；串行重跑
+    `python tools/probe.py all` → **41/41 PASS**（退出码 0）。
+- **未验证**：`tools/check_gates.ps1` —— 本机无 `pwsh`（与前几轮同）；
+  以全量 pytest + `tools/probe.py` 为运行时裁定器。未探测东财真实端点，
+  全部用桩。
+
 ## 2026-11-16 · 事件预计算接入统一东财熔断与请求预算（issue #1 敞口）
 
 - **分支**：`TF-Leo/events-guard`（父 `origin/main` `f75ed82`）；关联 issue #1；

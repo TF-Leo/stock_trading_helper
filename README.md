@@ -574,6 +574,21 @@ nginx 444 / 零字节 FIN 时，预计算立即熔断并写
 的请求数有硬上限（默认 60，`EASTMONEY_REQUEST_BUDGET` 可覆盖）；超限提前退出
 并告警，不落半截缓存。
 
+**冷却按域隔离（issue #130）**：所有东财取数调用（资金流 / ST 名单 / 事件 /
+监控池）都显式传 `surface=<自己的域名>`，444 只写
+`eastmoney_cooldown.json` 的 `surfaces[<域名>]`，**不写**顶层共享块。
+`push2` / `push2delay` / `push2his` 是同一套 L7 反爬规则，归并成**同一个**
+surface 键（`push2.eastmoney.com`）；`datacenter-web.eastmoney.com`
+（事件）与 `mobappconfig.securities.eastmoney.com`（监控池）各自独立。
+读取取「顶层共享封锁 ∪ 本域」并集，所以 18:30 资金流被 444 不会再让
+18:45 的事件任务 0 请求跳过。顶层共享块 = **显式全域封锁**：只有**升级投票
+窗口**（默认 600s，`EASTMONEY_ESCALATION_WINDOW` 可覆盖）内 **≥2 个不同域**
+都命中 **http_444**（判定为出口 IP 级封锁）才由
+`mark_cooldown` 自动写下（`surfaces_blocked` 列出投票的域，`escalation_evidence`
+留痕各域命中原因与时间）；单个域命中只写本域。`zero_byte_fin`（ConnectionReset /
+SSLEOF / 空 body 这类瞬时断连）**只写本域冷却，不参与升级投票**。
+`--clear-cooldown` 只删本域条目，`--clear-cooldown --all` 连顶层全域封锁一起清除。
+
 **只展示、不改决策**：`evidence.flow` 不参与 `action`、`status`、`position_fraction`、
 `entry_zone`、`target_position` 的任何计算；A/B 对照中 `recommendation` 逐键一致。
 
@@ -747,6 +762,7 @@ python tools/precompute_events.py --estimate        # 不触网，只算串行�
 python tools/precompute_events.py --probes-only     # 4 个对照探针，~4s，不写缓存
 python tools/precompute_events.py --budget 80       # 本轮请求硬上限（默认 80）
 python tools/precompute_events.py --clear-cooldown  # 只清本域冷却条目
+python tools/precompute_events.py --clear-cooldown --all  # 连全域封锁一起清
 
 # CLI 主路径只读如下缓存（data/ 已 gitignore），不发起任何请求
 source/stock_analysis/data/state/events/events.json
@@ -761,7 +777,9 @@ source/stock_analysis/data/state/events/events.json
   `surfaces["datacenter-web.eastmoney.com"]`，不写顶层共享封锁 —— `push2` /
   `push2his` 与 `datacenter-web` 是东财两套网关（历史上 push2 被 444 时
   datacenter 仍 200），共用一个整域键会互相误伤。读取时取「顶层共享封锁 ∪
-  本域条目」并集：任一命中都 0 请求。
+  本域条目」并集：任一命中都 0 请求。顶层块 = **显式全域封锁**，只有升级
+  投票窗口（默认 600s）内 ≥2 个不同域都命中 **http_444**（出口 IP 级封禁）
+  才会被写下；`zero_byte_fin` 不投票。`--clear-cooldown --all` 可解除。
 
 ```
 evidence.events = {

@@ -29,6 +29,7 @@ for _path in (SRC, SRC.parent / "tools"):
 
 from stock_analysis.data_loader import status  # noqa: E402
 from stock_analysis.data_sources import _astock_generated as _g  # noqa: E402
+from stock_analysis.data_sources import eastmoney_guard as em_guard  # noqa: E402
 from stock_analysis.data_sources import st_exchange  # noqa: E402
 
 import precompute_st_list as pre  # noqa: E402
@@ -283,7 +284,10 @@ def test_zero_byte_fin_aborts_after_one_request_and_cools(monkeypatch):
     assert stats["block_reason"] == "zero_byte_fin"
     assert stats["requests"] == 1
     assert calls["n"] == 1
-    cooldown = json.loads(Path(status.cooldown_path()).read_text(encoding="utf-8"))
+    # issue #130：ST 名单只写**本域**（push2 家族）条目，顶层共享块保持干净。
+    raw = json.loads(Path(status.cooldown_path()).read_text(encoding="utf-8"))
+    assert "blocked_until" not in raw, "单个域 444 不得升级成全域封锁"
+    cooldown = raw[em_guard.SURFACES_KEY][status.ST_LIST_SURFACE]
     assert cooldown["reason"] == "zero_byte_fin"
     assert cooldown["seconds"] == status.ST_LIST_COOLDOWN_SECONDS
 
