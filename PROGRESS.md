@@ -55,8 +55,9 @@
   - `python tools/probe.py all-quick` → 41 项：**36 PASS / 5 SKIP**（`horizon` PASS，
     0 FAIL/BLOCKED）。
   - **门禁说明**：本机是 Linux，**没有 `pwsh`**，无法直接跑
-    `tools/check_gates.ps1`；已用其两条真实裁定入口（`pytest tests/` + `tools/probe.py`）
-    代替，并跑 `probe.py all`（非 Quick）作为完整门禁等价物（结果见下）。
+    `tools/check_gates.ps1`；已用其两条真实裁定入口（`pytest tests/` +
+    `tools/probe.py`）代替。`probe.py all`（非 Quick）因外网数据源命中腾讯 WAF
+    长冷却（850s）未跑完，**不计入结论**；`all-quick` 结果如上。
 - **文档**：README `invalidation` 字段说明改写为两态，并注明 `{n}` 与
   `horizon_days` / `policy.run_policy` 同为 `cli.HORIZON`；示例 JSON
   `source/docs/example_output_600519.json` 只把 `invalidation` 从 30 改为 20
