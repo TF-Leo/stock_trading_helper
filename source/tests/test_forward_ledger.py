@@ -1533,27 +1533,27 @@ def test_tool_record_writes_ledger_and_legacy_csv(tmp_path, monkeypatch):
     monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
     monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
     ledger_dir = tmp_path / "forward"
-    written = tool.record(["002415"], ledger_dir=ledger_dir,
+    written = tool.record(["600519"], ledger_dir=ledger_dir,
                           runner=_runner(_cli_payload()))
     assert list(written) == ["2026-11-12"]
     ledger_payload = fl.load_day("2026-11-12", ledger_dir)
-    assert ledger_payload["records"]["002415"]["action"] == "buy"
+    assert ledger_payload["records"]["600519"]["action"] == "buy"
     rows = list(csv.DictReader(tool.LOG.open(encoding="utf-8", newline="")))
     assert len(rows) == 1
-    assert rows[0]["code"] == "002415" and rows[0]["action"] == "buy"
+    assert rows[0]["code"] == "600519" and rows[0]["action"] == "buy"
     assert rows[0]["close"] == "30.5"  # 旧字段仍然来自 CLI payload
     # issue #134：同一天重跑默认拒绝（JSON 台账不覆盖），CSV 也不追加
     with pytest.raises(fl.DuplicateRecordError):
-        tool.record(["002415"], ledger_dir=ledger_dir,
+        tool.record(["600519"], ledger_dir=ledger_dir,
                     runner=_runner(_cli_payload()))
     rows = list(csv.DictReader(tool.LOG.open(encoding="utf-8", newline="")))
     assert len(rows) == 1
     # 显式 --overwrite 才写 JSON；CSV 仍是 append-only，不重复追加
-    tool.record(["002415"], ledger_dir=ledger_dir,
+    tool.record(["600519"], ledger_dir=ledger_dir,
                 runner=_runner(_cli_payload(action="hold")), overwrite=True)
     rows = list(csv.DictReader(tool.LOG.open(encoding="utf-8", newline="")))
     assert len(rows) == 1
-    assert fl.load_day("2026-11-12", ledger_dir)["records"]["002415"][
+    assert fl.load_day("2026-11-12", ledger_dir)["records"]["600519"][
         "action"] == "hold"
 
 
@@ -1732,12 +1732,12 @@ def test_tool_record_survives_cli_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(tool, "EVID", tmp_path / "evidence")
     monkeypatch.setattr(tool, "LOG", tmp_path / "evidence" / "forward_log.csv")
     ledger_dir = tmp_path / "forward"
-    tool.record(["002415"], ledger_dir=ledger_dir, day=date(2026, 11, 17),
+    tool.record(["600519"], ledger_dir=ledger_dir, day=date(2026, 11, 17),
                 runner=_runner(None, exit_code=30, elapsed=2.0))
     # issue #134：无 payload → 无 request.as_of / data.end，缺省落运行日。
     payload = fl.load_day("2026-11-17", ledger_dir)
     assert payload is not None
-    record = payload["records"]["002415"]
+    record = payload["records"]["600519"]
     assert record["action"] is None and record["cli_exit"] == 30
     assert record["missing"]["action"] == "cli_failed"
     assert not tool.LOG.exists()  # CSV 需要 payload，无 payload 时不写假行
