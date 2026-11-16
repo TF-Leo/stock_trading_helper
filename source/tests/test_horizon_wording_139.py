@@ -15,8 +15,10 @@
 2. ``decision/sizing.py::build_invalidation``：持仓态不得再写
    「N 个交易日内未触发入场」（入场早已触发，自相矛盾），改为与
    ``policy.run_policy`` 时间止损同一条规则的表述；空仓态保持原入场计划语义。
-3. horizon 口径统一为**交易日**：回测 ``avg_holding_days`` 是自然日
-   （``engine.py`` 的 ``(exit_date - entry_date).days``），必须先换算。
+3. horizon 口径统一：``invalidation`` 的 N 与 ``horizon_days`` / ``policy`` 的
+   时间止损阈值同源（``cli.HORIZON``），不再用回测平均持仓派生的窗口。换算工具
+   ``calendar_days_to_trading_days`` / ``derive_horizon_from_calendar`` 保留，但
+   仅作自然日→交易日的展示换算，**不参与**时间止损阈值（issue #139 P1）。
 
 另外对拍 ``decide()``：本次只改字符串，动作/目标仓位必须逐组合不变。
 
@@ -24,7 +26,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import itertools
+import re
 
 import pytest
 
@@ -195,25 +199,178 @@ def test_derive_horizon_from_calendar_falls_back_when_missing():
 
 
 # ---------------------------------------------------------------------------
+# 2b) P1：持仓态 invalidation 的 N 必须与 policy 时间止损同源（cli.HORIZON）
+# ---------------------------------------------------------------------------
+def _toy_df(n=150, seed=7, drift=0.001, vol=0.02, start=100.0):
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(seed)
+    close = start * np.cumprod(1 + rng.normal(drift, vol, n))
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    return pd.DataFrame({
+        "open": close * 0.999, "high": close * (1 + vol),
+        "low": close * (1 - vol), "close": close, "volume": 1e6,
+    }, index=idx)
+
+
+def _advise_offline(monkeypatch, avg_holding_days, holding, bars_held=8):
+    """离线驱动 ``cli.advise_internal``，返回 (响应, policy 收到的 horizon)。"""
+    import pandas as pd
+
+    import cli
+    import stock_analysis.data_loader.meta as meta
+    from stock_analysis.backtest.engine import BacktestResult
+    from stock_analysis.data_loader.flow import empty_flow_block
+    from stock_analysis.data_loader.status import TradingStatus
+    from stock_analysis.data_loader.valuation import empty_valuation_block
+
+    df = _toy_df()
+    monkeypatch.setattr(meta, "resolve_and_fetch", lambda *a, **k: (df, "stock", None))
+    monkeypatch.setattr(cli, "last_fetch_info", lambda: {
+        "source": "cache", "from_cache": True, "degraded": False,
+        "cache_last_date": "2026-11-13", "lag_days": 0,
+        "expected_date": "2026-11-13", "requested_source": "cache",
+        "source_attempts": [],
+    })
+    monkeypatch.setattr(cli, "get_stock_name", lambda code: "示例银行")
+    monkeypatch.setattr(cli, "resolve_trading_status", lambda *a, **k: TradingStatus(
+        is_st=False, is_suspended=False, limit_up=13.2, limit_down=10.8,
+        quote_stale=False, status_source="eastmoney_st_list+tencent_quote"))
+    monkeypatch.setattr(cli, "evidence_context", lambda *a, **k: (
+        empty_flow_block(code="600519"),
+        empty_valuation_block(code="600519", reason="cache_missing"),
+        [],
+    ))
+
+    names = list(cli.build_strategy_signals().keys())[:3]
+    comparison = pd.DataFrame(
+        [{"评分": 1.0 - i * 0.1, "评分IS": 1.0 - i * 0.1,
+          "评分OOS": 0.9 - i * 0.1, "年化收益": "10.00%",
+          "最大回撤": "5.00%", "胜率": "60.00%", "交易次数": 20}
+         for i, _ in enumerate(names)],
+        index=names,
+    )
+    result = BacktestResult(trade_count=20, win_rate=0.6, annual_return=0.1,
+                            max_drawdown=0.05, unaffordable_lot_events=0)
+    result.equity_curve = [100000.0] * 50
+    result.avg_holding_days = avg_holding_days
+    monkeypatch.setattr(cli, "run_strategy_tournament",
+                        lambda *a, **k: (names[0], result, comparison))
+
+    # 记录 policy 实际收到的 horizon，并把仓位状态固定成用例要的形态。
+    real_run_policy = cli.pol_mod.run_policy
+    seen = {}
+
+    def _spy(df_, buy, exp_ok, horizon=20, **kwargs):
+        seen["horizon"] = horizon
+        out = real_run_policy(df_, buy, exp_ok, horizon=horizon, **kwargs)
+        out["holding"] = bool(holding)
+        out["pending"] = None
+        if holding:
+            out.update(bars_held=bars_held, entry_price=1450.0,
+                       entry_date="2026-11-02", stop_price=1400.0,
+                       target_price=1600.0)
+        return out
+
+    monkeypatch.setattr(cli.pol_mod, "run_policy", _spy)
+    doc = cli.advise_internal("600519", fast=True, no_regime=True)
+    return doc, seen
+
+
+def _invalidation_n(text: str) -> int:
+    match = re.search(r"(\d+) 个交易日", text)
+    assert match, f"invalidation 没有「N 个交易日」: {text!r}"
+    return int(match.group(1))
+
+
+@pytest.mark.parametrize("holding", [False, True])
+@pytest.mark.parametrize("avg_holding_days", [0.0, 15.694215, 27.646617, 140.0])
+def test_invalidation_n_matches_horizon_days(monkeypatch, holding, avg_holding_days):
+    """两态、多组 ``avg_holding_days``：N 与 ``horizon_days`` / policy 阈值一致。
+
+    15.69 / 27.65 / 140 自然日分别会派生出 17 / 30 / 60 个交易日；修复后
+    ``invalidation`` 与 ``horizon_days``、``run_policy(horizon=...)`` 三者同源，
+    一律是 ``cli.HORIZON``。空仓/持仓只影响文案分句，不影响 N。
+    """
+    import cli
+
+    doc, seen = _advise_offline(monkeypatch, avg_holding_days, holding=holding)
+    rec = doc["recommendation"]
+    n = _invalidation_n(rec["invalidation"])
+    assert rec["horizon_days"] == [cli.HORIZON, cli.HORIZON]
+    assert n == rec["horizon_days"][0] == cli.HORIZON
+    assert seen["horizon"] == cli.HORIZON, (
+        "invalidation 的 N 必须与 policy.run_policy 的时间止损阈值同源")
+    if holding:
+        assert "时间止损" in rec["invalidation"]
+        assert "未触发入场" not in rec["invalidation"]
+    else:
+        assert "未触发入场" in rec["invalidation"]
+        assert "时间止损" not in rec["invalidation"]
+
+
+@pytest.mark.parametrize("holding", [False, True])
+def test_invalidation_takes_real_threshold_not_derived(monkeypatch, holding):
+    """派生值与真实阈值不同的场景：取的是后者。
+
+    600519 ``--as-of 2019-11-20`` 实测 ``avg_holding_days=15.694215``（自然日），
+    ``derive_horizon_from_calendar`` 派生出 17，而时间止损阈值是 20。修复前
+    ``invalidation`` 写「满 17 个交易日」，与 ``horizon_days=[20,20]`` 同文矛盾。
+    """
+    import cli
+
+    derived = sizing.derive_horizon_from_calendar(15.694215)
+    assert derived[1] == 17 and derived[1] != cli.HORIZON
+
+    doc, _ = _advise_offline(monkeypatch, 15.694215, holding=holding)
+    invalidation = doc["recommendation"]["invalidation"]
+    assert f"{cli.HORIZON} 个交易日" in invalidation
+    assert f"{derived[1]} 个交易日" not in invalidation
+    # 函数本身收显式阈值；调用方传的就是 20，而不是派生值。
+    assert "20 个交易日" in sizing.build_invalidation(1430.0, "均线趋势", cli.HORIZON, holding)
+
+
+# ---------------------------------------------------------------------------
 # 4) decide() 对拍：只改字符串，动作/目标仓位逐组合不变
 # ---------------------------------------------------------------------------
 _STATUSES = (None, 'ok', 'no_edge', 'untradeable', 'insufficient_data',
              'data_source_error', 'market_closed')
 _PENDINGS = (None, 'entry', 'stop', 'target', 'time', 'bogus')
 
+#: 父提交 e4cd804 上算出的 168 组合摘要（actions.py 两版逐字节相同）。
+_DECIDE_MATRIX_SHA256 = "979b04f7b1951fea8293037a428890a10e50b759b85de4c1c2a0d05669fa6b00"
 
-def test_decide_matrix_is_unchanged_by_issue_139():
-    """穷举 decide()/target_position_for 的入参组合，锁住动作表。
 
-    期望值是**改动前**跑出来的（issue #139 前后逐字节相同）。这里写死成表，
-    任何判定逻辑变化都会让它变红——本 PR 只允许改字符串。
-    """
+def _decide_matrix():
     expected = {}
     for status, pending, exp_ok, holding in itertools.product(
             _STATUSES, _PENDINGS, (False, True), (False, True)):
         action = act_mod.decide(status, pending, exp_ok, holding)
         expected[(status, pending, exp_ok, holding)] = (
             action, act_mod.target_position_for(action, holding))
+    return expected
+
+
+def _decide_matrix_digest(expected) -> str:
+    lines = []
+    for key in itertools.product(_STATUSES, _PENDINGS, (False, True), (False, True)):
+        action, target = expected[key]
+        status, pending, exp_ok, holding = key
+        lines.append(f"{status}|{pending}|{exp_ok}|{holding}|{action}|{target}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def test_decide_matrix_is_unchanged_by_issue_139():
+    """168 个入参组合的 (action, target_position) 与**改动前**逐字节相同。
+
+    168 = 7 status × 6 pending × 2 expectancy_ok × 2 holding。下面的 SHA-256
+    是在父提交 ``e4cd804`` 上算出来的真实冻结值（该提交与本分支的
+    ``decision/actions.py`` 逐字节相同），不是现场自比的“冻结表”。
+    """
+    expected = _decide_matrix()
+    assert len(expected) == 168
+    assert _decide_matrix_digest(expected) == _DECIDE_MATRIX_SHA256
 
     # 关键锚点（与改动前的实现逐条一致）
     assert expected[(None, None, False, True)] == ('hold', 1.0)

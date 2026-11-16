@@ -14,40 +14,55 @@
 - **改动 2（`decision/sizing.py::build_invalidation`）**：持仓态不再写
   「{n} 个交易日内未触发入场」（入场早已触发，与「已持仓」自相矛盾），改为
   「…或满 {n} 个交易日仍低于入场价（时间止损）」—— 描述的是 `policy.run_policy`
-  **同一条**规则，不是新条件。空仓态文案逐字不变；`holding` 默认 `False`，
+  **同一条**规则，不是新条件。空仓态文案语义不变；`holding` 默认 `False`，
   既有调用方不受影响。**PR 单列「无逻辑变更」+ `decide()` 全组合对拍**（见下）。
+- **P1 修复（2026-11-17 复验返工）**：`{n}` 原先取
+  `derive_horizon_from_calendar()` 的派生值（实测 600519 `--as-of 2019-11-20`
+  得到 17），而时间止损真实阈值是 `cli.HORIZON=20`，同一份 JSON 里
+  `horizon_days=[20,20]` 与「满 17 个交易日」自相矛盾。现 `cli.py` 直接把
+  `HORIZON` 传给 `build_invalidation`（与 `policy.run_policy(horizon=HORIZON)`
+  同一常量，不复制字面量），删除派生死变量；两态 N 均与 `horizon_days` 一致。
+  只改字符串，`decide()` 对拍仍 0 差异。
 - **改动 3（horizon 口径统一为交易日）**：回测 `avg_holding_days` 是**自然日**
   （`engine.py` 的 `(exit_date - entry_date).days`），horizon 全链路是**交易日**。
-  新增 `sizing.calendar_days_to_trading_days()` + `derive_horizon_from_calendar()`，
-  `cli.py` 改用后者（`derive_horizon` 本身口径不变、仍收交易日）。
-  实测：600519 平均持仓 27.65 自然日 → 旧「42 个交易日」，新「30 个交易日」。
-  另修 `advice_render.py` 事件窗口注释与 `docs/EVENT_RISK.md` 的
+  新增 `sizing.calendar_days_to_trading_days()` + `derive_horizon_from_calendar()`
+  （`derive_horizon` 本身口径不变、仍收交易日）。**P1 返工后**：换算工具仅作
+  展示口径保留，不再参与 invalidation 的 N（见上）；文档里的自然日/交易日
+  单位说明仍有效。另修 `advice_render.py` 事件窗口注释与 `docs/EVENT_RISK.md` 的
   「20 自然日 = 20 日持有期同一尺度」错误等价（20 交易日≈28 自然日）；**窗口取值未改**。
 - **未改**：任何阈值/条件/取值；`--json` 结构与键（仅字符串内容变化）；`source/tests/`
   既有断言未放宽（仅新增测试文件）。
-- **测试**：新增 `source/tests/test_horizon_wording_139.py`（15 项）——三种形态
-  （持仓未超期 / 持仓超期 / 空仓观望）+ invalidation 两态 + 单位换算 + `decide()`
-  192 组合对拍。标的只用 600519 / 600000。
+- **测试**：新增 `source/tests/test_horizon_wording_139.py`（**25 项**）——三种形态
+  （持仓未超期 / 持仓超期 / 空仓观望）+ invalidation 两态 + 单位换算 +
+  `decide()` 对拍（测试矩阵 **168** 组合 = 7 status × 6 pending × 2 × 2；
+  跨提交复验另跑 **288** = 9 status × 8 pending × 2 × 2）。标的只用 600519 / 600000。
+  P1 返工新增：两态 × 4 组 `avg_holding_days` 的 N ≡ `horizon_days` ≡ policy 阈值；
+  派生值 17 ≠ 真实阈值 20 的场景。
 - **证据（本机 Linux，Python 3.14.7 / pytest 8.3.5，worktree `.venv` 由
   `uv pip install -r source/requirements.txt` 建立）**：
-  - `python -m pytest tests/ -q` → **1256 passed in 108.68s**（基线 1241）。
-  - `python -m pytest tests/test_horizon_wording_139.py -q` → **15 passed**。
-  - `decide()` 对拍：改前/改后 192 组合的 `(action, target_position)` 输出
-    `diff` 为空 → **逐字节相同**。
-  - 真实 CLI（600519 `--json --fast`）：`invalidation` 42 → **30 个交易日**，
-    `avg_holding_days` 27.646617 不变（证明只是换算，不是改数据）。
-  - `--as-of 2020-11-10` 真实持仓超期：`持有中（第 77/20 个交易日…）；
-    已超建议持有期 57 日（不强制退出）`，`invalidation` 尾段
-    `满 9 个交易日仍低于入场价（时间止损）`。
-  - `python tools/probe.py all-quick` → 41 项 **0 非 PASS/SKIP**（`horizon` PASS）。
-  - `python tools/probe.py all`（**非 Quick**，完整门禁等价物）→ 41 项**全部 PASS**。
+  - `python -m pytest tests/ -q` → **1266 passed in 109.96s**（PR 基线 1256；本次 +10 项）。
+  - `python -m pytest tests/test_horizon_wording_139.py -q` → **25 passed**。
+  - `decide()` 跨提交对拍（父 `e4cd804` 的 `actions.py` vs 本分支，真实执行）：
+    **288 组合**（9 status × 8 pending × 2 exp_ok × 2 holding）的
+    `(action, target_position)` **0 差异**；测试矩阵 **168** 组合另以
+    SHA-256 `979b04f7…` 冻结（见测试文件）。
+  - 真实 CLI（600519 `--json --fast`）：`invalidation`
+    `收盘跌破 1369.86，或 唐奇安 族共识转为看空，或 20 个交易日内未触发入场`，
+    `horizon_days=[20,20]`，`avg_holding_days` 27.646617（数据未变）。
+  - 真实持仓场景（600519 `--as-of 2019-11-20`）：`action_reason` 为
+    「持有中（第 25/20 个交易日…）；已超建议持有期 5 日（不强制退出）」，
+    `invalidation` 尾段 **`满 20 个交易日`**（修复前为 17），与 `horizon_days=[20,20]` 一致。
+  - `python tools/probe.py all-quick` → 41 项：**36 PASS / 5 SKIP**（`horizon` PASS，
+    0 FAIL/BLOCKED）。
   - **门禁说明**：本机是 Linux，**没有 `pwsh`**，无法直接跑
     `tools/check_gates.ps1`；已用其两条真实裁定入口（`pytest tests/` + `tools/probe.py`）
     代替，并跑 `probe.py all`（非 Quick）作为完整门禁等价物（结果见下）。
-- **文档**：README `invalidation` 字段说明改写为两态 + 单位口径；示例 JSON
-  `source/docs/example_output_600519.json` 由 `python cli.py 600519 --json --fast` 现跑重生成。
-  `source/docs/validation_600519.md` 未重生成（重跑会混入与本 issue 无关的 1643→6043
-  根数据窗口变化，且无测试断言其内容）。
+- **文档**：README `invalidation` 字段说明改写为两态，并注明 `{n}` 与
+  `horizon_days` / `policy.run_policy` 同为 `cli.HORIZON`；示例 JSON
+  `source/docs/example_output_600519.json` 只把 `invalidation` 从 30 改为 20
+  （真实 CLI 重跑复现同一字符串；未整体覆盖，避免混入与本 issue 无关的
+  浮点/环境差异）。`source/docs/validation_600519.md` 未重生成（重跑会混入
+  与本 issue 无关的 1643→6043 根数据窗口变化，且无测试断言其内容）。
 
 ## 2026-11-17 · PR #133 复验返工：参考价带日期/归属 + 仓位信息找回
 

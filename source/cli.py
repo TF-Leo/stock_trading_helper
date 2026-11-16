@@ -487,14 +487,13 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
     buy_px = trig0.get('buy_price')
     sell_px = trig0.get('sell_price')
     entry_zone = None if action == 'sell' else sizing.derive_entry_zone(last_close, atr_val, buy_px)
-    horizon = sizing.derive_horizon_from_calendar(getattr(result, 'avg_holding_days', 0))
     if action in ('avoid', 'insufficient_data'):
         position_fraction = 0.0
     else:
         position_fraction = sizing.derive_position_fraction(confidence, stop_distance)
     dist = sizing.distance_to_trigger(last_close, buy_px, sell_px)
-    invalidation = sizing.build_invalidation(
-        stops['stop_loss'], consensus.get('family'), horizon[1], bool(policy_block.get('holding')))
+    invalidation = sizing.build_invalidation(stops['stop_loss'], consensus.get('family'),
+        HORIZON, policy_block.get('holding'))
 
     # F06e: 告警必须由真实事实触发
     if getattr(result, 'blocked_by_limit_events', 0) > 0:
