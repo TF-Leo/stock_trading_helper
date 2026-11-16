@@ -230,7 +230,10 @@ def _csv_row_from_payload(payload, day, code, rec):
 
 def _load_close(code):
     import pandas as pd
-    p = SRC / "stock_analysis" / "data" / f"stock_{code}_qfq.csv"
+    # issue #124：行情缓存目录必须可注入（测试把 ``forward_ledger.DATA_DIR``
+    # 指向临时目录）。直接拼 ``SRC/stock_analysis/data`` 会让测试读到/写到
+    # 开发者本机的真实缓存；``ledger.DATA_DIR`` 的默认值就是同一个目录。
+    p = Path(ledger.DATA_DIR) / f"stock_{code}_qfq.csv"
     if not p.exists():
         return None
     return pd.read_csv(p, index_col=0, parse_dates=True)["close"]
