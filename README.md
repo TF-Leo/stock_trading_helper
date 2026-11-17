@@ -517,7 +517,10 @@ python cli.py 600519 --start 20200101 --json
 - **take_profit**: 止盈价 = `last + 4.0×ATR(14)`；无 ATR 时用 `take_profit_pct`（0.15）
 - **stop_method**: `"atr"` 或 `"fixed"` —— 明确告诉调用方止损是用哪种口径算的（**与回测引擎同一口径**）；无回测（错误路径）时为 null
 - **distance_to_trigger**: `{buy_pct, sell_pct}`，由"最近一次该向信号所在 bar 的收盘价"与 `last_close` 实算；无该向信号时为 null
-- **invalidation**: 失效条件，模板 `收盘跌破 {stop_loss}，或 {family} 族共识转为看空，或 {n} 个交易日内未触发入场`
+- **invalidation**: 失效条件，**文案随当前仓位切换**（issue #139；只改字符串，不改判定）：
+  - 空仓（`signal.position_state != "holding"`）：`收盘跌破 {stop_loss}，或 {family} 族共识转为看空，或 {n} 个交易日内未触发入场` —— 这是一份**入场计划**的有效期；
+  - 持仓（`holding`）：`收盘跌破 {stop_loss}，或 {family} 族共识转为看空，或满 {n} 个交易日仍低于入场价（时间止损）` —— 旧文案在持仓态写「未触发入场」与「已持仓」自相矛盾（入场早已触发）。这里描述的是 `decision/policy.py` **同一条**时间止损规则，不是新增条件。
+  - `{n}` 与 `recommendation.horizon_days` / `policy.run_policy(horizon=...)` **同源**，即 `cli.HORIZON`（默认 20 个交易日）；空仓与持仓两态共用同一 N，**不得**用回测平均持仓派生的窗口另算（issue #139 P1：曾出现 `horizon_days=[20,20]` 与「满 17 个交易日」同文矛盾）。`sizing.derive_horizon_from_calendar()` 仅作自然日→交易日的展示换算，不参与该阈值。
 - **signal**: 信号状态块（v2.0 新增）——
   `strategy`（策略名）、`indicator`（指标口径，如 `MA5/MA30`）、`position_state`（`flat`/`holding`）、
   `state`（五档，见枚举）、`as_of`、`last_buy_date`/`last_buy_age`、`last_sell_date`/`last_sell_age`、

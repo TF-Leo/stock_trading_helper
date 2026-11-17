@@ -28,6 +28,29 @@ DEFAULT_TAKE_PROFIT_PCT = 0.15  # 与 BacktestConfig.take_profit_pct 默认值�
 HORIZON_MIN_FLOOR = 2
 HORIZON_MAX_CAP = 60
 
+#: 自然日 → 交易日 的换算（每周 5 个交易日 / 7 个自然日）。
+#: issue #139：回测的 ``avg_holding_days`` 是**自然日**
+#: （``engine.py`` 里 ``(exit_date - entry_date).days``），而 horizon 的每一处
+#: 口径（``policy.run_policy`` 的 ``bars_held``、``horizon_days``、
+#: ``build_invalidation`` 的「N 个交易日」）都是**交易日**。历史上直接把它喂给
+#: ``derive_horizon``，于是同一份 JSON 里「平均持仓 27.6 天」推出「42 个交易日」，
+#: 而 42 个交易日≈59 个自然日 —— 两套单位混用。
+#: **注意**：换算与 ``derive_horizon_from_calendar`` 只用于展示口径；时间止损的
+#: 真实阈值是 ``cli.HORIZON``，``build_invalidation`` 的 N 必须用它（P1）。
+TRADING_DAYS_PER_CALENDAR_WEEK = 5.0
+CALENDAR_DAYS_PER_WEEK = 7.0
+
+
+def calendar_days_to_trading_days(days: Optional[float]) -> Optional[float]:
+    """把自然日数换算成交易日数（按「每周 5 交易日」近似；只用于文案口径）。"""
+    try:
+        value = float(days or 0)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value * TRADING_DAYS_PER_CALENDAR_WEEK / CALENDAR_DAYS_PER_WEEK
+
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
@@ -105,7 +128,11 @@ def derive_entry_zone(last_close: float, atr: Optional[float] = None,
 
 
 def derive_horizon(avg_holding_days: Optional[float]) -> List[int]:
-    """horizon_days = [max(2, floor(0.5*h)), min(60, ceil(1.5*h))]。"""
+    """horizon_days = [max(2, floor(0.5*h)), min(60, ceil(1.5*h))]（h 为**交易日**）。
+
+    入参必须是交易日。回测的 ``avg_holding_days`` 是自然日，调用方须先用
+    :func:`calendar_days_to_trading_days` 换算（issue #139）。
+    """
     try:
         h = float(avg_holding_days or 0)
     except (TypeError, ValueError):
@@ -117,6 +144,18 @@ def derive_horizon(avg_holding_days: Optional[float]) -> List[int]:
     if hi < lo:
         hi = lo
     return [lo, hi]
+
+
+def derive_horizon_from_calendar(avg_holding_days: Optional[float]) -> List[int]:
+    """入参是**自然日**（回测 ``avg_holding_days``），先换算成交易日再推导。
+
+    issue #139：``engine.py`` 用 ``(exit_date - entry_date).days`` 计持仓，
+    单位是自然日；horizon 全链路（``bars_held`` / ``horizon_days``）是交易日。
+    历史上直接混用，同一份 JSON 里会出现「平均持仓 27.6 天 → 42 个交易日」。
+    本函数只做**展示口径**换算；时间止损的真实阈值是 ``cli.HORIZON``，
+    ``build_invalidation`` 的 N 不得用它（issue #139 P1）。
+    """
+    return derive_horizon(calendar_days_to_trading_days(avg_holding_days))
 
 
 def derive_position_fraction(confidence: float, stop_distance: float,
@@ -147,8 +186,25 @@ def distance_to_trigger(last_close: float,
 
 
 def build_invalidation(stop_loss: Optional[float], family: Optional[str],
-                       horizon_hi: int) -> str:
-    """B9 模板：'收盘跌破 {stop:.2f}，或 {family} 族共识转为看空，或 {n} 个交易日内未触发入场'。"""
+                       horizon_hi: int, holding: bool = False) -> str:
+    """失效条件文案（issue #139：与当前仓位、horizon 口径一致）。
+
+    空仓态：``收盘跌破 {stop}，或 {family} 族共识转为看空，或 {n} 个交易日内未触发入场``
+    —— 这是一份**入场计划**的有效期，语义成立。
+
+    持仓态：原模板的「{n} 个交易日内未触发入场」与「已持仓」自相矛盾（入场早
+    就触发了）。改为与 ``decision/policy.py`` 的时间止损**同一条规则**的表述：
+    满 ``n`` 个交易日仍低于入场价时按时间止损离场；盈利仓位不受此约束。
+    这里只换字符串，不新增/删除任何条件。
+
+    ``horizon_hi`` 必须与 ``cli.HORIZON`` 同源（即 ``policy.run_policy(horizon=...)``
+    实际使用的阈值，也是 ``horizon_days`` 的来源），**不得**用回测平均持仓派生
+    的窗口另算。issue #139 P1：持仓态曾误传派生值，导致同一份 JSON 里
+    ``horizon_days=20`` 与「满 17 个交易日」自相矛盾。
+    """
     stop_txt = f"{float(stop_loss):.2f}" if stop_loss is not None else "止损价"
     fam = family or "主导"
+    if holding:
+        return (f"收盘跌破 {stop_txt}，或 {fam} 族共识转为看空，"
+                f"或满 {int(horizon_hi)} 个交易日仍低于入场价（时间止损）")
     return f"收盘跌破 {stop_txt}，或 {fam} 族共识转为看空，或 {int(horizon_hi)} 个交易日内未触发入场"

@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "generated_at": "2026-11-13T05:16:17.488595",
+  "generated_at": "2026-11-17T05:26:36.116620",
   "request": {
     "code": "600519",
     "type": "stock",
@@ -19,23 +19,29 @@
     "is_st": false,
     "is_st_source": "quote_name",
     "is_suspended": false,
-    "limit_up": 1542.53,
-    "limit_down": 1262.07,
+    "limit_up": 1578.79,
+    "limit_down": 1291.73,
     "quote_stale": false,
     "one_word_limit": null,
-    "status_source": "tencent_quote"
+    "market_closed": false,
+    "market_state_source": "astock_calendar",
+    "status_source": "tencent_quote",
+    "turnover_rate_pct": 0.32,
+    "volume_ratio": 1.23,
+    "market_cap_yi": 18174.94,
+    "float_market_cap_yi": 18174.94
   },
   "data": {
-    "bars": 6040,
+    "bars": 6043,
     "start": "2001-08-27 00:00:00",
-    "end": "2026-11-12 00:00:00",
-    "last_close": 1410.27,
+    "end": "2026-11-16 00:00:00",
+    "last_close": 1453.9,
     "source": "cache",
     "from_cache": true,
     "stale": false,
-    "cache_last_date": "2026-11-12",
+    "cache_last_date": "2026-11-16",
     "lag_days": 0,
-    "expected_date": "2026-11-12",
+    "expected_date": "2026-11-16",
     "requested_source": "akshare",
     "window_note": null,
     "execution": {
@@ -47,91 +53,91 @@
   },
   "market_regime": {
     "label": "Bull",
-    "confidence": 0.7,
-    "as_of": "2026-11-12 00:00:00",
+    "confidence": 0.9,
+    "as_of": "2026-11-16 00:00:00",
     "definition": "ma20_ma60_return_volatility",
     "index": {
       "label": "Shock",
       "confidence": 0.5,
-      "as_of": "2026-11-12 00:00:00",
+      "as_of": "2026-11-16 00:00:00",
       "definition": "ma20_ma60_return_volatility",
       "source": "tencent_index:sh000300",
-      "bars": 1662
+      "bars": 1664
     }
   },
   "recommendation": {
     "status": "no_edge",
     "action": "hold",
     "action_reason": [
-      "策略当前空仓；今日无合格买点（20 日期望 +2.90%（n=175，命中 53.1%，t=+3.5））"
+      "策略当前空仓；今日无合格买点（20 日期望 +4.41%（n=381，命中 60.6%，t=+6.0））"
     ],
     "signal": {
-      "strategy": "CMF(30,0.1/-0.1)",
-      "indicator": null,
+      "strategy": "唐奇安(30/20)",
+      "indicator": "通道位置",
       "position_state": "flat",
       "state": "neutral",
-      "as_of": "2026-11-12",
-      "last_buy_date": "2026-10-27",
-      "last_buy_age": 12,
-      "last_sell_date": "2026-09-29",
-      "last_sell_age": 27,
-      "current_value": null,
-      "last_close": 1410.27,
+      "as_of": "2026-11-16",
+      "last_buy_date": "2026-11-03",
+      "last_buy_age": 9,
+      "last_sell_date": "2026-09-24",
+      "last_sell_age": 31,
+      "current_value": 0.8553629469122436,
+      "last_close": 1453.9,
       "threshold": {
-        "buy": null,
-        "sell": null
+        "buy": 1.0,
+        "sell": 0.0
       },
       "conflict": false
     },
     "target_position": 0.0,
-    "review_date": "2026-12-10",
+    "review_date": "2026-12-14",
     "side_expectancy": {
       "side": "buy",
       "horizon": 20,
-      "mean": 0.028956,
-      "hit_rate": 0.5314,
-      "n": 175,
-      "t_stat": 3.48,
+      "mean": 0.044114,
+      "hit_rate": 0.6063,
+      "n": 381,
+      "t_stat": 5.96,
       "ok": true
     },
-    "confidence": 0.829,
-    "position_fraction": 0.148,
+    "confidence": 0.818,
+    "position_fraction": 0.142,
     "horizon_days": [
       20,
       20
     ],
     "entry_zone": [
-      1394.51,
-      1426.03
+      1437.09,
+      1470.71
     ],
-    "stop_loss": 1331.48,
-    "take_profit": 1536.33,
+    "stop_loss": 1369.86,
+    "take_profit": 1588.37,
     "stop_method": "atr",
     "distance_to_trigger": {
-      "buy_pct": -3.86,
-      "sell_pct": -12.39
+      "buy_pct": 1.8,
+      "sell_pct": -14.92
     },
-    "invalidation": "收盘跌破 1331.48，或 配对交易 族共识转为看空，或 46 个交易日内未触发入场",
+    "invalidation": "收盘跌破 1369.86，或 唐奇安 族共识转为看空，或 20 个交易日内未触发入场",
     "no_edge": true
   },
   "evidence": {
     "consensus": {
-      "family": "配对交易",
-      "agreement": 0.954,
+      "family": "唐奇安",
+      "agreement": 0.983,
       "members": [
-        "CMF(30,0.1/-0.1)",
         "唐奇安(30/20)",
-        "唐奇安(20/10)",
         "唐奇安(30/10)",
+        "唐奇安(20/10)",
         "配对交易(20,-2.0,0.5)",
         "价差ZScore(20,-2.0,0.5)",
         "唐奇安(15/10)",
-        "配对交易(20,-1.5,0.5)",
         "价差ZScore(20,-1.5,0.5)",
-        "价差ZScore(20,-2.0,0.0)"
+        "配对交易(20,-1.5,0.5)",
+        "均线趋势(8-13-60)",
+        "配对交易(20,-2.0,0.0)"
       ]
     },
-    "dispersion": 0.046,
+    "dispersion": 0.017,
     "stability": {
       "action_stable": null,
       "family_stable": null,
@@ -139,23 +145,23 @@
       "top_k_overlap_min": null
     },
     "n_trials": 581,
-    "n_survivors": 561,
-    "deflated_sharpe": 0.672,
+    "n_survivors": 552,
+    "deflated_sharpe": 0.583,
     "significant": false,
     "edge": {
       "verdict": "negative_significant",
-      "point": -0.0006574815574191884,
+      "point": -0.0006212012592517772,
       "ci_95": [
-        -0.0010683732049804363,
-        -0.00029661219930618833
+        -0.0010652125163062886,
+        -0.0002478645853846322
       ],
       "p_positive": 0.0,
-      "n_obs": 6039,
-      "dsr": 0.6718,
+      "n_obs": 6042,
+      "dsr": 0.5831,
       "dsr_ok": true
     },
     "signal_stats": {
-      "strategy": "CMF(30,0.1/-0.1)",
+      "strategy": "唐奇安(30/20)",
       "horizons": [
         1,
         3,
@@ -163,146 +169,146 @@
         10,
         20
       ],
-      "n_buy": 176,
-      "n_sell": 146,
+      "n_buy": 386,
+      "n_sell": 294,
       "buy": {
         "mean_fwd": {
-          "1": 0.000677,
-          "3": 0.005876,
-          "5": 0.004863,
-          "10": 0.006565,
-          "20": 0.028956
+          "1": 0.003321,
+          "3": 0.007815,
+          "5": 0.009243,
+          "10": 0.023988,
+          "20": 0.044114
         },
         "hit_rate": {
-          "1": 0.4602,
-          "3": 0.5341,
-          "5": 0.5,
-          "10": 0.4886,
-          "20": 0.5314
+          "1": 0.4974,
+          "3": 0.5466,
+          "5": 0.5466,
+          "10": 0.5948,
+          "20": 0.6063
         }
       },
       "sell": {
         "mean_fwd": {
-          "1": 0.001361,
-          "3": 0.000449,
-          "5": 0.004518,
-          "10": 0.006763,
-          "20": 0.01517
+          "1": 0.001358,
+          "3": 0.004025,
+          "5": 0.008001,
+          "10": 0.010467,
+          "20": 0.016199
         },
         "hit_rate": {
-          "1": 0.3973,
-          "3": 0.4658,
-          "5": 0.4795,
-          "10": 0.4863,
-          "20": 0.4726
+          "1": 0.4864,
+          "3": 0.4796,
+          "5": 0.4388,
+          "10": 0.4524,
+          "20": 0.4388
         },
-        "missed_rally_mean_5d": 0.03403
+        "missed_rally_mean_5d": 0.039236
       },
-      "sell_false_alarm_rate_5d": 0.5205,
+      "sell_false_alarm_rate_5d": 0.5612,
       "note": null
     },
     "decision_replay": {
       "method": "policy_h20_risk_exit",
-      "trade_count": 164,
-      "annual_return": 0.045746,
-      "max_drawdown": 0.550177,
-      "exposure": 0.2353,
-      "vs_buy_hold": -349.452158,
+      "trade_count": 218,
+      "annual_return": 0.157082,
+      "max_drawdown": 0.269958,
+      "exposure": 0.2654,
+      "vs_buy_hold": -330.401526,
       "exit_reasons": {
-        "stop": 22,
-        "target": 35,
-        "time": 25
+        "stop": 27,
+        "target": 56,
+        "time": 26
       },
       "note": null
     },
     "metrics": {
       "annual_return": {
-        "point": 0.119591,
+        "point": 0.125094,
         "ci_95": [
-          0.044343,
-          0.198141
+          0.037582,
+          0.216264
         ]
       },
       "max_drawdown": {
-        "point": 0.404567,
+        "point": 0.27817,
         "ci_95": [
-          0.233032,
-          0.584844
+          0.266217,
+          0.654684
         ]
       },
       "win_rate": {
-        "point": 0.578947,
+        "point": 0.526316,
         "ci_95": [
-          0.473421,
-          0.684211
+          0.443609,
+          0.616729
         ]
       },
       "sharpe": {
-        "point": 0.723647,
+        "point": 0.67539,
         "ci_95": [
-          0.335661,
-          1.093579
+          0.283446,
+          1.055253
         ]
       },
       "calmar": {
-        "point": 0.295602,
+        "point": 0.449704,
         "ci_95": [
-          0.090133,
-          0.804117
+          0.066864,
+          0.713012
         ]
       },
       "profit_factor": {
-        "point": 2.075321,
+        "point": 1.590496,
         "ci_95": [
-          1.338584,
-          3.6139
+          1.296117,
+          2.886988
         ]
       },
       "trade_count": {
-        "point": 95,
+        "point": 133,
         "ci_95": null
       },
       "avg_holding_days": {
-        "point": 30.105263,
+        "point": 27.646617,
         "ci_95": [
-          25.715263,
-          35.758421
+          24.251692,
+          31.428947
         ]
       },
       "time_in_market": {
-        "point": 0.317384,
+        "point": 0.394341,
         "ci_95": null
       }
     },
     "excess_vs_buy_hold": {
-      "point": -0.0006574815574191884,
+      "point": -0.0006212012592517772,
       "ci_95": [
-        -0.0010683732049804363,
-        -0.00029661219930618833
+        -0.0010652125163062886,
+        -0.0002478645853846322
       ],
       "p_positive": 0.0,
-      "n_obs": 6039,
+      "n_obs": 6042,
       "benchmark": "buy_and_hold_close"
     },
     "buy_hold_baseline": {
-      "total_return": 351.3705944680426,
-      "annual_return": 0.27721952401385574
+      "total_return": 362.47190000000006,
+      "annual_return": 0.2787173494687878
     },
     "regime_win_rates": {
-      "Bull": 0.6744,
-      "Bear": 0.6,
-      "Shock": 0.4894
+      "Bull": 0.5326,
+      "Bear": 0.0,
+      "Shock": 0.5122
     },
     "triggers": [
       {
-        "indicator": "CMF(30,0.1/-0.1)",
-        "current": null,
-        "last_close": 1410.27,
-        "buy_trigger": "买点参考价 1355.90（最近一次买点所在 bar 收盘价）",
-        "sell_trigger": "卖点参考价 1235.58（最近一次卖点所在 bar 收盘价）",
+        "indicator": "唐奇安(30/20)",
+        "current": 0.8553629469122436,
+        "last_close": 1453.9,
+        "buy_trigger": "买点参考价 1480.00（最近一次买点所在 bar 收盘价）",
+        "sell_trigger": "卖点参考价 1237.00（最近一次卖点所在 bar 收盘价）",
         "state": "neutral",
-        "buy_price": 1355.9,
-        "sell_price": 1235.58
+        "buy_price": 1480.0,
+        "sell_price": 1237.0
       }
     ],
     "flow": {
@@ -321,9 +327,10 @@
       "direction": null,
       "direction_basis": null,
       "stale": null,
-      "expected_date": "2026-11-12",
+      "expected_date": "2026-11-16",
       "expected_source": "calendar_cache",
-      "reason": "cache_missing"
+      "reason": "cache_missing",
+      "degraded_reason": null
     },
     "valuation": {
       "available": false,
@@ -351,162 +358,210 @@
       "turnover_latest": null,
       "is_st_hist": null,
       "stale": null,
-      "expected_date": "2026-11-12",
+      "expected_date": "2026-11-16",
       "expected_source": "calendar_cache",
       "reason": "cache_missing"
     },
     "market_watch": {
       "available": true,
       "stale": false,
-      "as_of": "2026-11-14",
+      "as_of": "2026-11-17",
       "hit": null
+    },
+    "events": {
+      "available": false,
+      "stale": true,
+      "as_of": null,
+      "fetched_at": null,
+      "reason": "cache_missing",
+      "code": "600519",
+      "lockup": {
+        "available": false,
+        "stale": true,
+        "as_of": null,
+        "fetched_at": null,
+        "reason": "cache_missing",
+        "error": null,
+        "items": [],
+        "warnings": []
+      },
+      "holder_trades": {
+        "available": false,
+        "stale": true,
+        "as_of": null,
+        "fetched_at": null,
+        "reason": "cache_missing",
+        "error": null,
+        "items": [],
+        "warnings": []
+      },
+      "forecast": {
+        "available": false,
+        "stale": true,
+        "as_of": null,
+        "fetched_at": null,
+        "reason": "cache_missing",
+        "error": null,
+        "items": [],
+        "warnings": []
+      },
+      "pledge": {
+        "available": false,
+        "stale": true,
+        "as_of": null,
+        "fetched_at": null,
+        "reason": "cache_missing",
+        "error": null,
+        "items": [],
+        "warnings": []
+      }
     }
   },
   "candidates": [
     {
-      "name": "CMF(30,0.1/-0.1)",
-      "family": "CMF",
-      "score": 0.4898702356821689,
-      "score_is": 0.47304987060140175,
-      "score_oos": 0.4971,
-      "annual_return": 0.11960000000000001,
-      "max_drawdown": 0.4046,
-      "win_rate": 0.5789,
-      "trade_count": 95,
-      "calmar": 0.2956005931784479,
-      "deflated_sharpe": 0.0495
-    },
-    {
       "name": "唐奇安(30/20)",
       "family": "唐奇安",
-      "score": 0.37507141924399945,
-      "score_is": 0.5549746059267379,
-      "score_oos": 0.298,
-      "annual_return": 0.12369999999999999,
-      "max_drawdown": 0.2784,
+      "score": 0.3853721454389125,
+      "score_is": 0.5581856733800709,
+      "score_oos": 0.3113,
+      "annual_return": 0.1251,
+      "max_drawdown": 0.2782,
       "win_rate": 0.5263,
       "trade_count": 133,
-      "calmar": 0.4443247126436782,
-      "deflated_sharpe": 0.1782
-    },
-    {
-      "name": "唐奇安(20/10)",
-      "family": "唐奇安",
-      "score": 0.3552539393600739,
-      "score_is": 0.561207244932814,
-      "score_oos": 0.267,
-      "annual_return": 0.1458,
-      "max_drawdown": 0.3146,
-      "win_rate": 0.49090000000000006,
-      "trade_count": 165,
-      "calmar": 0.46344564526382714,
-      "deflated_sharpe": 0.2037
+      "calmar": 0.44967649173256646,
+      "deflated_sharpe": 0.1853
     },
     {
       "name": "唐奇安(30/10)",
       "family": "唐奇安",
-      "score": 0.3541907449729866,
-      "score_is": 0.5857274618600059,
-      "score_oos": 0.255,
-      "annual_return": 0.12689999999999999,
-      "max_drawdown": 0.2504,
+      "score": 0.3617407147500963,
+      "score_is": 0.5868962351904293,
+      "score_oos": 0.2652,
+      "annual_return": 0.1281,
+      "max_drawdown": 0.2518,
       "win_rate": 0.4894,
       "trade_count": 141,
-      "calmar": 0.5067891373801916,
-      "deflated_sharpe": 0.2688
+      "calmar": 0.5087370929308974,
+      "deflated_sharpe": 0.2722
+    },
+    {
+      "name": "唐奇安(20/10)",
+      "family": "唐奇安",
+      "score": 0.3594854991392038,
+      "score_is": 0.5526407819889356,
+      "score_oos": 0.2767,
+      "annual_return": 0.1458,
+      "max_drawdown": 0.3246,
+      "win_rate": 0.49090000000000006,
+      "trade_count": 165,
+      "calmar": 0.4491682070240296,
+      "deflated_sharpe": 0.1846
     },
     {
       "name": "配对交易(20,-2.0,0.5)",
       "family": "配对交易",
-      "score": 0.35413963170313,
-      "score_is": 0.39561226665238136,
-      "score_oos": 0.3364,
-      "annual_return": 0.057699999999999994,
-      "max_drawdown": 0.4086,
+      "score": 0.3554555976228529,
+      "score_is": 0.4002577400186499,
+      "score_oos": 0.3363,
+      "annual_return": 0.06280000000000001,
+      "max_drawdown": 0.4216,
       "win_rate": 0.6441,
       "trade_count": 118,
-      "calmar": 0.14121390112579538,
-      "deflated_sharpe": 0.0081
+      "calmar": 0.1489563567362429,
+      "deflated_sharpe": 0.0089
     },
     {
       "name": "价差ZScore(20,-2.0,0.5)",
       "family": "价差ZScore",
-      "score": 0.35413963170313,
-      "score_is": 0.39561226665238136,
-      "score_oos": 0.3364,
-      "annual_return": 0.057699999999999994,
-      "max_drawdown": 0.4086,
+      "score": 0.3554555976228529,
+      "score_is": 0.4002577400186499,
+      "score_oos": 0.3363,
+      "annual_return": 0.06280000000000001,
+      "max_drawdown": 0.4216,
       "win_rate": 0.6441,
       "trade_count": 118,
-      "calmar": 0.14121390112579538,
-      "deflated_sharpe": 0.0081
+      "calmar": 0.1489563567362429,
+      "deflated_sharpe": 0.0089
     },
     {
       "name": "唐奇安(15/10)",
       "family": "唐奇安",
-      "score": 0.3410351450090455,
-      "score_is": 0.5056374037560774,
-      "score_oos": 0.2705,
-      "annual_return": 0.1411,
-      "max_drawdown": 0.3809,
-      "win_rate": 0.4889,
-      "trade_count": 180,
-      "calmar": 0.37043843528485165,
-      "deflated_sharpe": 0.0996
-    },
-    {
-      "name": "配对交易(20,-1.5,0.5)",
-      "family": "配对交易",
-      "score": 0.32698417417218506,
-      "score_is": 0.40688302844663565,
-      "score_oos": 0.2927,
-      "annual_return": 0.0848,
-      "max_drawdown": 0.5236999999999999,
-      "win_rate": 0.6147,
-      "trade_count": 218,
-      "calmar": 0.16192476608745468,
-      "deflated_sharpe": 0.0106
+      "score": 0.35000569941746495,
+      "score_is": 0.5049059564804397,
+      "score_oos": 0.2836,
+      "annual_return": 0.1437,
+      "max_drawdown": 0.392,
+      "win_rate": 0.4972,
+      "trade_count": 179,
+      "calmar": 0.3665816326530612,
+      "deflated_sharpe": 0.0964
     },
     {
       "name": "价差ZScore(20,-1.5,0.5)",
       "family": "价差ZScore",
-      "score": 0.32698417417218506,
-      "score_is": 0.40688302844663565,
-      "score_oos": 0.2927,
-      "annual_return": 0.0848,
-      "max_drawdown": 0.5236999999999999,
-      "win_rate": 0.6147,
-      "trade_count": 218,
-      "calmar": 0.16192476608745468,
-      "deflated_sharpe": 0.0106
+      "score": 0.33344335474816345,
+      "score_is": 0.40704961934683787,
+      "score_oos": 0.3019,
+      "annual_return": 0.08560000000000001,
+      "max_drawdown": 0.5256000000000001,
+      "win_rate": 0.6129,
+      "trade_count": 217,
+      "calmar": 0.1628614916286149,
+      "deflated_sharpe": 0.0107
     },
     {
-      "name": "价差ZScore(20,-2.0,0.0)",
-      "family": "价差ZScore",
-      "score": 0.3236198708765372,
-      "score_is": 0.400400201584761,
-      "score_oos": 0.2907,
-      "annual_return": 0.0521,
-      "max_drawdown": 0.37170000000000003,
-      "win_rate": 0.6694,
-      "trade_count": 121,
-      "calmar": 0.14016680118375033,
-      "deflated_sharpe": 0.008
+      "name": "配对交易(20,-1.5,0.5)",
+      "family": "配对交易",
+      "score": 0.33344335474816345,
+      "score_is": 0.40704961934683787,
+      "score_oos": 0.3019,
+      "annual_return": 0.08560000000000001,
+      "max_drawdown": 0.5256000000000001,
+      "win_rate": 0.6129,
+      "trade_count": 217,
+      "calmar": 0.1628614916286149,
+      "deflated_sharpe": 0.0107
+    },
+    {
+      "name": "均线趋势(8-13-60)",
+      "family": "均线趋势",
+      "score": 0.3313369983774881,
+      "score_is": 0.4955884040282948,
+      "score_oos": 0.2609,
+      "annual_return": 0.11349999999999999,
+      "max_drawdown": 0.326,
+      "win_rate": 0.4959,
+      "trade_count": 242,
+      "calmar": 0.3481595092024539,
+      "deflated_sharpe": 0.0819
+    },
+    {
+      "name": "配对交易(20,-2.0,0.0)",
+      "family": "配对交易",
+      "score": 0.32818982565802,
+      "score_is": 0.415796565887801,
+      "score_oos": 0.2906,
+      "annual_return": 0.0593,
+      "max_drawdown": 0.3747,
+      "win_rate": 0.6917,
+      "trade_count": 120,
+      "calmar": 0.15825994128636242,
+      "deflated_sharpe": 0.0101
     }
   ],
   "diagnostics": {
     "unaffordable_lot_events": 0,
     "blocked_by_limit_events": 0,
     "zero_trade_configs": 8,
-    "survivor_configs": 547,
+    "survivor_configs": 548,
     "warnings": [
-      "ST 名单接口失败（RuntimeError: 东财 ST 名单不可达（东财 push2 / push2delay 均不可达: https://push2.eastmoney.com: ConnectionError; https://push2delay.eastmoney.com: ConnectionError）；baostock 兜底已禁用：本项目不引入 baostock（issue #1 决策）），且无本地缓存：is_st 只能依据实时报价名称判断",
-      "策略族 'CMF' 未提供可复算的指标值：trigger.current 为 null（不以收盘价顶替）",
+      "本地无 ST 名单缓存：盘前不请求东财接口（push2 已触发出口 IP 封禁），is_st 只能依据实时报价/本地名称判断；请确认 18:30 预计算任务已运行",
       "超额收益 95% CI 上界 ≤ 0：统计上无优势，判 no_edge（B8）",
       "资金面上下文不可用（600519）：无本地资金流缓存（需先运行 tools/precompute_flow.py）；只展示，不影响 action",
-      "估值上下文不可用（600519）：无本地估值缓存（需先运行 tools/precompute_valuation.py）；只展示，不影响 action"
+      "估值上下文不可用（600519）：无本地估值缓存（需先运行 tools/precompute_valuation.py）；只展示，不影响 action",
+      "事件风险上下文不可用（600519）：无本地事件缓存（需先运行 tools/precompute_events.py）；只展示，不影响 action"
     ],
-    "elapsed_seconds": 22.34,
+    "elapsed_seconds": 23.94,
     "source_attempts": []
   },
   "disclaimer": "本结果不构成投资建议，市场有风险，投资需谨慎。"
