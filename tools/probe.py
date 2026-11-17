@@ -37,6 +37,8 @@ REQUIRED_REC_KEYS = [
     "distance_to_trigger", "invalidation", "stop_method", "no_edge",
     # v3.0：有效期契约（G47 校验其内部自洽）
     "signal", "target_position", "review_date", "side_expectancy",
+    # issue #144：实际持有交易日数（结构化字段；渲染层不解析文本）
+    "holding_days",
 ]
 # F06f/F20 的数据新鲜度字段同样锁定，防止"降级不可见"回归。
 # window_note（2026-10-18 补登）：`--start` 生效时的截取说明，两条路径都输出。

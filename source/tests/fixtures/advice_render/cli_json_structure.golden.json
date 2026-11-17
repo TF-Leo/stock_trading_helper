@@ -68,6 +68,7 @@
     "confidence",
     "distance_to_trigger",
     "entry_zone",
+    "holding_days",
     "horizon_days",
     "invalidation",
     "no_edge",

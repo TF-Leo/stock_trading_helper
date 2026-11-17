@@ -390,6 +390,9 @@ def create_error_response(status, message, code, data_type, type_hint='auto',
             'position_fraction': 0.0,
             # 未知持仓时长时给 [null, null] 而不是编造 [1, 5]
             'horizon_days': [None, None],
+            # issue #144 additive：错误路径与成功路径同构（G35）；实际持有
+            # 交易日数未知时显式 null，不得编造 0 或从文本派生。
+            'holding_days': None,
             'entry_zone': None,
             'stop_loss': None,
             'take_profit': None,

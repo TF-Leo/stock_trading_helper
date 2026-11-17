@@ -52,10 +52,13 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
 * ``target_position`` / ``review_date`` **不再进入主行**（issue #142）。
 * ``horizon_days`` 当前是 ``[20, 20]``（低/高），渲染取第一个正值。它只用于
   ``hold`` + ``position_state=holding`` 的「继续持有（第 N 个交易日）」超期
-  判断：``N`` 取 ``action_reason`` 已写出的「第 N/M 个交易日」（策略引擎的
-  ``bars_held``）；``N > horizon`` 时追加「已超建议持有期 N-horizon 日
-  （不强制退出）」。**不能**用 ``signal.last_buy_age`` 代替——持仓期间出现
-  新买点信号时它会重置（实测 600519：2 vs 实际 21）。渲染层不重算判定。
+  判断：``N`` 取结构化字段 ``recommendation.holding_days``（CLI 从决策层
+  ``policy.run_policy`` 的 ``bars_held`` 原值透传，issue #144）；``N >
+  horizon`` 时追加「已超建议持有期 N-horizon 日（不强制退出）」。渲染层
+  **不解析** ``action_reason`` 文本，也**不能**用 ``signal.last_buy_age``
+  代替——后者是「距最近买点信号的交易日数」，持仓期间出现新买点会被重置
+  （实测 600519：2 vs 实际 21）。``holding_days`` 为 ``null`` 时整段省略，
+  不回退到文本。两者语义差异见 ``docs/HOLDING_DAYS.md``。
 * ``instrument.limit_up`` / ``limit_down`` 是**价格**，不是布尔。一字板优先
   读取显式字段 ``instrument.one_word_limit``（``"up"`` / ``"down"``），缺失时
   才从 ``diagnostics.warnings`` 里识别 CLI 已写入的「一字涨停/一字跌停」事实。
@@ -1050,29 +1053,24 @@ def _level_parts(rec: Dict[str, Any], *, include_entry: bool) -> List[str]:
 _AVOID_SUFFIX_RE = re.compile(r"[，,；;]?\s*(?:建议)?不参与\s*$")
 
 
-#: ``action_reason`` 里策略引擎写出的实际持有交易日数（``decision/render.py``）。
-_HOLD_DAYS_RE = re.compile(r"第\s*(\d+)\s*/\s*\d+\s*个交易日")
-
-
 def _holding_days(rec: Dict[str, Any]) -> Optional[int]:
-    """实际持有交易日数 ``N``；只读已有事实，不重新计算。
+    """实际持有交易日数；只读结构化字段 ``recommendation.holding_days``。
 
-    权威值在 ``action_reason`` 的「持有中（第 N/M 个交易日…）」里（由
-    ``policy.run_policy`` 的 ``bars_held`` 写出）。**不能**用
-    ``signal.last_buy_age`` 代替：持仓期间出现新的买点信号时，后者会被重置
-    为距最近买点的天数（实测 600519：last_buy_age=2，实际已持有 21 个交易
-    日）。只有 ``action_reason`` 完全缺失该事实时才退回 ``last_buy_age``。
+    CLI 把 ``decision.policy.run_policy`` 回放得到的 ``bars_held`` 原值透传
+    到这个字段（issue #144）。渲染层**不解析** ``action_reason`` 文本：文案
+    改版后正则失配不会报错，只会静默显示错误天数或整段消失。也**不用**
+    ``signal.last_buy_age`` 兜底——它表示「距最近买点信号的交易日数」，持仓
+    期间出现新买点会被重置（实测 600519：``last_buy_age=2`` 时实际已持有
+    21 个交易日）。
+
+    字段缺失 / ``null`` / 非正整数时返回 ``None``，调用方省略「（第 N 个
+    交易日）」整段。语义差异见 ``docs/HOLDING_DAYS.md``。
     """
-    reasons = rec.get("action_reason")
-    if isinstance(reasons, (list, tuple)):
-        for reason in reasons:
-            match = _HOLD_DAYS_RE.search(str(reason or ""))
-            if match:
-                return int(match.group(1))
-    age = _num(_dict(rec.get("signal")).get("last_buy_age"))
-    if age is not None and age >= 1:
-        return int(round(age))
-    return None
+    days = _num(rec.get("holding_days"))
+    if days is None:
+        return None
+    value = int(days)
+    return value if value >= 1 else None
 
 
 def _plain_action_reason(rec: Dict[str, Any],
@@ -1111,12 +1109,11 @@ def _main_line(rec: Dict[str, Any]) -> Optional[str]:
     「复审日」。这些字段的原始值仍保留在 JSON 与 `依据：` 明细里，主行不再
     并列倾倒。
 
-    ``N`` 取 ``action_reason`` 里策略引擎已写出的「第 N/M 个交易日」事实
-    （``policy.run_policy`` 的 ``bars_held``）；``M = N - horizon_days[0]``。
-    渲染层不重新计算任何判定。**不用** ``signal.last_buy_age`` 代替：持仓
-    期间的新买点信号会把后者重置（实测 600519 ``last_buy_age=2`` 时实际已
-    持有 21 个交易日）。只有 ``action_reason`` 缺失该事实时才退回
-    ``last_buy_age``，见 :func:`_holding_days`。
+    ``N`` 取结构化字段 ``recommendation.holding_days``（CLI 从 ``policy.
+    run_policy`` 的 ``bars_held`` 原值透传，issue #144），``M`` 取
+    ``horizon_days[0]``。渲染层不重新计算任何判定，**不**解析 ``action_reason``
+    文本，**不**用 ``signal.last_buy_age`` 替代（语义不同）。字段缺失时主行
+    只写「继续持有」，省略「（第 N 个交易日）」整段。
     """
     action = _text(rec.get("action"))
     signal = _dict(rec.get("signal"))
