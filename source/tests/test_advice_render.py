@@ -95,12 +95,24 @@ def test_fixtures_cover_required_cases():
 
 
 # ---------------------------------------------------------------------------
-# T1：仓位 / 持有期 / 复审日
+# T1：主行按动作裁剪（issue #142）
 # ---------------------------------------------------------------------------
-def test_t1_position_horizon_review_present():
+_MAIN_ROW_PREFIXES = ("可买", "继续持有", "暂不买", "卖出", "不参与")
+
+
+def _main_row(text: str) -> str:
+    """取建议主行（第一条以动作短语开头的行）。"""
+    return next(line for line in text.splitlines()
+                if line.startswith(_MAIN_ROW_PREFIXES))
+
+
+def test_t1_buy_main_row_keeps_position_and_levels():
     output = _render("normal_buy")
-    assert "建议仓位 15%" in output
-    assert "持有 20 日，2026-12-11 复审" in output
+    assert _main_row(output) == (
+        "可买，仓位约 15%｜置信 72%（中）｜入场区 11.8-12.2｜止损 11｜止盈 13.5")
+    # 持有期 / 复审日只属于 hold-holding，buy 主行不出现。
+    assert "持有 20 日" not in _main_row(output)
+    assert "复审" not in _main_row(output)
 
 
 def test_t1_none_segments_disappear():
@@ -112,21 +124,25 @@ def test_t1_none_segments_disappear():
 
 
 def test_t1_partial_optional_fields():
-    """仓位缺失但持有期存在：只渲染持有期；复审日缺失则不写「复审」。"""
+    """仓位缺失：主行只写「可买」，不出现「仓位约」。"""
     payload = _payload("normal_buy")
     payload["recommendation"]["position_fraction"] = None
     payload["recommendation"]["review_date"] = None
     output = render_advice(payload)
     assert "建议仓位" not in output
-    assert "持有 20 日" in output
+    assert "仓位约" not in output
+    assert "持有 20 日" not in output
     assert "复审" not in output
+    assert _main_row(output).startswith("可买")
 
 
-def test_t1_zero_position_is_rendered():
-    """0.0 是有效值，不能被当成 None 吃掉；issue #132 起写作「目标仓位 0%」。"""
+def test_t1_avoid_has_no_position_or_horizon():
+    """avoid 只写「不参与（原因）」；仓位/持有期/复审日一律不出现。"""
     output = _render("suspended")
-    assert "目标仓位 0%" in output
-    assert "建议仓位" not in output
+    row = _main_row(output)
+    assert row.startswith("不参与（")
+    for word in ("建议仓位", "目标仓位", "持有", "复审"):
+        assert word not in row
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +161,7 @@ def test_trigger_line_matches_json_values():
 
 def test_trigger_line_sits_between_advice_and_reason():
     lines = _advice_lines(_render("normal_buy"))
-    advice_at = next(i for i, line in enumerate(lines) if line.startswith("建议仓位"))
+    advice_at = next(i for i, line in enumerate(lines) if line.startswith("可买"))
     trigger_at = next(i for i, line in enumerate(lines) if line.startswith("触发："))
     reason_at = next(i for i, line in enumerate(lines) if line.startswith("依据："))
     assert advice_at < trigger_at < reason_at
@@ -280,15 +296,18 @@ def test_t2_gate_is_first_advice_line(name, reason):
 
 
 @pytest.mark.parametrize("name,action_line", [
-    ("suspended", "动作 avoid｜置信 0%（低）"),
-    ("one_word_up", "动作 avoid｜置信 0%（低）"),
-    ("st_warning", "动作 hold｜置信 66%（中）"),
+    ("suspended", "不参与（不可交易或结果不可信）｜置信 0%（低）"),
+    ("one_word_up", "不参与（不可交易或结果不可信）｜置信 0%（低）"),
+    ("st_warning", "暂不买（无合格买点）｜置信 66%（中）"),
 ])
 def test_t2_action_and_confidence_are_not_rewritten(name, action_line):
     output = _render(name)
-    assert action_line in output
-    # 闸门只描述可执行性，不替换 recommendation.action。
-    assert f"动作 {_payload(name)['recommendation']['action']}｜" in output
+    assert _main_row(output) == action_line
+    # 闸门只描述可执行性，不替换 recommendation.action 对应的主行动作。
+    expected_head = {"avoid": "不参与", "hold": "暂不买",
+                     "sell": "卖出", "buy": "可买"}[
+                         _payload(name)["recommendation"]["action"]]
+    assert _main_row(output).startswith(expected_head)
 
 
 def test_t2_warnings_precede_advice():
@@ -296,7 +315,7 @@ def test_t2_warnings_precede_advice():
     warnings = [line for line in output.splitlines()
                 if line.startswith("⚠️ 数据:")]
     assert len(warnings) == 2
-    assert output.index("⚠️ 数据:") < output.index("动作 hold")
+    assert output.index("⚠️ 数据:") < output.index("暂不买")
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +564,7 @@ def test_t3_missing_index_no_line_no_error():
     output = _render("suspended")  # market_regime 无 index 键
     assert "大盘逆风" not in output
     assert "大盘顺风" not in output
-    assert "目标仓位 0%" in output  # 其余建议仍然正常渲染
+    assert _main_row(output).startswith("不参与（")  # 其余建议仍然正常渲染
 
 
 # ---------------------------------------------------------------------------
@@ -633,8 +652,8 @@ def _confidence_payload(confidence):
     }
 
 
-def _action_line_of(text: str) -> str:
-    return next(line for line in text.splitlines() if line.startswith("动作 "))
+def _main_row_of(text: str) -> str:
+    return _main_row(text)
 
 
 def test_confidence_grade_thresholds_are_explicit():
@@ -645,26 +664,26 @@ def test_confidence_grade_thresholds_are_explicit():
 
 def test_confidence_grade_high_boundary_is_inclusive():
     """0.75 属于「高」；0.749 仍属「中」。"""
-    assert _action_line_of(render_advice(
-        _confidence_payload(0.75))) == "动作 hold｜置信 75%（高）"
-    assert _action_line_of(render_advice(
-        _confidence_payload(0.749))) == "动作 hold｜置信 74.9%（中）"
+    assert _main_row_of(render_advice(
+        _confidence_payload(0.75))) == "暂不买（无合格买点）｜置信 75%（高）"
+    assert _main_row_of(render_advice(
+        _confidence_payload(0.749))) == "暂不买（无合格买点）｜置信 74.9%（中）"
 
 
 def test_confidence_grade_medium_boundary_is_inclusive():
     """0.5 属于「中」；0.499 属于「低」。"""
-    assert _action_line_of(render_advice(
-        _confidence_payload(0.5))) == "动作 hold｜置信 50%（中）"
-    assert _action_line_of(render_advice(
-        _confidence_payload(0.499))) == "动作 hold｜置信 49.9%（低）"
+    assert _main_row_of(render_advice(
+        _confidence_payload(0.5))) == "暂不买（无合格买点）｜置信 50%（中）"
+    assert _main_row_of(render_advice(
+        _confidence_payload(0.499))) == "暂不买（无合格买点）｜置信 49.9%（低）"
 
 
 def test_confidence_display_is_floored_not_rounded():
     """P3 回归：显示值向下取整，不能把 0.7499 四舍五入成「75%（中）」。"""
-    assert _action_line_of(render_advice(
-        _confidence_payload(0.7499))) == "动作 hold｜置信 74.9%（中）"
-    assert _action_line_of(render_advice(
-        _confidence_payload(0.4999))) == "动作 hold｜置信 49.9%（低）"
+    assert _main_row_of(render_advice(
+        _confidence_payload(0.7499))) == "暂不买（无合格买点）｜置信 74.9%（中）"
+    assert _main_row_of(render_advice(
+        _confidence_payload(0.4999))) == "暂不买（无合格买点）｜置信 49.9%（低）"
 
 
 def test_confidence_display_tier_matches_grade_on_grid():
@@ -682,7 +701,7 @@ def test_confidence_display_tier_matches_grade_on_grid():
         0.7499, 0.4999,
     ]
     for confidence in values:
-        line = _action_line_of(render_advice(_confidence_payload(confidence)))
+        line = _main_row_of(render_advice(_confidence_payload(confidence)))
         match = re.search(r"置信 ([0-9.]+)%（([高中低])）", line)
         assert match, line
         shown = float(match.group(1)) / 100.0
@@ -700,8 +719,8 @@ def test_confidence_display_tier_matches_grade_on_grid():
 @pytest.mark.parametrize("confidence", [None, "abc", True])
 def test_confidence_missing_is_omitted_never_invented(confidence):
     """confidence 缺失/不可用：整段「置信 …」消失，不编数值也不编分级。"""
-    line = _action_line_of(render_advice(_confidence_payload(confidence)))
-    assert line == "动作 hold"
+    line = _main_row_of(render_advice(_confidence_payload(confidence)))
+    assert line == "暂不买（无合格买点）"
     assert "置信" not in line
 
 
@@ -709,8 +728,8 @@ def test_confidence_grade_does_not_change_json_value():
     """渲染不修改入参；等级只是对已有数值的映射。"""
     payload = _confidence_payload(0.63)
     original = copy.deepcopy(payload)
-    line = _action_line_of(render_advice(payload))
-    assert line == "动作 hold｜置信 63%（中）"
+    line = _main_row_of(render_advice(payload))
+    assert line == "暂不买（无合格买点）｜置信 63%（中）"
     assert payload == original
 
 
@@ -792,7 +811,7 @@ def test_tone_both_off_keeps_warnings_and_gate():
     assert "大盘逆风" not in output
     assert "⚠️ 数据: 示例数据告警（不影响判定）" in output
     assert "【今日不建议执行】ST 风险警示股" in output
-    assert "动作 hold｜置信 63%（中）" in output
+    assert "暂不买（无合格买点）｜置信 63%（中）" in output
     expected = [line for line in _without(default, "免责声明：")
                 if not line.startswith("⚠️ 大盘")]
     assert output.splitlines() == expected
@@ -1489,7 +1508,7 @@ def test_render_does_not_touch_network(monkeypatch):
     monkeypatch.setattr(socket, "socket", _boom)
     monkeypatch.setattr(socket, "create_connection", _boom)
     output = render_advice(_payload("normal_buy"))
-    assert "建议仓位 15%" in output
+    assert "可买，仓位约 15%" in output
 
 
 # ---------------------------------------------------------------------------

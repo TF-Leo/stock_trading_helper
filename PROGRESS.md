@@ -1,5 +1,70 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-17 · issue #142：建议主行按动作裁剪、说人话（**只改渲染层**）
+
+- **分支**：`task/plain-row`（本地 worktree 分支 `TF-Leo/plain-row`，父
+  `origin/main` = `606790b`），未合并。合并 issue #141 的重复部分：
+  #141 是 #142 的子集，本 PR 一并关闭 #141（同一根因、同一渲染层改动）。
+- **改动**：`source/stock_analysis/advice_render.py` 用一条按动作裁剪的主行
+  取代原来的 `动作 …` + `建议仓位/目标仓位/持有期/复审日` + `价位：…` 三行：
+  - `buy` → `可买，仓位约 15%｜置信 72%（中）｜入场区 11.8-12.2｜止损 11｜止盈 13.5`；
+  - `hold` + `position_state=holding` → `继续持有（第 21 个交易日）｜置信 …｜止损 …｜止盈 …`，
+    `N > horizon_days[0]` 时追加 `已超建议持有期 M 日（不强制退出）`；
+  - `hold` + 空仓 → `暂不买（无合格买点）｜置信 …`；
+  - `sell` → `卖出（风控止损）｜置信 …｜止损 …｜止盈 …`，不显示入场区；
+  - `avoid` / 不可交易 → `不参与（{action_reason 已有原因}）｜置信 …`。
+  - 硬规则：「仓位」只在 buy；「持有 N 个交易日 / 复审」只在 hold-holding；
+    sell / avoid / hold-flat 主行不出现「建议仓位」「目标仓位」「持有」
+    「复审」。
+  - **持有天数不能取 `signal.last_buy_age`**：真实 600519 实测
+    `last_buy_age=2`，而策略引擎实际已持有 21 个交易日（持仓期间的新买点
+    信号会重置它）。改为从 `action_reason` 已有的「第 N/M 个交易日」读取
+    （`policy.run_policy` 的 `bars_held`），`M = N - horizon_days[0]`；
+    只有 `action_reason` 缺失该事实时才退回 `last_buy_age`。渲染层仍不重算
+    任何判定。
+  - 保留：`⚠️ 数据` 行、可执行性闸门、置信分级（向下取整到 1 位）、触发
+    参考价归属、事件/监控/估值/资金流明细及原有顺序；`--json` 结构与既有
+    键未改，`decision/*` 未改。
+- **测试**：新增 `source/tests/test_plain_row_142.py`（**15 项**）：五形态
+  快照（buy / hold-holding / hold-holding 超期 / hold-flat / sell / avoid）、
+  「仓位只在 buy」「持有/复审只在 hold-holding」「sell 不显示入场区」三项
+  硬规则、持有天数取 `action_reason` 而非 `last_buy_age` 的回归、纯函数与
+  JSON 键不变。既有 `test_advice_render.py` / `test_trigger_semantics_132.py`
+  / `test_events_context.py` / `test_market_watch.py` 的文案断言与 9 份
+  `*.expected.txt` 快照同步到新契约（**契约变更导致的文案变化，不是放宽
+  判定**；旧断言里「建议仓位 0.2%｜目标仓位 0%｜持有 20 日」正是 #141/#142
+  要删除的矛盾文案）。测试标的只用 600519 / 600000。
+- **证据（本机 Linux，Python 3.14.7 / pytest 8.3.5，worktree `.venv` 由
+  `uv pip install -r source/requirements.txt` 建立）**：
+  - `python -m pytest tests/ -q` → **1281 passed in 106.31s**（父提交基线
+    1266；本次净增 15 项）。
+  - `python -m pytest tests/test_plain_row_142.py -q` → **15 passed**。
+  - `python tools/probe.py all-quick` → 退出码 0；41 项中 **34 PASS /
+    5 SKIP（-Quick 跳过）/ 1 FAIL / 1 BLOCKED**（FAIL=`error_shape`：错误路径缺
+    `diagnostics.source_attempts[]` 六键；BLOCKED=`as_of`：本 worktree 无
+    `stock_analysis/data/stock_600519_qfq.csv`。两项均为 #133 已记录的既有
+    环境问题，与渲染层改动无因果关系）。
+  - **门禁说明**：本机无 `pwsh`，无法执行 `tools/check_gates.ps1`；以全量
+    pytest + `tools/probe.py all-quick` 作为运行时裁定器（与前几轮同）。
+- **真实 10 只对照（匿名；payload 由生产克隆 `606790b` 的 `cli.py --json
+  --fast` 生成，用本分支 `tools/render_advice.py` 渲染）**：
+  | 匿名 | status/action | 主行 |
+  |---|---|---|
+  | 标的1 | ok/hold-holding | 继续持有（第 21 个交易日）｜已超建议持有期 1 日（不强制退出）｜置信 63.1%（中）｜止损 33.17｜止盈 38.7 |
+  | 标的2 | ok/hold-flat | 暂不买（无合格买点）｜置信 43.5%（低） |
+  | 标的3 | ok/hold-flat | 暂不买（无合格买点）｜置信 50.6%（中） |
+  | 标的4 | ok/hold-flat | 暂不买（无合格买点）｜置信 34.8%（低） |
+  | 标的5 | ok/hold-flat | 暂不买（无合格买点）｜置信 55.5%（中） |
+  | 标的6 | no_edge/hold-flat | 暂不买（无合格买点）｜置信 45.2%（低） |
+  | 标的7 | ok/hold-flat | 暂不买（无合格买点）｜置信 38.6%（低） |
+  | 标的8 | ok/hold-flat | 暂不买（无合格买点）｜置信 55.5%（中） |
+  | 标的9 | ok/hold-flat | 暂不买（无合格买点）｜置信 2.2%（低） |
+  | 标的10 | ok/sell | 卖出（风控止损）｜置信 2.1%（低）｜止损 2.2｜止盈 2.86 |
+  真实 10 只里没有 buy/avoid，五形态由合成快照覆盖。
+- **未改**：`decision/*`、`--json` 结构/键、取数逻辑。**投递侧
+  `~/.hermes` prompt（主行六项：建议仓位/持有期/价位）仍是旧契约，需在合并
+  后另行同步**——本次按任务书只改仓库渲染层，未触碰生产 Hermes 配置。
+
 ## 2026-11-17 · issue #139：超过建议持有期的文案矛盾（**不改判定逻辑**）
 
 - **分支**：`task/horizon-wording`（父 `origin/main` = `e4cd804`），未合并。
