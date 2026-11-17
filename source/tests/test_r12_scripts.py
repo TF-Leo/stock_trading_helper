@@ -28,6 +28,7 @@ def _load(name: str):
 
 lib = _load("r12_lib")
 analysis = _load("r12_analysis")
+h2 = _load("r12_h2")
 h3 = _load("r12_h3")
 fetch = _load("r12_fetch")
 
@@ -111,3 +112,73 @@ def test_perm_pvalue_detects_monotone_relation():
 def test_month_ends_are_calendar_month_ends():
     days = fetch.month_ends("2024-01", "2024-03")
     assert days == ["2024-01-31", "2024-02-29", "2024-03-31"]
+
+
+def test_last_close_before_information_available():
+    """strict=True 必须排除期间末当天的外盘收盘（A 股 15:00 尚未发生）。"""
+    idx = pd.bdate_range("2024-01-01", "2024-01-31")
+    s = pd.Series(np.arange(len(idx), dtype=float) + 100.0, index=idx)
+    end = pd.Series([pd.Timestamp("2024-01-12"), pd.Timestamp("2024-01-19")],
+                    index=pd.PeriodIndex(["2024-01-12", "2024-01-19"], freq="W-FRI"))
+    strict = lib.last_close_before(s, end, strict=True)
+    loose = lib.last_close_before(s, end, strict=False)
+    assert strict.iloc[0] == s.loc["2024-01-11"]      # 周四收盘
+    assert loose.iloc[0] == s.loc["2024-01-12"]       # 含周五收盘（收盘后重叠）
+    assert strict.iloc[1] == s.loc["2024-01-18"]
+    assert loose.iloc[1] == s.loc["2024-01-19"]
+
+
+def test_alpha_diagnostics_noise_vs_dispersion():
+    # 纯噪声：alpha 的横截面离散小于估计噪声 → λ<1、τ=0
+    rng = np.random.default_rng(0)
+    se = np.full(200, 0.01)
+    a_noise = rng.normal(0, 0.005, size=200)
+    d0 = lib.alpha_diagnostics(a_noise, se, a_noise / se)
+    assert d0["alpha_lambda"] < 1.0
+    assert d0["alpha_tau_ann"] == 0.0
+    # 有真实横截面离散：λ>1、τ>0
+    a_sig = rng.normal(0, 0.03, size=200)
+    d1 = lib.alpha_diagnostics(a_sig, se, a_sig / se)
+    assert d1["alpha_lambda"] > 1.0
+    assert d1["alpha_tau_ann"] > 0.0
+
+
+def test_ols_hac_reduces_to_ols_without_lags():
+    rng = np.random.default_rng(1)
+    x = rng.normal(size=300)
+    y = 0.2 + 1.5 * x + rng.normal(size=300)
+    a = lib.ols_hac(y, x, lags=0)
+    A = np.column_stack([np.ones(len(x)), x])
+    b, *_ = np.linalg.lstsq(A, y, rcond=None)
+    e = y - A @ b
+    se = np.sqrt((float(e @ e) / (len(y) - 2)) * np.linalg.pinv(A.T @ A)[0, 0])
+    assert abs(a["alpha"] - b[0]) < 1e-12
+    assert abs(a["se_alpha"] - se) < 1e-12
+    assert abs(a["beta"] - b[1]) < 1e-12
+
+
+def test_gaussian_calibration_near_nominal_five_percent():
+    # 旧判据 |t|>2 在高斯零假设下应接近 5%（合成噪声的理论值）
+    res = h2.run_gaussian_calibration(n=200, reps=2000, seed=3)
+    assert 0.02 < res["share_abs_t_gt_2"] < 0.08
+
+
+def test_block_bootstrap_indices_are_bounded_and_full_length():
+    rng = np.random.default_rng(2)
+    idx = h2._block_idx(503, 20, rng)
+    assert len(idx) == 503
+    assert idx.min() >= 0 and idx.max() < 503
+
+
+def test_cal_window_smoke_returns_null_and_power():
+    rng = np.random.default_rng(4)
+    T, N = 520, 30
+    x = rng.normal(0, 0.012, T)
+    Y = np.array([0.8 * x + rng.normal(0, 0.012, T) for _ in range(N)]).T
+    ew = rng.normal(0, 0.01, T)
+    res = h2._cal_window(Y, x, ew, rng, B=5)
+    for key in ("lambda_obs", "p_lambda", "portfolio_alpha_csi",
+                "portfolio_alpha_ew", "power_lambda"):
+        assert key in res
+    assert 0.0 <= res["p_lambda"] <= 1.0
+    assert res["n_stocks"] == N

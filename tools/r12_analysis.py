@@ -87,8 +87,8 @@ def _ar1_forecast(y: pd.Series, first_oos: str) -> pd.Series:
 
 def run_variant(name: str, freq: str, start: str, first_oos: str,
                 factors_b: list[str], factors_c: list[str],
-                note: str = "") -> dict:
-    panel = L.build_panel(freq).loc[start:]
+                note: str = "", align: str = "period") -> dict:
+    panel = L.build_panel(freq, align=align).loc[start:]
     y = panel["ret"]
     mean_f = _mean_forecast(y)
     ar1_f = _ar1_forecast(y, first_oos)
@@ -98,7 +98,7 @@ def run_variant(name: str, freq: str, start: str, first_oos: str,
     m = y.index >= pd.Timestamp(first_oos)
     out = {
         "name": name, "freq": freq, "start": str(panel.index.min().date()),
-        "first_oos": first_oos, "note": note,
+        "first_oos": first_oos, "note": note, "align": align,
         "n_total": int(len(panel)), "n_oos": int((m & mean_f.notna()).sum()),
         "factors_b": factors_b, "factors_c": factors_c,
     }
@@ -133,11 +133,13 @@ def run_variant(name: str, freq: str, start: str, first_oos: str,
     out["verdict"] = {
         "best_baseline_r2": best_bench,
         "C_minus_best_baseline": out["C"]["r2_vs_mean"] - best_bench,
+        "C_minus_020_threshold": out["C"]["r2_vs_mean"] - 0.20,
         "supported": bool(out["C"]["r2_vs_mean"] >= 0.20
                           and out["C"]["r2_vs_mean"] - best_bench >= 0.10
                           and out["C"]["hit"] > 0.55),
         "rejected": bool(out["C"]["r2_vs_mean"] <= 0.05
                          or ("B" in out and out["C"]["r2_vs_mean"] < out["B"]["r2_vs_mean"])),
+        "barely_above_threshold": bool(0.20 <= out["C"]["r2_vs_mean"] < 0.22),
     }
     return out
 
@@ -170,6 +172,54 @@ VARIANTS = [
      ["fx_off", "spx", "hsi", "d_us10y"], "长样本 + 离岸汇率"),
 ]
 
+# 双档报告：同一期间 vs 信息可得。samegrid / avail 用同一套期间边界，
+# 差别只在「外盘窗口右端是否包含 A 股收盘之后的收盘」。
+ALIGN_VARIANTS = [
+    ("weekly_2017_samegrid", "W", "2017-03-01", "2019-01-01",
+     L.DOMESTIC, L.EXTERNAL,
+     "同一期间（同一网格重算；含周五美股夜盘与恒生 15:00–16:00）", "samegrid"),
+    ("weekly_2017_avail", "W", "2017-03-01", "2019-01-01",
+     L.DOMESTIC, L.EXTERNAL,
+     "信息可得（外盘取 A 股期间末收盘前最后一根）", "avail"),
+    ("monthly_2010_samegrid", "M", "2010-01-01", "2019-01-01",
+     ["d_m2_yoy", "margin_g"], L.EXTERNAL,
+     "月频同一期间（同一网格重算）", "samegrid"),
+    ("monthly_2010_avail", "M", "2010-01-01", "2019-01-01",
+     ["d_m2_yoy", "margin_g"], L.EXTERNAL,
+     "月频信息可得", "avail"),
+    ("weekly_2017_avail_offshore", "W", "2017-03-01", "2019-01-01",
+     L.DOMESTIC, ["fx_off", "spx", "hsi", "d_us10y"],
+     "信息可得 + 离岸汇率（稳健性）", "avail"),
+]
+
+# 因子分解：逐因子分别在「同一期间」与「信息可得」两档口径下重算
+FACTOR_SETS = [
+    ("四因子", L.EXTERNAL),
+    ("仅恒生", ["hsi"]),
+    ("仅S&P500", ["spx"]),
+    ("仅USDCNY(在岸)", ["fx_on"]),
+    ("仅USDCNH(离岸)", ["fx_off"]),
+    ("仅美债10Y", ["d_us10y"]),
+]
+
+
+def factor_decomposition(freq: str, start: str, first_oos: str) -> dict:
+    """逐因子在同一期间 / 信息可得两档口径下的 OOS R² 与命中率。"""
+    out: dict = {}
+    for align in ("samegrid", "avail"):
+        panel = L.build_panel(freq, align=align).loc[start:]
+        y = panel["ret"]
+        bench = _mean_forecast(y)
+        m = y.index >= pd.Timestamp(first_oos)
+        out[align] = {}
+        for label, factors in FACTOR_SETS:
+            pred = L.expanding_forecast(y, panel[factors], first_oos)
+            out[align][label] = {
+                "r2": L.oos_r2(y[m], pred[m], bench[m]),
+                "hit": L.direction_hit(y[m], pred[m]),
+            }
+    return out
+
 
 def main() -> int:
     print("== 单位根 / 自相关（日频、周频、月频收益）==")
@@ -185,14 +235,41 @@ def main() -> int:
               f"(lags={diag[label]['adf']['lags']}) ACF(1)={diag[label]['acf1']:6.3f}")
 
     corr = {}
+    corr_model = {}
     for freq, label in (("W", "weekly"), ("M", "monthly")):
         panel = L.build_panel(freq)
         corr[label] = {k: float(v) for k, v in
                        panel[["ret"] + L.EXTERNAL + L.DOMESTIC].corr()["ret"].items()}
-        print(f"{label} 与沪深300收益的同期相关："
+        panel17 = panel.loc["2017-03-01":]
+        corr_model[label] = {k: float(v) for k, v in
+                             panel17[["ret"] + L.EXTERNAL + L.DOMESTIC].corr()["ret"].items()}
+        print(f"{label} 与沪深300收益的同期相关（全样本）："
               + ", ".join(f"{k}={v:+.3f}" for k, v in corr[label].items() if k != "ret"))
+        print(f"{label} 与沪深300收益的同期相关（2017-03 起）："
+              + ", ".join(f"{k}={v:+.3f}" for k, v in corr_model[label].items() if k != "ret"))
 
-    results = {"diagnostics": diag, "correlations": corr, "variants": []}
+    leadlag = L.lead_lag_daily()
+    print("\n== 日频 lead-lag（2017-03 起，对数收益）==")
+    for k, v in leadlag.items():
+        print(f"  {k:22s} {v:+.3f}")
+
+    print("\n== 因子分解（同一期间 vs 信息可得）==")
+    decomp = {
+        "weekly": factor_decomposition("W", "2017-03-01", "2019-01-01"),
+        "monthly": factor_decomposition("M", "2010-01-01", "2019-01-01"),
+    }
+    for freq_label, block in decomp.items():
+        print(f"-- {freq_label}")
+        for label, vals in block["samegrid"].items():
+            av = block["avail"][label]
+            print(f"   {label:16s} same R2={vals['r2']:+.3f} hit={vals['hit']:.3f} | "
+                  f"avail R2={av['r2']:+.3f} hit={av['hit']:.3f}")
+
+    results = {"diagnostics": diag, "correlations": corr,
+               "correlations_model_sample": corr_model,
+               "lead_lag_daily": leadlag,
+               "factor_decomposition": decomp,
+               "variants": []}
     for args in VARIANTS:
         r = run_variant(*args)
         results["variants"].append(r)
@@ -209,8 +286,19 @@ def main() -> int:
               f"DM(C,A)={c['dm_vs_A'][0]:+.2f} (p={c['dm_vs_A'][1]:.3f}) "
               f"DM(C,B)={c['dm_vs_B'][0]:+.2f} (p={c['dm_vs_B'][1]:.3f}) | "
               f"IS R2={c['in_sample']['r2']:.3f}")
-        print(f"   verdict supported={r['verdict']['supported']} rejected={r['verdict']['rejected']} "
-              f"Δ(best baseline)={r['verdict']['C_minus_best_baseline']:+.3f}")
+
+    results["align_variants"] = []
+    print("\n== 双档报告：同一期间 vs 信息可得 ==")
+    for args in ALIGN_VARIANTS:
+        r = run_variant(*args)
+        results["align_variants"].append(r)
+        c = r["C"]
+        v = r["verdict"]
+        print(f"-- {r['name']} align={r['align']} | OOS {r['n_oos']} | {r['note']}")
+        print(f"   C R2={c['r2_vs_mean']:+.4f} hit={c['hit']:.4f} "
+              f"Δ(best baseline)={v['C_minus_best_baseline']:+.4f} "
+              f"Δ(0.20 threshold)={v['C_minus_020_threshold']:+.4f} "
+              f"supported={v['supported']} barely={v['barely_above_threshold']}")
     path = L.save_json("h1_results.json", results)
     print(f"\n结果已写入 {path}")
     return 0
