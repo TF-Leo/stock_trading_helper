@@ -19,7 +19,9 @@
   「复审」；
 * sell 不显示入场区。
 
-实现只改渲染层：``--json`` 结构与既有键不变，``decision/*`` 未改动。
+实现只改渲染层；``--json`` 结构仅有 issue #144 的 additive 字段
+``recommendation.holding_days``（实际持有交易日数，渲染层只读它，不再解析
+文本），``decision/*`` 未改动。
 测试标的固定为 ``600519`` / ``600000``，不使用任何真实持仓代码。
 """
 from __future__ import annotations
@@ -53,7 +55,7 @@ def _signal(*, position_state="flat", last_buy_age=None, as_of="2026-11-17"):
 def _payload(code, *, action, status="ok", confidence=0.6,
              position_fraction=0.2, horizon=(20, 20), signal=None,
              reason=None, stop_loss=1430.0, take_profit=1600.0,
-             entry_zone=(1480.0, 1520.0)):
+             entry_zone=(1480.0, 1520.0), holding_days=None):
     rec = {
         "status": status,
         "action": action,
@@ -64,6 +66,8 @@ def _payload(code, *, action, status="ok", confidence=0.6,
         "review_date": "2026-12-15",
         "position_fraction": position_fraction,
         "horizon_days": list(horizon) if horizon else None,
+        # issue #144：实际持有交易日数（结构化事实，渲染层只读它）
+        "holding_days": holding_days,
         "entry_zone": list(entry_zone) if entry_zone else None,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
@@ -109,6 +113,7 @@ def test_hold_holding_main_row():
     payload = _payload(
         "600519", action="hold", position_fraction=0.2,
         signal=_signal(position_state="holding", last_buy_age=7),
+        holding_days=7,
         reason=["持有中（第 7/20 个交易日，入场 2026-11-06 @ 1450）；未触发风控"],
     )
     assert _main_row(render_advice(payload)) == (
@@ -119,6 +124,7 @@ def test_hold_holding_overdue_appends_plain_note():
     payload = _payload(
         "600519", action="hold",
         signal=_signal(position_state="holding", last_buy_age=25),
+        holding_days=25,
         reason=["持有中（第 25/20 个交易日，入场 2026-10-10 @ 1450）；未触发风控"],
     )
     assert _main_row(render_advice(payload)) == (
@@ -130,11 +136,14 @@ def test_holding_days_come_from_policy_fact_not_signal_age():
     """持仓期间出现新买点信号时 last_buy_age 会重置，不能拿它当持有天数。
 
     真实 600519 payload：``signal.last_buy_age=2``，但策略引擎已持有 21 个
-    交易日；主行必须与 ``action_reason`` 的「第 21/20 个交易日」一致。
+    交易日；主行必须与结构化字段 ``recommendation.holding_days``（来源
+    ``policy.run_policy`` 的 ``bars_held``）一致，而不是 ``last_buy_age``，
+    也不看 ``action_reason`` 文本（issue #144）。
     """
     payload = _payload(
         "600519", action="hold",
         signal=_signal(position_state="holding", last_buy_age=2),
+        holding_days=21,
         reason=["持有中（第 21/20 个交易日，入场 2026-10-19 @ 1450）"
                 "；已超建议持有期 1 日（不强制退出）；未触发风控"],
     )
@@ -193,6 +202,7 @@ def _five_rows():
         "hold_holding": _main_row(render_advice(_payload(
             "600519", action="hold",
             signal=_signal(position_state="holding", last_buy_age=7),
+            holding_days=7,
             reason=["持有中（第 7/20 个交易日，入场 2026-11-06 @ 1450）"]))),
         "hold_flat": _main_row(render_advice(_payload(
             "600519", action="hold", reason=["策略当前空仓；今日无合格买点"]))),
@@ -263,5 +273,6 @@ def test_json_keys_still_present_after_render():
     render_advice(payload)
     rec = payload["recommendation"]
     for key in ("target_position", "position_fraction", "horizon_days",
-                "review_date", "entry_zone", "stop_loss", "take_profit"):
+                "holding_days", "review_date", "entry_zone", "stop_loss",
+                "take_profit"):
         assert key in rec

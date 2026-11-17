@@ -595,6 +595,7 @@ def advise_internal(code, type_hint='auto', start=None, opt='grid', jobs=1,
             'confidence': round(confidence, 3),
             'position_fraction': round(position_fraction, 3),
             'horizon_days': [HORIZON, HORIZON],
+            'holding_days': policy_block.get('bars_held'),  # issue #144: bars_held 原值透传，不重新推导
             'entry_zone': entry_zone,
             'stop_loss': stops['stop_loss'],
             'take_profit': stops['take_profit'],
