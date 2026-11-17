@@ -9,11 +9,11 @@
     「本次触发为风控止损；最近一次卖点参考价 P（D 收盘），非本次触发价」；
   - 无法判断来源 → 只写日期 + 「历史参考价」，不得暗示与本次触发相关；
   - 样本内无历史卖点 → 写「样本内无历史卖点」，不编造价格。
-* ``position_fraction`` 非空且 > 0 就写「建议仓位 {x}%」；``target_position
-  == 0`` 或 ``action`` 为 ``sell`` / ``avoid`` 时**追加**「目标仓位 0%」，
-  顺序固定为「建议仓位 …｜目标仓位 0%」，且不得出现「建议仓位 0%｜目标仓位
-  0%」的重复。
-* ``entry_zone`` 为 null 时保留「入场区 —」占位；
+* issue #142 起主行按动作裁剪：仓位只随 ``buy`` 以「仓位约」出现；持有
+  天数只随 ``hold`` + ``position_state=holding`` 出现；``sell`` / ``avoid`` /
+  空仓 ``hold`` 不再并列「建议仓位」「目标仓位」「持有 N 日」「复审日」。
+* ``buy`` 的 ``entry_zone`` 为 null 时保留「入场区 —」占位；``sell`` 不显示
+  入场区（issue #132 / #142）；
 * 渲染层不修改入参（``--json`` 既有字段与含义不变，本次未新增 JSON 字段）。
 
 测试标的固定为 ``600519`` / ``600000``，不使用任何真实持仓代码。
@@ -112,11 +112,9 @@ def test_snapshot_triggered_buy_uses_today_reference_price():
     )
     assert render_advice(payload) == "\n".join([
         "600519 示例标的 现价 1500",
-        "动作 buy｜置信 70%（中）",
-        "建议仓位 20%｜持有 20 日，2026-12-15 复审",
+        "可买，仓位约 20%｜置信 70%（中）｜入场区 1480-1520｜止损 1430｜止盈 1600",
         "触发：均线趋势(3-5-8) 买信号已触发"
         "（参考价 1490（2026-11-17 收盘），本次触发价）",
-        "价位：入场区 1480-1520｜止损 1430｜止盈 1600",
         "依据：今日（2026-11-17）触发买点",
         f"免责声明：{DISCLAIMER}",
     ])
@@ -135,9 +133,7 @@ def test_snapshot_untriggered_has_no_trigger_line():
     )
     assert render_advice(payload) == "\n".join([
         "600519 示例标的 现价 1500",
-        "动作 hold｜置信 60%（中）",
-        "建议仓位 50%｜持有 20 日，2026-12-15 复审",
-        "价位：入场区 1480-1520｜止损 1430｜止盈 1600",
+        "暂不买（无合格买点）｜置信 60%（中）",
         "依据：策略当前空仓；今日无合格买点",
         f"免责声明：{DISCLAIMER}",
     ])
@@ -145,8 +141,8 @@ def test_snapshot_untriggered_has_no_trigger_line():
     assert "距触发" not in render_advice(payload)
 
 
-def test_snapshot_sell_risk_exit_keeps_suggestion_and_target():
-    """sell（风控止损）：建议仓位与目标 0% 并列，参考价标为历史卖点。"""
+def test_snapshot_sell_risk_exit_hides_position_and_horizon():
+    """sell（风控止损）：主行只写卖出原因 + 止损/止盈，不展示仓位/持有期。"""
     payload = _stock_payload(
         "600000",
         _recommendation(action="sell", confidence=0.65,
@@ -166,21 +162,21 @@ def test_snapshot_sell_risk_exit_keeps_suggestion_and_target():
     output = render_advice(payload)
     assert output == "\n".join([
         "600000 示例标的 现价 12",
-        "动作 sell｜置信 65%（中）",
-        "建议仓位 0.2%｜目标仓位 0%｜持有 20 日，2026-12-15 复审",
+        "卖出（风控止损）｜置信 65%（中）｜止损 11.5｜止盈 13.5",
         "触发：均线趋势(3-5-8) 卖信号已触发"
         "（本次触发为风控止损；最近一次卖点参考价 18"
         "（2026-09-24 收盘），非本次触发价）",
-        "价位：入场区 —｜止损 11.5｜止盈 13.5",
         "依据：今日（2026-11-17）触发止损，目标仓位 0%",
         f"免责声明：{DISCLAIMER}",
     ])
-    assert "建议仓位 0%" not in output
+    row = output.splitlines()[1]
+    for word in ("建议仓位", "目标仓位", "持有", "复审", "入场区"):
+        assert word not in row
     assert "距触发" not in output
 
 
-def test_snapshot_avoid_zero_target_and_entry_zone_placeholder():
-    """avoid：无建议仓位，只写目标仓位 0%；无价位仍保留入场区占位。"""
+def test_snapshot_avoid_has_only_plain_reason():
+    """avoid：只写「不参与（原因）」；仓位/持有期/价位一律不出现。"""
     payload = _stock_payload(
         "600000",
         _recommendation(action="avoid", confidence=0.0,
@@ -194,13 +190,13 @@ def test_snapshot_avoid_zero_target_and_entry_zone_placeholder():
     output = render_advice(payload)
     assert output == "\n".join([
         "600000 示例标的 现价 12",
-        "动作 avoid｜置信 0%（低）",
-        "目标仓位 0%",
-        "价位：入场区 —",
+        "不参与（不可交易或结果不可信）｜置信 0%（低）",
         "依据：不可交易或结果不可信，建议不参与",
         f"免责声明：{DISCLAIMER}",
     ])
-    assert "建议仓位" not in output
+    row = output.splitlines()[1]
+    for word in ("建议仓位", "目标仓位", "持有", "复审", "入场区"):
+        assert word not in row
 
 
 def test_snapshot_fund_risk_exit_distinguishes_historical_sell_point():
@@ -234,17 +230,17 @@ def test_snapshot_fund_risk_exit_distinguishes_historical_sell_point():
     output = render_advice(payload)
     assert output == "\n".join([
         "600000 现价 2.6",
-        "动作 sell｜置信 60%（中）",
-        "建议仓位 0.2%｜目标仓位 0%｜持有 20 日，2026-12-15 复审",
+        "卖出（风控止盈）｜置信 60%（中）｜止损 2.5｜止盈 2.8",
         "触发：场外基金净值 卖信号已触发"
         "（本次触发为风控止盈；最近一次卖点参考价 4.0527"
         "（2026-09-24 收盘），非本次触发价）",
-        "价位：入场区 —｜止损 2.5｜止盈 2.8",
         "依据：今日（2026-11-17）触发止盈，目标仓位 0%",
         f"免责声明：{DISCLAIMER}",
     ])
     assert "距触发" not in output
-    assert "建议仓位 0%" not in output
+    row = output.splitlines()[1]
+    for word in ("建议仓位", "目标仓位", "持有", "复审", "入场区"):
+        assert word not in row
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +345,13 @@ def test_trigger_reference_without_signal_block_is_date_unknown():
 
 
 # ---------------------------------------------------------------------------
-# 建议仓位 / 目标仓位
+# 主行按动作裁剪（issue #142 起取代「建议仓位 / 目标仓位」并列）
 # ---------------------------------------------------------------------------
-def test_position_zero_target_keeps_suggestion_first():
-    """空仓 hold（target=0）不再丢仓位信息；顺序固定「建议仓位｜目标仓位」。"""
+_FORBIDDEN_ON_FLAT_OR_SELL = ("建议仓位", "目标仓位", "持有", "复审")
+
+
+def test_hold_flat_hides_sizing_and_horizon():
+    """空仓 hold：即使 position_fraction=0.5 也只在 buy 显示「仓位约」。"""
     payload = _stock_payload(
         "600519",
         _recommendation(action="hold", target_position=0.0,
@@ -360,12 +359,14 @@ def test_position_zero_target_keeps_suggestion_first():
                         signal=_signal(state="neutral"),
                         action_reason=["策略当前空仓；今日无合格买点"]),
     )
-    lines = render_advice(payload).splitlines()
-    assert lines[2] == "建议仓位 50%｜目标仓位 0%｜持有 20 日，2026-12-15 复审"
+    row = render_advice(payload).splitlines()[1]
+    assert row == "暂不买（无合格买点）｜置信 60%（中）"
+    for word in _FORBIDDEN_ON_FLAT_OR_SELL:
+        assert word not in row
 
 
-def test_position_zero_fraction_has_no_duplicate_zero():
-    """avoid + position_fraction=0：只有「目标仓位 0%」，不重复建议仓位 0%。"""
+def test_avoid_never_shows_position_or_levels():
+    """avoid：不显示仓位/持有期/价位，只写原因。"""
     payload = _stock_payload(
         "600000",
         _recommendation(action="avoid", target_position=0.0,
@@ -373,14 +374,14 @@ def test_position_zero_fraction_has_no_duplicate_zero():
                         signal=_signal(state="neutral"),
                         action_reason=["不可交易或结果不可信，建议不参与"]),
     )
-    output = render_advice(payload)
-    assert "目标仓位 0%" in output
-    assert "建议仓位 0%" not in output
-    assert "建议仓位 0%｜目标仓位 0%" not in output
+    row = render_advice(payload).splitlines()[1]
+    assert row == "不参与（不可交易或结果不可信）｜置信 60%（中）"
+    for word in _FORBIDDEN_ON_FLAT_OR_SELL + ("入场区", "止损", "止盈"):
+        assert word not in row
 
 
-def test_position_tiny_fraction_does_not_render_zero_duplicate():
-    """极小正仓位显示为 0% 时抑制建议仓位，避免「0%｜0%」重复。"""
+def test_sell_never_shows_position_horizon_or_entry_zone():
+    """sell：风控类型进主行，仓位/持有期/入场区不出现。"""
     payload = _stock_payload(
         "600000",
         _recommendation(action="sell", target_position=0.0,
@@ -392,22 +393,23 @@ def test_position_tiny_fraction_does_not_render_zero_duplicate():
         triggers=[{"indicator": "均线趋势(3-5-8)", "state": "sell_triggered",
                    "buy_price": None, "sell_price": 18.0}],
     )
-    output = render_advice(payload)
-    assert "建议仓位 0%" not in output
-    assert "建议仓位 0%｜目标仓位 0%" not in output
-    assert "目标仓位 0%" in output
+    row = render_advice(payload).splitlines()[1]
+    assert row == "卖出（风控止损）｜置信 60%（中）｜止损 1430｜止盈 1600"
+    for word in _FORBIDDEN_ON_FLAT_OR_SELL + ("入场区",):
+        assert word not in row
 
 
-def test_position_positive_fraction_without_zero_target_is_unchanged():
-    """非 0 目标仓位：保持原「建议仓位 {x}%」措辞，不追加目标仓位。"""
+def test_buy_keeps_position_even_when_target_position_is_one():
+    """buy：建议仓位以「仓位约」出现；目标仓位不再并列。"""
     payload = _stock_payload(
         "600519",
-        _recommendation(action="hold", target_position=1.0,
+        _recommendation(action="buy", target_position=1.0,
                         position_fraction=0.15),
     )
-    output = render_advice(payload)
-    assert "建议仓位 15%" in output
-    assert "目标仓位" not in output
+    row = render_advice(payload).splitlines()[1]
+    assert row.startswith("可买，仓位约 15%｜置信 60%（中）｜入场区 1480-1520")
+    assert "建议仓位" not in row
+    assert "目标仓位" not in row
 
 
 # ---------------------------------------------------------------------------

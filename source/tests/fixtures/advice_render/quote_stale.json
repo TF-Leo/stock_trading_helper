@@ -44,6 +44,15 @@
     "status": "ok",
     "action": "hold",
     "action_reason": ["持有中（第 8/20 个交易日，入场 2026-11-02 @ 24.90）；未触发风控"],
+    "signal": {
+      "strategy": "示例策略",
+      "indicator": "均线趋势(3-5-8)",
+      "position_state": "holding",
+      "state": "neutral",
+      "as_of": "2026-11-12",
+      "last_buy_date": "2026-11-02",
+      "last_buy_age": 8
+    },
     "target_position": 1.0,
     "review_date": "2026-12-10",
     "confidence": 0.6,

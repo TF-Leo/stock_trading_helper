@@ -1158,9 +1158,30 @@ source/.venv/bin/python cli.py 600519 --json --fast \
 `source/stock_analysis/advice_render.py` 的模块 docstring。`--compact` 只压缩
 `diagnostics.warnings`，其余行与默认输出逐字节一致。
 
+### 建议主行（按动作裁剪，issue #142）
+
+每票的主行只回答「现在做什么」，不再把 `position_fraction` /
+`target_position` / `horizon_days` / `review_date` 四个内部字段并列倒给用户：
+
+| 动作 | 主行 |
+| --- | --- |
+| `buy` | `可买，仓位约 15%｜置信 72%（中）｜入场区 11.8-12.2｜止损 11｜止盈 13.5` |
+| `hold` + `position_state=holding` | `继续持有（第 7 个交易日）｜置信 64%（中）｜止损 23.8｜止盈 29`；超过建议持有期时追加 `已超建议持有期 M 日（不强制退出）` |
+| `hold` + 空仓 | `暂不买（无合格买点）｜置信 43.5%（低）` |
+| `sell` | `卖出（风控止损）｜置信 2.1%（低）｜止损 2.2｜止盈 2.86`（不显示入场区） |
+| `avoid` / 不可交易 | `不参与（不可交易）｜置信 0%（低）` |
+
+硬规则：**「仓位」只在 `buy` 出现**；**「持有 N 个交易日」只在 hold-holding
+出现**；`sell` / `avoid` / 空仓 `hold` 不出现「建议仓位」「目标仓位」「持有
+N 日」「复审日」。持有天数取 `action_reason` 已有的「第 N/M 个交易日」
+（策略引擎的 `bars_held`），超期天数 = `N - horizon_days[0]`；**不用**
+`signal.last_buy_age`（持仓期间的新买点信号会把它重置，实测同一 payload
+出现 `last_buy_age=2` 而实际已持有 21 个交易日）。渲染层不重算判定，
+`--json` 结构与既有键保持不变。
+
 ### 置信分级（只映射已有数值）
 
-动作行输出 `动作 hold｜置信 63%（中）`。分级阈值是模块常量：
+主行输出 `暂不买（无合格买点）｜置信 63%（中）`。分级阈值是模块常量：
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
@@ -1187,7 +1208,7 @@ include_regime_note=True)`；命令行对应 `--no-disclaimer` / `--no-regime-no
 这一行，**不影响**任何判定或其他行；`include_disclaimer=False` 只去掉末尾免责行；
 `⚠️ 数据:` 告警与「今日不建议执行」闸门**不受这两个开关影响**。
 
-渲染的上下文行：仓位/持有期/复审日（T1）、可执行性闸门（T2）、regime 冲突（T3）、
+渲染的上下文行：按动作裁剪的建议主行（T1 / issue #142）、可执行性闸门（T2）、regime 冲突（T3）、
 估值分位（T4）、资金流方向（T5），以及**交易所重点监控命中（T6）**——
 `evidence.market_watch.hit.listed is True` 时输出
 `🚫 交易所重点监控（{start}~{end}）`，位置在可执行性闸门之后、价格/建议行之前。

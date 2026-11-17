@@ -4,7 +4,7 @@
 对应 ``docs/ASTOCK_GAP_INVENTORY.md`` 的 T1–T5（issue #1 的 R11 Top 5）：
 
 ========  ==========================================================
-T1        建议仓位 / 持有期 / 复审日（``recommendation.*``）+ 触发事实
+T1        按动作裁剪的建议主行（``recommendation.*``，issue #142）+ 触发事实
           （``evidence.triggers[]`` / ``recommendation.distance_to_trigger``）
 T2        可执行性闸门 + 数据新鲜度（``instrument.*`` / ``diagnostics.warnings``）
 T3        个股 regime 与指数 regime 的口径冲突（``market_regime.index``）
@@ -22,7 +22,11 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
 * **纯函数**：``render_advice(payload)`` 不修改入参、不读写文件、**不发起任何
   网络请求**（本模块只 import 标准库）。
 * **只描述事实**：不重算 ``action`` / ``confidence`` / 价位，不把建议写成下单
-  指令；仓位一律写作「建议仓位」。
+  指令。主行按动作裁剪（issue #142）：``buy`` 写「可买，仓位约 {x}%」，
+  ``hold`` + ``holding`` 写「继续持有（第 N 个交易日）」并只在超期时追加
+  「已超建议持有期 M 日（不强制退出）」，空仓 ``hold`` 写「暂不买（无合格
+  买点）」，``sell`` 写「卖出（{风控类型}）」，``avoid`` / 不可交易写
+  「不参与（{原因}）」。
 * **可关闭的解释性文本**：``include_disclaimer`` / ``include_regime_note``
   默认 ``True``（保持既有投递口径，向后兼容）；自用场景可关掉免责行与
   「大盘逆风/顺风」括注。**数据正确性告警（``⚠️ 数据:``）与「今日不建议
@@ -42,13 +46,16 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
 字段口径直接沿用 CLI 当前 JSON（``cli.py`` 的成功/错误响应同构）：
 
 * ``position_fraction`` 是「策略建议权重」（小数，0.15 = 15%），不是用户应买
-  金额；文案必须保留「建议仓位」四个字。**只要它非空且 > 0 就显示
-  「建议仓位 {x}%」**（含空仓 hold：``target_position == 0`` 不等于「没有仓
-  位信息」）。动作后目标仓位为 0（``target_position == 0`` 或 ``action`` 为
-  ``sell`` / ``avoid``）时**追加**「目标仓位 0%」，顺序固定为
-  「建议仓位 …｜目标仓位 0%」。显示为 ``0%`` 的极小正仓位不输出建议仓位，
-  避免出现「建议仓位 0%｜目标仓位 0%」的重复（issue #132 复验）。
-* ``horizon_days`` 当前是 ``[20, 20]``（低/高），渲染取第一个正值。
+  金额。issue #142 起它**只在 ``action=buy`` 的主行**以「可买，仓位约
+  {x}%」出现；空仓 ``hold``、``sell``、``avoid`` 一律不显示（字段值仍保留在
+  JSON 与 `依据：` 明细里）。非正数与显示为 ``0%`` 的极小正仓位整段省略。
+* ``target_position`` / ``review_date`` **不再进入主行**（issue #142）。
+* ``horizon_days`` 当前是 ``[20, 20]``（低/高），渲染取第一个正值。它只用于
+  ``hold`` + ``position_state=holding`` 的「继续持有（第 N 个交易日）」超期
+  判断：``N`` 取 ``action_reason`` 已写出的「第 N/M 个交易日」（策略引擎的
+  ``bars_held``）；``N > horizon`` 时追加「已超建议持有期 N-horizon 日
+  （不强制退出）」。**不能**用 ``signal.last_buy_age`` 代替——持仓期间出现
+  新买点信号时它会重置（实测 600519：2 vs 实际 21）。渲染层不重算判定。
 * ``instrument.limit_up`` / ``limit_down`` 是**价格**，不是布尔。一字板优先
   读取显式字段 ``instrument.one_word_limit``（``"up"`` / ``"down"``），缺失时
   才从 ``diagnostics.warnings`` 里识别 CLI 已写入的「一字涨停/一字跌停」事实。
@@ -71,9 +78,10 @@ T8        腾讯报价的量比 / 换手（``instrument.turnover_rate_pct`` /
     风控离场则写「本次触发为风控止损；样本内无历史卖点」，否则整条消失。
 
   未触发态本就没有这一行，语义不变。
-* ``recommendation.entry_zone`` 为 ``null``（例如 ``action=sell`` 按设计不
-  给入场区）时，价位行仍保留「入场区 —」占位，不能把字段名整段丢掉——读者
-  需要区分「缺数据」与「不适用」（issue #132）。
+* ``recommendation.entry_zone`` 只在 ``buy`` 主行显示；为 ``null`` 时保留
+  「入场区 —」占位，不能把字段名整段丢掉——读者需要区分「缺数据」与
+  「不适用」（issue #132）。``hold-holding`` / ``sell`` 按 #142 不显示入场区，
+  ``avoid`` / 空仓 ``hold`` 不显示任何价位。
 * ``instrument.is_suspended`` 为 ``None`` 表示**无法判断**（盘前集合竞价前
   的正常现象），绝不能当成「确认停牌」；只有 ``True`` 才进不可执行闸门。
 * 名称优先取 ``instrument.display_name`` / 顶层 ``display_name``，其次
@@ -869,25 +877,19 @@ def _confidence_grade(value) -> Optional[str]:
     return CONFIDENCE_GRADE_LABELS["low"]
 
 
-def _action_line(rec: Dict[str, Any]) -> Optional[str]:
-    """``动作 {action}｜置信 {pct}（{分级}）``。
+def _confidence_segment(rec: Dict[str, Any]) -> Optional[str]:
+    """``置信 {pct}（{分级}）``；置信缺失时整段消失。
 
     置信与分级都只展示 ``recommendation.confidence`` 的**已有数值**：分级是
     常量阈值的查表映射（:data:`CONFIDENCE_HIGH_MIN` /
     :data:`CONFIDENCE_MEDIUM_MIN`），渲染层不重算、不调整。百分数向下取整到
     1 位小数（见 :func:`_fmt_confidence_pct`），使显示档位与分级恒一致。
-    置信缺失时整段「置信 …」消失，绝不编造数值或分级。
     """
-    action = _text(rec.get("action"))
     confidence = _fmt_confidence_pct(rec.get("confidence"))
+    if not confidence:
+        return None
     grade = _confidence_grade(rec.get("confidence"))
-    parts = []
-    if action:
-        parts.append(f"动作 {action}")
-    if confidence:
-        parts.append(f"置信 {confidence}（{grade}）" if grade
-                     else f"置信 {confidence}")
-    return "｜".join(parts) or None
+    return f"置信 {confidence}（{grade}）" if grade else f"置信 {confidence}"
 
 
 #: 已触发状态 → (用户可读方向, 触发价字段, 参考价所属点位, 信号日期字段)。
@@ -1003,67 +1005,177 @@ def _trigger_line(payload: Dict[str, Any]) -> Optional[str]:
     return "触发：" + "；".join(parts) if parts else None
 
 
-def _position_line(rec: Dict[str, Any]) -> Optional[str]:
-    """T1：建议仓位 / 目标仓位 / 持有期 / 复审日；缺失段整体消失。
+def _position_suggestion(rec: Dict[str, Any]) -> Optional[str]:
+    """买入时的建议仓位；缺失 / 非正 / 显示为 ``0%`` 时整段消失。
 
-    ``position_fraction`` 非空且 > 0 时**总是**输出「建议仓位 {w}%」——空仓
-    ``hold`` 的 ``target_position`` 也是 0，不能因此丢掉仓位信息。动作后目标
-    仓位为 0（``target_position == 0`` 或 ``action`` 为 ``sell`` / ``avoid``）
-    时再**追加**「目标仓位 0%」，顺序固定为「建议仓位 …｜目标仓位 0%」。
-    显示为 ``0%`` 的极小正仓位不输出建议仓位，避免出现
-    「建议仓位 0%｜目标仓位 0%」的重复（issue #132 复验）。
+    ``position_fraction`` 是 sizing 的**假设值**（0.15 = 15%），只在 ``buy``
+    的主行以「仓位约」出现；其余动作一律不显示（issue #142）。极小正仓位
+    显示为 ``0%`` 时同样抑制，避免写出「仓位约 0%」。
     """
-    parts = []
     fraction = _num(rec.get("position_fraction"))
-    suggestion = (_fmt_pct(fraction)
-                  if fraction is not None and fraction > 0 else None)
-    if suggestion == "0%":  # 极小正数显示为 0%，与目标 0% 并列会重复。
-        suggestion = None
-    if suggestion is not None:
-        parts.append(f"建议仓位 {suggestion}")
-
-    action = _text(rec.get("action"))
-    target = _num(rec.get("target_position"))
-    zero_target = (action in ("sell", "avoid")
-                   or (target is not None and target == 0.0))
-    if zero_target:
-        parts.append("目标仓位 0%")
-
-    horizon = _horizon_value(rec)
-    review_date = _date_text(rec.get("review_date"))
-    if horizon is not None:
-        text = f"持有 {horizon} 日"
-        if review_date:
-            text += f"，{review_date} 复审"
-        parts.append(text)
-    elif review_date:
-        parts.append(f"{review_date} 复审")
-    return "｜".join(parts) or None
+    if fraction is None or fraction <= 0:
+        return None
+    suggestion = _fmt_pct(fraction)
+    if suggestion == "0%":
+        return None
+    return suggestion
 
 
-def _levels_line(rec: Dict[str, Any]) -> Optional[str]:
-    """价位原样展示（不重算）；``entry_zone`` 为 null 时保留占位。
+def _level_parts(rec: Dict[str, Any], *, include_entry: bool) -> List[str]:
+    """主行价位段（原样展示，不重算）；缺失时保留字段名 +「—」占位。
 
-    ``entry_zone`` 对 ``action=sell`` 按设计为 null —— 这是「不适用」而不是
-    「没取到」，所以字段名必须留在价位行里（写作「入场区 —」），否则读者
-    无法区分两者（issue #132）。止损/止盈缺失时价位行仍只保留入场区占位。
+    * ``buy`` 显示入场区；``hold-holding`` / ``sell`` 只显示止损/止盈；
+    * 其余动作没有价位段（issue #142）；
+    * ``entry_zone`` 对 ``sell`` 按设计为 null，字段整段不出现；买入时 null
+      则保留「入场区 —」占位，区分「不适用」与「缺数据」（issue #132）。
     """
-    parts = []
-    zone = rec.get("entry_zone")
-    lower = upper = None
-    if isinstance(zone, (list, tuple)) and len(zone) == 2:
-        lower, upper = _fmt_num(zone[0]), _fmt_num(zone[1])
-    if lower is not None and upper is not None:
-        parts.append(f"入场区 {lower}-{upper}")
-    else:
-        parts.append("入场区 —")
+    parts: List[str] = []
+    if include_entry:
+        zone = rec.get("entry_zone")
+        lower = upper = None
+        if isinstance(zone, (list, tuple)) and len(zone) == 2:
+            lower, upper = _fmt_num(zone[0]), _fmt_num(zone[1])
+        if lower is not None and upper is not None:
+            parts.append(f"入场区 {lower}-{upper}")
+        else:
+            parts.append("入场区 —")
     stop_loss = _fmt_num(rec.get("stop_loss"))
-    if stop_loss is not None:
-        parts.append(f"止损 {stop_loss}")
+    parts.append(f"止损 {stop_loss}" if stop_loss is not None else "止损 —")
     take_profit = _fmt_num(rec.get("take_profit"))
-    if take_profit is not None:
-        parts.append(f"止盈 {take_profit}")
-    return "价位：" + "｜".join(parts) if parts else None
+    parts.append(f"止盈 {take_profit}" if take_profit is not None else "止盈 —")
+    return parts
+
+
+#: ``action_reason`` 结尾的劝告语（主行已写「不参与」，原因段不再重复）。
+_AVOID_SUFFIX_RE = re.compile(r"[，,；;]?\s*(?:建议)?不参与\s*$")
+
+
+#: ``action_reason`` 里策略引擎写出的实际持有交易日数（``decision/render.py``）。
+_HOLD_DAYS_RE = re.compile(r"第\s*(\d+)\s*/\s*\d+\s*个交易日")
+
+
+def _holding_days(rec: Dict[str, Any]) -> Optional[int]:
+    """实际持有交易日数 ``N``；只读已有事实，不重新计算。
+
+    权威值在 ``action_reason`` 的「持有中（第 N/M 个交易日…）」里（由
+    ``policy.run_policy`` 的 ``bars_held`` 写出）。**不能**用
+    ``signal.last_buy_age`` 代替：持仓期间出现新的买点信号时，后者会被重置
+    为距最近买点的天数（实测 600519：last_buy_age=2，实际已持有 21 个交易
+    日）。只有 ``action_reason`` 完全缺失该事实时才退回 ``last_buy_age``。
+    """
+    reasons = rec.get("action_reason")
+    if isinstance(reasons, (list, tuple)):
+        for reason in reasons:
+            match = _HOLD_DAYS_RE.search(str(reason or ""))
+            if match:
+                return int(match.group(1))
+    age = _num(_dict(rec.get("signal")).get("last_buy_age"))
+    if age is not None and age >= 1:
+        return int(round(age))
+    return None
+
+
+def _plain_action_reason(rec: Dict[str, Any],
+                         fallback: Optional[str] = None) -> Optional[str]:
+    """动作原因的白话短语；只取 ``action_reason`` 的第一条**已有事实**。
+
+    去掉尾部的「建议不参与」劝告，不新增任何判断；取不到时返回 ``fallback``。
+    """
+    reasons = rec.get("action_reason")
+    if isinstance(reasons, (list, tuple)):
+        for reason in reasons:
+            text = _text(reason)
+            if text:
+                text = _AVOID_SUFFIX_RE.sub("", text).strip()
+                if text:
+                    return text
+                break
+    return fallback
+
+
+def _main_line(rec: Dict[str, Any]) -> Optional[str]:
+    """按动作裁剪的建议主行（issue #142）。
+
+    主行只回答「现在做什么」：
+
+    * ``buy`` → 「可买，仓位约 {x}%」+ 入场区 / 止损 / 止盈；
+    * ``hold`` 且 ``position_state=holding`` → 「继续持有（第 N 个交易日）」
+      + 止损 / 止盈；``N > horizon_days[0]`` 时追加「已超建议持有期 M 日
+      （不强制退出）」；
+    * ``hold`` 且空仓 → 「暂不买（无合格买点）」；
+    * ``sell`` → 「卖出（{风控类型}）」+ 止损 / 止盈，**不显示入场区**；
+    * ``avoid`` / ``untradeable`` / ``insufficient_data`` → 「不参与（{原因}）」。
+
+    硬规则：**「仓位」只在 buy 出现**；**持有天数只在 hold-holding 出现**；
+    sell / avoid / hold-flat 不出现「建议仓位」「目标仓位」「持有 N 日」
+    「复审日」。这些字段的原始值仍保留在 JSON 与 `依据：` 明细里，主行不再
+    并列倾倒。
+
+    ``N`` 取 ``action_reason`` 里策略引擎已写出的「第 N/M 个交易日」事实
+    （``policy.run_policy`` 的 ``bars_held``）；``M = N - horizon_days[0]``。
+    渲染层不重新计算任何判定。**不用** ``signal.last_buy_age`` 代替：持仓
+    期间的新买点信号会把后者重置（实测 600519 ``last_buy_age=2`` 时实际已
+    持有 21 个交易日）。只有 ``action_reason`` 缺失该事实时才退回
+    ``last_buy_age``，见 :func:`_holding_days`。
+    """
+    action = _text(rec.get("action"))
+    signal = _dict(rec.get("signal"))
+    holding = _text(signal.get("position_state")) == "holding"
+
+    head: Optional[str] = None
+    overdue: Optional[str] = None
+    levels: List[str] = []
+
+    if action == "buy":
+        head = "可买"
+        suggestion = _position_suggestion(rec)
+        if suggestion:
+            head += f"，仓位约 {suggestion}"
+        levels = _level_parts(rec, include_entry=True)
+
+    elif action == "sell":
+        # 本项目 sell 只由风控出场产生；``_today_exit_kind`` 在 action_reason
+        # 读不到具体类型时给的是笼统的「风控离场」——主行按 #142 只写「卖出」，
+        # 不把未知类型包装成原因。
+        kind = _today_exit_kind(rec)
+        if kind == "风控离场":
+            kind = None
+        head = f"卖出（{kind}）" if kind else "卖出"
+        levels = _level_parts(rec, include_entry=False)
+
+    elif action == "hold" and holding:
+        days = _holding_days(rec)
+        head = (f"继续持有（第 {days} 个交易日）" if days is not None
+                else "继续持有")
+        levels = _level_parts(rec, include_entry=False)
+        horizon = _horizon_value(rec)
+        if days is not None and horizon is not None and days > horizon:
+            overdue = f"已超建议持有期 {days - horizon} 日（不强制退出）"
+
+    elif action == "hold":
+        head = "暂不买（无合格买点）"
+
+    elif action in ("avoid", "untradeable"):
+        fallback = ("不可交易" if _text(rec.get("status")) == "untradeable"
+                    else None)
+        reason = _plain_action_reason(rec, fallback)
+        head = f"不参与（{reason}）" if reason else "不参与"
+
+    elif action == "insufficient_data":
+        reason = _plain_action_reason(rec, "数据不足")
+        head = f"不参与（{reason}）"
+
+    if head is None:
+        return None
+
+    parts = [head]
+    if overdue:
+        parts.append(overdue)
+    confidence = _confidence_segment(rec)
+    if confidence:
+        parts.append(confidence)
+    parts.extend(levels)
+    return "｜".join(parts)
 
 
 #: ``status == "no_edge"`` 的白话解释（不写预测、不作保证）。
@@ -1625,13 +1737,11 @@ def render_advice(payload: dict, compact: bool = False, *,
     if turnover:
         lines.append(turnover)
 
-    action = _action_line(rec)
-    if action:
-        lines.append(action)
-
-    position = _position_line(rec)
-    if position:
-        lines.append(position)
+    # T1（issue #142）：主行按动作裁剪 —— 只写「现在做什么」+ 该动作适用的
+    # 价位；建议仓位只随 buy、持有天数只随 hold-holding 出现。
+    main_line = _main_line(rec)
+    if main_line:
+        lines.append(main_line)
 
     # T1：触发事实放在建议行之后、依据行之前；无已触发信号则整行消失。
     trigger = _trigger_line(document)
@@ -1645,10 +1755,6 @@ def render_advice(payload: dict, compact: bool = False, *,
     st_note = _st_note(inst, rec)
     if st_note:
         lines.append(st_note)
-
-    levels = _levels_line(rec)
-    if levels:
-        lines.append(levels)
 
     if include_regime_note:
         regime = _regime_line(document)
