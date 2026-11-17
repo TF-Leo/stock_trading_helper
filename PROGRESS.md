@@ -42,7 +42,7 @@
   - `python tools/probe.py all-quick` → 退出码 0；41 项中 **34 PASS /
     5 SKIP（-Quick 跳过）/ 1 FAIL / 1 BLOCKED**（FAIL=`error_shape`：错误路径缺
     `diagnostics.source_attempts[]` 六键；BLOCKED=`as_of`：本 worktree 无
-    `stock_analysis/data/stock_002415_qfq.csv`。两项均为 #133 已记录的既有
+    `stock_analysis/data/stock_600519_qfq.csv`。两项均为 #133 已记录的既有
     环境问题，与渲染层改动无因果关系）。
   - **门禁说明**：本机无 `pwsh`，无法执行 `tools/check_gates.ps1`；以全量
     pytest + `tools/probe.py all-quick` 作为运行时裁定器（与前几轮同）。
