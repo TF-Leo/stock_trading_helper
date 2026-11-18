@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
-"""盘前简报 v2（issue #149）的离线测试。
+"""盘前简报 v2（issue #149 / #150 复验）的离线测试。
 
 覆盖：
 * 五形态快照：买入 / 继续持有 / 暂不买 / 卖出 / 不参与；
+* 三种数据状态快照：正常 / 部分标的取数失败 / 全部失败（含空输入）；
 * 结论行计数：0 条 →「今天不用动」，N 条 →「今天有 N 件事要做」；
-* 术语黑名单扫描 0 命中（名称属于白名单）；
+* 全部失败不得出现「不用动」类结论；CLI 退出码 4；
+* 低把握只有一种口径（`模型把握低（x%）`），不再写「没出现买点」；
+* 超期持仓：条目补全「建议持有 N 个交易日，已超 M 日」，结论带「有 N 只
+  已超建议持有期」；
+* 买入条带「入场区 / 止损」，卖出条保持止损 / 止盈；
+* 术语黑名单扫描 0 命中（名称属于白名单），并覆盖新增的
+  `信号族 / 显著 / 胜率 / 相关性`；
 * 空仓/持仓提示互斥：空仓无卖出提示、持仓无买入提示；矛盾 payload 被忽略
   并在数据行说明；
 * 价格 2 位小数、百分比最多 1 位；
@@ -31,6 +38,10 @@ if str(SRC) not in sys.path:
 
 from stock_analysis.daily_brief import (  # noqa: E402
     CONFIDENCE_EXPLAIN,
+    DATA_STATUS_NO_DATA,
+    DATA_STATUS_OK,
+    DATA_STATUS_PARTIAL,
+    data_status,
     find_banned_terms,
     render_daily_brief,
 )
@@ -115,6 +126,30 @@ def _avoid() -> dict:
                     suspension=True)
 
 
+def _error_payload(code: str, name: str = "") -> dict:
+    """与 ``create_error_response(status='data_source_error')`` 同构。"""
+    message = "行情拉取失败（渠道池全失败且无可用缓存）"
+    payload = _payload(code, name, action="insufficient_data",
+                       position="flat", confidence=0.0, price=None,
+                       status="data_source_error")
+    payload["data"].update({"bars": 0, "last_close": None})
+    payload["recommendation"]["action_reason"] = [message]
+    payload["diagnostics"]["warnings"] = [message]
+    return payload
+
+
+def _insufficient_payload(code: str, name: str = "") -> dict:
+    """取到了数据但根数不够（``status='insufficient_data'``）。"""
+    message = "数据不足（仅 50 根 < 100）"
+    payload = _payload(code, name, action="insufficient_data",
+                       position="flat", confidence=None, price=12.3,
+                       status="insufficient_data")
+    payload["data"].update({"bars": 50})
+    payload["recommendation"]["action_reason"] = [message]
+    payload["diagnostics"]["warnings"] = [message]
+    return payload
+
+
 def _render(*payloads) -> str:
     return render_daily_brief(list(payloads), date=DATE)
 
@@ -128,7 +163,8 @@ def test_snapshot_buy():
         "\n"
         "结论：今天有 1 件事要做。\n"
         + CONFIDENCE_EXPLAIN + "\n"
-        "- 示例白酒 1820.50：买入，今天出现了买点，仓位约 15%（把握 高，82%）。"
+        "- 示例白酒 1820.50：买入，今天出现了买点，入场区 11.80–12.20，"
+        "止损 11.00，仓位约 15%（把握 高，82%）。"
     )
     assert _render(_buy()) == expected
 
@@ -137,9 +173,10 @@ def test_snapshot_holding():
     expected = (
         HEADER + "\n"
         "\n"
-        "结论：今天不用动。\n"
+        "结论：今天不用动；有 1 只已超建议持有期。\n"
         "- 示例白酒 1701.20：继续持有，第 22 个交易日"
-        "（建议 20 日，没跌破止损就不强制卖）。"
+        "（建议持有 20 个交易日，已超 2 日"
+        "（未跌破止损，不强制卖））。"
     )
     assert _render(_holding()) == expected
 
@@ -154,19 +191,42 @@ def test_snapshot_flat():
     assert _render(_flat()) == expected
 
 
-def test_flat_low_grade_without_near_zero_omits_confidence():
-    # 43.6% 是「低」，但模型并非毫无方向：照 issue #149 示例只说不买，
-    # 不把置信百分比塞进每一行。
+def test_flat_low_grade_shows_confidence_not_certainty():
+    # 43.6% 是「低」：必须让读者看见不确定，不能写成确定的「今天没出现买点」。
     payload = _payload("600000", NAMES["600000"], action="hold",
                        position="flat", confidence=0.436, price=21.95)
     text = _render(payload)
-    assert "- 示例银行 21.95：不买，今天没出现买点。" in text
-    assert "把握" not in text
+    assert "- 示例银行 21.95：不买，模型把握低（43.6%）。" in text
+    assert "没出现买点" not in text
+
+
+def test_low_grade_has_a_single_phrasing():
+    # 2.1% 与 43.6% 同属「低」：同一动作只允许一种口径。
+    for confidence in (0.021, 0.347, 0.436):
+        text = _render(_payload("600000", NAMES["600000"], action="hold",
+                                position="flat", confidence=confidence,
+                                price=12.3))
+        assert "不买，模型把握低（" in text
+        assert "没出现买点" not in text
+
+
+def test_flat_medium_grade_keeps_certain_phrasing():
+    text = _render(_flat())  # 0.55 = 中
+    assert "不买，今天没出现买点。" in text
+
+
+def test_flat_without_confidence_never_claims_no_setup():
+    payload = _payload("600000", NAMES["600000"], action="hold",
+                       position="flat", confidence=None, price=12.3)
+    text = _render(payload)
+    assert "不买，模型没给把握。" in text
+    assert "没出现买点" not in text
 
 
 def test_snapshot_flat_low_confidence():
     text = _render(_flat_low_confidence())
-    assert "- 示例银行 12.30：不买，模型也没把握（把握 低，2.1%）。" in text
+    assert "- 示例银行 12.30：不买，模型把握低（2.1%）。" in text
+    assert "模型也没把握" not in text
 
 
 def test_snapshot_sell():
@@ -189,20 +249,81 @@ def test_snapshot_avoid():
     assert _render(_avoid()) == expected
 
 
-def test_snapshot_insufficient_data():
-    payload = _payload("600000", NAMES["600000"], action="insufficient_data",
-                       position="flat", confidence=None, price=12.3,
-                       status="insufficient_data")
-    text = _render(payload)
-    assert "- 示例银行 12.30：不参与，数据不够，今天不给判断。" in text
-    assert "结论：今天不用动。" in text
+def test_snapshot_insufficient_data_as_partial_state():
+    # 一只有结论 + 一只数据不够 → 部分失败：结论写明数量，条目只写状态。
+    text = _render(_flat(), _insufficient_payload("600519", NAMES["600519"]))
+    assert "结论：今天不用动；另有 1 只数据不够。" in text
+    assert "- 示例白酒：数据不够，今天不给判断。" in text
+    line = next(item for item in _item_lines(text) if "数据不够" in item)
+    for word in ("买", "卖", "参与", "观望"):
+        assert word not in line
+
+
+# ---------------------------------------------------------------------------
+# 数据三态（issue #150 复验 P1）
+# ---------------------------------------------------------------------------
+def test_data_status_three_states():
+    assert data_status([]) == DATA_STATUS_NO_DATA
+    assert data_status([_flat()]) == DATA_STATUS_OK
+    assert data_status([_flat(), _error_payload("600519", NAMES["600519"])]) \
+        == DATA_STATUS_PARTIAL
+    assert data_status([_error_payload("600000")]) == DATA_STATUS_NO_DATA
+    assert data_status([_insufficient_payload("600000")]) == DATA_STATUS_NO_DATA
+
+
+def test_snapshot_all_data_failed_never_says_no_action():
+    text = _render(_error_payload("600519", NAMES["600519"]),
+                   _error_payload("600000", NAMES["600000"]))
+    assert text == (
+        HEADER + "\n\n"
+        "结论：今天数据没拿到，无法给出建议。\n"
+        "原因：2 只标的都没取到行情数据。")
+    assert "不用动" not in text
+    assert "数据不够" not in text
+
+
+def test_all_insufficient_is_no_data():
+    text = _render(_insufficient_payload("600519", NAMES["600519"]),
+                   _insufficient_payload("600000", NAMES["600000"]))
+    assert "结论：今天数据没拿到，无法给出建议。" in text
+    assert "原因：2 只标的的行情数据都不够。" in text
+    assert "不用动" not in text
+
+
+def test_mixed_all_failure_reason_mentions_no_usable_data():
+    text = _render(_error_payload("600519", NAMES["600519"]),
+                   _insufficient_payload("600000", NAMES["600000"]))
+    assert "原因：2 只标的都没有可用的行情数据。" in text
+    assert "不用动" not in text
+
+
+def test_partial_data_failure_conclusion_and_item():
+    text = _render(_flat(), _error_payload("600519", NAMES["600519"]))
+    assert "结论：今天不用动；另有 1 只没取到数据。" in text
+    assert "- 示例白酒：今天数据没拿到，没有给出建议。" in text
+    line = next(item for item in _item_lines(text) if "数据没拿到" in item)
+    for word in ("买", "卖", "参与", "观望"):
+        assert word not in line
+
+
+def test_partial_failure_with_action_still_counts_action():
+    text = _render(_buy(), _error_payload("600000", NAMES["600000"]))
+    assert "结论：今天有 1 件事要做；另有 1 只没取到数据。" in text
+
+
+def test_empty_payload_object_is_failure_not_neutral():
+    text = _render({})
+    assert "结论：今天数据没拿到，无法给出建议。" in text
+    assert "不用动" not in text
 
 
 # ---------------------------------------------------------------------------
 # 结论行计数
 # ---------------------------------------------------------------------------
 def test_conclusion_zero_actions():
-    text = _render(_flat(), _holding())
+    other_flat = _payload("600519", NAMES["600519"], action="hold",
+                          position="flat", confidence=0.55, price=12.3)
+    text = _render(_flat(), other_flat)
     assert "结论：今天不用动。" in text
     assert "件事要做" not in text
 
@@ -218,12 +339,81 @@ def test_actions_listed_before_informational_items():
 
 
 # ---------------------------------------------------------------------------
+# 超期持仓 / 买入价位（issue #150 复验 P2-2 / P2-3）
+# ---------------------------------------------------------------------------
+def test_overdue_holding_wording_and_conclusion():
+    text = _render(_holding())
+    assert "- 示例白酒 1701.20：继续持有，第 22 个交易日" in text
+    assert "建议持有 20 个交易日，已超 2 日（未跌破止损，不强制卖）" in text
+    assert "建议 20 日" not in text
+    assert "结论：今天不用动；有 1 只已超建议持有期。" in text
+
+
+def test_not_overdue_holding_has_no_overdue_clause():
+    payload = _payload("600519", NAMES["600519"], action="hold",
+                       position="holding", confidence=0.63, price=1701.2,
+                       holding_days=5)
+    text = _render(payload)
+    assert "（建议持有 20 个交易日）。" in text
+    assert "已超" not in text
+    assert "结论：今天不用动。" in text
+
+
+def test_overdue_count_in_conclusion_with_other_actions():
+    overdue = _payload("600519", NAMES["600519"], action="hold",
+                       position="holding", confidence=0.63, price=1701.2,
+                       holding_days=25)
+    text = _render(_buy(), overdue)
+    assert "结论：今天有 1 件事要做；另有 1 只已超建议持有期。" in text
+
+
+def test_multiple_overdue_counted():
+    first = _payload("600519", NAMES["600519"], action="hold",
+                     position="holding", confidence=0.63, price=1701.2,
+                     holding_days=22)
+    second = _payload("600000", NAMES["600000"], action="hold",
+                      position="holding", confidence=0.63, price=12.3,
+                      holding_days=30)
+    text = _render(first, second)
+    assert "结论：今天不用动；有 2 只已超建议持有期。" in text
+
+
+def test_buy_line_has_entry_zone_and_stop():
+    line = _item_lines(_render(_buy()))[0]
+    assert "入场区 11.80–12.20" in line
+    assert "止损 11.00" in line
+
+
+def test_buy_line_shows_only_available_levels():
+    payload = _buy()
+    payload["recommendation"]["entry_zone"] = None
+    line = _item_lines(_render(payload))[0]
+    assert "入场区" not in line
+    assert "止损 11.00" in line
+
+    payload = _buy()
+    payload["recommendation"]["stop_loss"] = None
+    line = _item_lines(_render(payload))[0]
+    assert "入场区 11.80–12.20" in line
+    assert "止损" not in line
+
+
+def test_sell_line_keeps_stop():
+    line = _item_lines(_render(_sell()))[0]
+    assert "卖出，跌破了止损价 33.17" in line
+
+
+# ---------------------------------------------------------------------------
 # 术语黑名单
 # ---------------------------------------------------------------------------
 def test_banned_terms_zero_hits_on_all_shapes():
     outputs = [
         _render(_buy()), _render(_holding()), _render(_flat()),
         _render(_flat_low_confidence()), _render(_sell()), _render(_avoid()),
+        _render(_flat(), _error_payload("600519", NAMES["600519"])),
+        _render(_error_payload("600519", NAMES["600519"]),
+                _error_payload("600000", NAMES["600000"])),
+        render_daily_brief([], date=DATE),
     ]
     for text in outputs:
         assert find_banned_terms(text, names=NAMES.values()) == [], text
@@ -246,6 +436,12 @@ def test_banned_terms_catches_internal_jargon():
     assert "触发参考价" in hits
     assert "n=" in hits
     assert "t=" in hits
+
+
+def test_banned_terms_cover_review_vocabulary():
+    hits = find_banned_terms("信号族 显著 胜率 相关性")
+    for term in ("信号族", "显著", "胜率", "相关性"):
+        assert term in hits
 
 
 def test_banned_term_scan_whitelists_names():
@@ -365,13 +561,19 @@ def test_market_closed_prints_one_conclusion_no_items():
 
 
 def test_empty_payload_list():
-    assert render_daily_brief([], date=DATE) == (
-        HEADER + "\n\n结论：今天不用动。")
+    text = render_daily_brief([], date=DATE)
+    assert text == (
+        HEADER + "\n\n"
+        "结论：今天数据没拿到，无法给出建议。\n"
+        "原因：这次没有收到任何标的的数据。")
+    assert "不用动" not in text
 
 
 def test_no_none_in_output():
     text = _render(_buy(), _holding(), _flat(), _sell(), _avoid())
     assert "None" not in text
+    failure_text = _render(_flat(), _error_payload("600519", NAMES["600519"]))
+    assert "None" not in failure_text
 
 
 def test_pure_function_does_not_mutate_payloads():
@@ -449,3 +651,31 @@ def test_tool_check_terms_clean_exit_zero(tmp_path):
                         "--check-terms"])
     assert result.returncode == 0, result.stderr
     assert "术语黑名单命中" not in result.stderr
+
+
+def test_tool_all_data_failure_exits_4(tmp_path):
+    path = tmp_path / "errors.json"
+    payloads = [_error_payload("600519", NAMES["600519"]),
+                _error_payload("600000", NAMES["600000"])]
+    path.write_text(json.dumps(payloads, ensure_ascii=False), encoding="utf-8")
+    result = _run_tool(["--json-file", str(path), "--date", DATE,
+                        "--check-terms"])
+    assert result.returncode == 4, result.stderr
+    assert "结论：今天数据没拿到，无法给出建议。" in result.stdout
+    assert "不用动" not in result.stdout
+
+
+def test_tool_empty_array_exits_4():
+    result = _run_tool(["--date", DATE], stdin_text="[]")
+    assert result.returncode == 4, result.stderr
+    assert "今天数据没拿到" in result.stdout
+    assert "不用动" not in result.stdout
+
+
+def test_tool_partial_failure_exits_zero_and_discloses(tmp_path):
+    path = tmp_path / "partial.json"
+    payloads = [_flat(), _error_payload("600519", NAMES["600519"])]
+    path.write_text(json.dumps(payloads, ensure_ascii=False), encoding="utf-8")
+    result = _run_tool(["--json-file", str(path), "--date", DATE])
+    assert result.returncode == 0, result.stderr
+    assert "另有 1 只没取到数据" in result.stdout

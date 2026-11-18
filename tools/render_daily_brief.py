@@ -24,6 +24,13 @@
 * ``--check-terms``：渲染后扫描术语黑名单，命中时把术语写 stderr 并退出 3
   （文本仍照常打印，便于定位）。
 
+退出码：
+* ``0``：正常给出结论（含「部分标的取数失败」—— 文本里已写明数量）；
+* ``2``：参数 / JSON 读取错误；
+* ``3``：``--check-terms`` 命中术语黑名单；
+* ``4``：**全部标的都没有可用数据**（`data_source_error` / `insufficient_data`
+  或空输入）。调用方可据此判断「今天没有建议」与「今天不用动」是两回事。
+
 设计边界：只做 I/O 包装；渲染逻辑全部在
 ``stock_analysis.daily_brief.render_daily_brief``；不触网、不重算任何决策值。
 非法 JSON / 非对象 payload 以退出码 2 结束。
@@ -43,6 +50,8 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from stock_analysis.daily_brief import (  # noqa: E402
+    DATA_STATUS_NO_DATA,
+    data_status,
     find_banned_terms,
     render_daily_brief,
 )
@@ -166,6 +175,9 @@ def main(argv=None) -> int:
         if hits:
             print("术语黑名单命中：" + "、".join(hits), file=sys.stderr)
             return 3
+    # 「全部没数据」必须与「今天不用动」区分开（issue #150 复验 P1）。
+    if data_status(prepared) == DATA_STATUS_NO_DATA:
+        return 4
     return 0
 
 
