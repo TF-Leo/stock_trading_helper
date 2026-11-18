@@ -5,7 +5,7 @@
 
 用法：
     source/.venv/bin/python tools/render_daily_brief.py --json-dir /path/to/payloads \
-        --date 2026-11-18 --name 002415=海康威视 --name 023299=汇添富A500C
+        --date 2026-11-18 --name 600519=示例股票 --name 600000=示例股票B
 
     source/.venv/bin/python tools/render_daily_brief.py --json-file a.json --json-file b.json
 

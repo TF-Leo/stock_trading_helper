@@ -70,7 +70,7 @@
   - `python tools/probe.py all-quick` → 退出码 0；41 项中 **34 PASS / 5 SKIP
     （-Quick 跳过）/ 1 FAIL / 1 BLOCKED**（FAIL=`error_shape`：错误路径缺
     `diagnostics.source_attempts[]` 六键；BLOCKED=`as_of`：本 worktree 无
-    `stock_002415_qfq.csv`。两项均为 #133 已记录的既有环境问题，与本次
+    `stock_600519_qfq.csv`。两项均为 #133 已记录的既有环境问题，与本次
     additive 渲染层无因果关系，与 #142 轮的探针结果同形）。
 - **待办（不在本仓库范围）**：Hermes 侧 `trade_preopen_alert.py` 改为收集 10 份
   payload 后调用 `tools/render_daily_brief.py` 并原样发送 stdout；调用方式已写进
