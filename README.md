@@ -1262,6 +1262,27 @@ issue #92 要求 compact 输出是原文的「删除子序列」。实现需要�
 > 与 issue #92 字面表述的差异（替换 vs 纯删除）已显式记录在此：只接受上面这个
 > 封闭、可验证的词表，不接受任何自由改写；`--json` 仅允许 additive 变更。
 
+## 盘前简报（`tools/render_daily_brief.py`，issue #149）
+
+把一组 `cli.py --json` payload 渲染成**最终投递文本**，Hermes 侧原样发送
+stdout（不再由 prompt 改写内容）：
+
+```bash
+source/.venv/bin/python tools/render_daily_brief.py \
+  --json-dir /path/to/payloads --date 2026-11-18 \
+  --name 600519=示例白酒 --name 600000=示例银行
+```
+
+输出形态：标题 → 一句话结论（今天要做的动作条数，0 条写「今天不用动」）→
+每条「标的名 + 价格 + 做什么 + 一句人话理由」→ 至多一行「数据：…」。
+动作只计 `buy` / `sell`；空仓不显示卖出提示、持仓不显示买入提示，矛盾
+payload 会按仓位侧忽略并在数据行说明。置信只在**买入**与**模型接近毫无把握
+（`confidence < 0.2`）**时出现，只用「把握 高/中/低」（可带百分比），术语
+黑名单见 `source/stock_analysis/daily_brief.py` 的 `BANNED_TERMS`，
+`--check-terms` 命中时退出码 3。置信不低于 20% 的「低」不逐行报百分比（43.6%
+仍写「今天没出现买点」，避免把「低」说成「没把握」）。渲染层是纯函数：不改
+入参、不读写文件、不触网；`advice_render.render_advice` 与 `--json` 结构不变。
+
 ## 幂等性保证
 
 同一份缓存数据下连续两次运行，JSON 除 `generated_at` 与 `diagnostics.elapsed_seconds` 外逐字节相同。所有随机过程使用固定 seed。

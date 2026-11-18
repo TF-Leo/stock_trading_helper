@@ -1,5 +1,81 @@
 # PROGRESS.md — 唯一台账（每轮开始先读这里）
 
+## 2026-11-18 · issue #149：盘前投递「结论优先 + 每条一句人话」，渲染层直出最终文本
+
+- **分支**：本地 `TF-Leo/daily-brief`（推送 `task/daily-brief`），父 `origin/main`
+  = `24b0232`，未合并。用户 11-18 直接反馈「越来越看不懂」，最高优先级。
+- **改动（additive，只加新入口）**：
+  - 新增 `source/stock_analysis/daily_brief.py::render_daily_brief(payloads, *,
+    date)` —— 纯函数，零联网，输入一组 `cli.py --json` payload，输出**最终投递
+    文本**（Hermes 原样发送，prompt 不再改写）。
+  - 新增 `tools/render_daily_brief.py` —— 文件 / 目录 / stdin 包装；`--date`、
+    `--name CODE=简称`、`--check-terms`（命中术语黑名单退出码 3）。
+  - `README.md` 增加「盘前简报」一节（调用方式与契约）。
+  - **未改** `advice_render.render_advice`、`decision/*`、`--json` 结构/键、
+    取数逻辑；零新依赖。
+- **输出契约（硬规则逐条）**：
+  1. 顶部结论只数 `buy` / `sell`（今天要下的单）：0 条「今天不用动」，1 条
+     「今天有 1 件事要做」，N 条「今天有 N 件事要做」；休市日「今天休市，不用动」。
+  2. 每条 = 标的名 + 价格（2 位小数）+ 做什么 + 一句人话理由；不读
+     `action_reason` 的统计措辞（只从里面读风控类型「触发止损/止盈/时间止损」）。
+  3. 空仓不显示卖出提示；持仓不显示买入提示。矛盾 payload（空仓 `action=sell`、
+     持仓 `action=buy`）按仓位侧忽略，并在末尾数据行写「卖出/买入提示已忽略」；
+     已确认停牌 / 一字板 / 风险警示股即使带了 `buy`/`sell` 也只写「不参与」。
+  4. 置信只用「把握 高/中/低」（可带 1 位小数百分比），首条前一句
+     「把握分高/中/低，表示模型对这次判断的信心。」只对 `buy` 与置信 < 20%
+     的空仓行显示百分比（43.6% 的「低」仍写「今天没出现买点」，不写成
+     「没把握」——与 issue 示例一致）。
+  5. 数据行只在影响结论时出现（价格回退旧缓存 / 行情滞后 / 缺价格 / 买入缺
+     入场区 / 仓位矛盾），合并为末尾至多一行；资金流口径、估值缺失、事件缓存、
+     ST 名单滞后、超额收益等**不影响动作**的事实一律不进投递文本。
+  6. 百分比最多 1 位小数；`BANNED_TERMS` + `n=`/`t=`/英文缩写扫描，标的名称
+     先剔除（名称白名单，简称可能含「策略」）。
+- **测试**：新增 `source/tests/test_daily_brief_149.py`（**35 项**）：五形态
+  快照（买入 / 继续持有 / 暂不买 / 卖出 / 不参与，另含数据不足）、结论 0 条与
+  2 条、术语扫描 0 命中（并反向证明扫描器能抓 `策略族/CMF/触发参考价/n=/t=`）、
+  空仓无卖出/持仓无买入、矛盾 payload 抑制、停牌中的持仓不出现「卖出」、
+  价格/百分比精度、数据行取舍、
+  休市日、空列表、纯函数、CLI 包装（数组/单对象/目录/坏 JSON/名称白名单）。
+  测试标的只用 600519 / 600000。
+- **证据（本机 Linux，Python 3.14.7 / pytest 8.3.5，worktree `.venv` 由
+  `uv pip install -r source/requirements.txt` 建立）**：
+  - `python -m pytest tests/ -q` → **1348 passed in 101.62s**（父提交基线
+    1313；本次净增 35 项）。
+  - `python -m pytest tests/test_daily_brief_149.py -q` → **35 passed**。
+  - 真实 10 只（payload 由生产克隆 `cli.py --json --fast` 离线生成，渲染用本
+    分支 `tools/render_daily_brief.py --check-terms`，退出码 0，stderr 空；
+    名称匿名化）：
+    ```
+    📈 盘前 11/18
+
+    结论：今天不用动。
+    把握分高/中/低，表示模型对这次判断的信心。
+    - 标的1 35.28：继续持有，第 22 个交易日（建议 20 日，没跌破止损就不强制卖）。
+    - 标的2 21.95：不买，今天没出现买点。
+    - 标的3 1.25：不买，模型也没把握（把握 低，2.1%）。
+    - 标的4 2.50：不买，今天没出现买点。
+    - 标的5 3.12：不买，今天没出现买点。
+    - 标的6 3.79：不买，今天没出现买点。
+    - 标的7 2.46：不买，今天没出现买点。
+    - 标的8 3.00：不买，今天没出现买点。
+    - 标的9 0.95：不买，模型也没把握（把握 低，2%）。
+    - 标的10 2.42：不买，模型也没把握（把握 低，2.1%）。
+    ```
+    术语扫描 `find_banned_terms(text, names=...) → []`；`re.findall(
+    r"\d+\.\d{2,}%", text) → []`；输出无 `None`。今日 10 只没有「影响结论」
+    的数据问题，故按规则 5 省略数据行（stale / 缺价 / 缺入场区 / 矛盾 payload
+    的数据行由单测覆盖）。
+  - **门禁说明**：本机无 `pwsh`，无法执行 `tools/check_gates.ps1`；以全量
+    pytest + `tools/probe.py all-quick` 作为运行时裁定器（与前几轮同）。
+  - `python tools/probe.py all-quick` → 退出码 0；41 项中 **34 PASS / 5 SKIP
+    （-Quick 跳过）/ 1 FAIL / 1 BLOCKED**（FAIL=`error_shape`：错误路径缺
+    `diagnostics.source_attempts[]` 六键；BLOCKED=`as_of`：本 worktree 无
+    `stock_002415_qfq.csv`。两项均为 #133 已记录的既有环境问题，与本次
+    additive 渲染层无因果关系，与 #142 轮的探针结果同形）。
+- **待办（不在本仓库范围）**：Hermes 侧 `trade_preopen_alert.py` 改为收集 10 份
+  payload 后调用 `tools/render_daily_brief.py` 并原样发送 stdout；调用方式已写进
+  README / PR，合并后另行同步生产配置。
+
 ## 2026-11-17 · issue #142：建议主行按动作裁剪、说人话（**只改渲染层**）
 
 - **分支**：`task/plain-row`（本地 worktree 分支 `TF-Leo/plain-row`，父
